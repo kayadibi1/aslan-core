@@ -117,3 +117,36 @@ async def test_update_entity_partial_patch(session: AsyncSession) -> None:
     assert e2.short_name == "Xco"
     assert e2.status == "suspended"
     assert e2.legal_name == "X"  # unchanged
+
+
+async def test_identifier_transfer_ticker_rename(session: AsyncSession) -> None:
+    """Spec §10 v0.1 invariant: a ticker can be reassigned to a different
+    entity. Expire the active row at as_of=D, then add a new row for the
+    same (namespace, value) on the new entity with valid_from=D.
+
+    Half-open interval [valid_from, valid_to) means the two rows touch
+    without overlapping, so the GiST exclusion permits both.
+    """
+    await _wipe(session)
+    run = await _new_run(session)
+    client = EntityRegistryClient(session, ingestion_run_id=run)
+
+    a = await client.create_entity(
+        type="company", legal_name="OldCo", identifiers={"bist_ticker": "X"}
+    )
+    b = await client.create_entity(
+        type="company", legal_name="NewCo", identifiers={"kap_entity_code": "B-CODE"}
+    )
+    await session.commit()
+
+    rename_dt = date(2026, 4, 27)
+    await client.expire_identifier("bist_ticker", "X", as_of=rename_dt)
+    await client.add_identifier(b.entity_id, "bist_ticker", "X", valid_from=rename_dt)
+    await session.commit()
+
+    # Day before the rename: still resolves to the old entity.
+    assert await client.resolve("bist_ticker", "X", as_of=date(2026, 4, 26)) == a.entity_id
+    # On the rename day (FIRST INVALID DAY for OldCo, valid_from for NewCo): NewCo.
+    assert await client.resolve("bist_ticker", "X", as_of=rename_dt) == b.entity_id
+    # After the rename: NewCo.
+    assert await client.resolve("bist_ticker", "X", as_of=date(2026, 4, 28)) == b.entity_id
