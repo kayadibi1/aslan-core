@@ -17,6 +17,13 @@ from aslan_core.schemas.entity import (
     Identifier,
     IdentifierIn,
 )
+from aslan_core.schemas.ingestion import (
+    IngestionRunHandle as IngestionRunHandleSchema,
+)
+from aslan_core.schemas.ingestion import (
+    RunStatus,
+    WatermarkValue,
+)
 
 
 def _now() -> datetime:
@@ -120,3 +127,42 @@ def test_identifier_is_frozen() -> None:
     assert ident.namespace == "bist_ticker"
     with pytest.raises(ValidationError):
         ident.value = "OTHER"  # type: ignore[misc]
+
+
+def test_ingestion_run_handle_schema_fields() -> None:
+    h = IngestionRunHandleSchema(
+        id=1,
+        source_id="kap",
+        job_name="seed",
+        started_at=_now(),
+    )
+    assert h.id == 1
+    assert h.source_id == "kap"
+
+
+def test_run_status_fields() -> None:
+    rs = RunStatus(
+        id=1,
+        source_id="kap",
+        job_name="entity_catalog",
+        started_at=_now(),
+        finished_at=None,
+        status="running",
+        rows_written=0,
+        docs_written=0,
+        bytes_written=0,
+        error_count=0,
+        error=None,
+    )
+    assert rs.status == "running"
+
+
+def test_watermark_value_fields() -> None:
+    wv = WatermarkValue(
+        source_id="kap",
+        job_name="tail",
+        key="global",
+        cursor_value="abc",
+        updated_at=_now(),
+    )
+    assert wv.cursor_value == "abc"
