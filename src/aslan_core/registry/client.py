@@ -193,6 +193,16 @@ class EntityRegistryClient:
 
         if match_eids:
             (target_eid,) = match_eids
+            # The trust boundary is the target entity's source, not just the
+            # identifier rows' source. Otherwise a source could attach its own
+            # identifier to another source's entity via add_identifier and
+            # then "merge" into it on the next create_entity call.
+            target_entity = await self.get(target_eid)
+            if target_entity.source_id != my_source:
+                raise EntityMergeRequired(
+                    f"target entity {target_eid} owned by "
+                    f"source_id={target_entity.source_id}; current run is {my_source}",
+                )
             for r in rows:
                 if r.source_id != my_source:
                     raise EntityMergeRequired(
@@ -203,7 +213,7 @@ class EntityRegistryClient:
             for ns, val in identifiers.items():
                 if (ns, val) not in existing:
                     await self.add_identifier(target_eid, ns, val)
-            return await self.get(target_eid)
+            return target_entity
 
         # Fresh INSERT.
         eid: UUID = (

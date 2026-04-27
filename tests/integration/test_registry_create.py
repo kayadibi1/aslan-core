@@ -126,3 +126,45 @@ async def test_create_entity_multi_entity_match_raises(session: AsyncSession) ->
             legal_name="Foo or Bar?",
             identifiers={"bist_ticker": "FOO", "kap_entity_code": "2"},
         )
+
+
+async def test_create_entity_laundered_cross_source_match_raises(
+    session: AsyncSession,
+) -> None:
+    """Source B can't launder a cross-source merge by attaching its own
+    identifier to source A's entity first.
+
+    Spec §2: auto-merge is intentionally same-source only. The trust
+    boundary is the *entity's* source, not just the identifier row's source.
+    """
+    await _wipe(session)
+
+    run_kap = await _new_run(session, source_id="kap")
+    client_kap = EntityRegistryClient(session, ingestion_run_id=run_kap)
+    entity_kap = await client_kap.create_entity(
+        type="company",
+        legal_name="Aselsan A.Ş.",
+        identifiers={"kap_entity_code": "19387"},
+    )
+    await session.commit()
+
+    # Source `manual` attaches its own identifier to source `kap`'s entity.
+    # add_identifier(...) is intentionally permissive (operator path), so
+    # this succeeds and writes an identifier row owned by source `manual`.
+    run_manual_attach = await _new_run(session, source_id="manual", job="attach")
+    await EntityRegistryClient(session, run_manual_attach).add_identifier(
+        entity_kap.entity_id, "bist_ticker", "ASELS"
+    )
+    await session.commit()
+
+    # Now source `manual` calls create_entity with that same identifier.
+    # The identifier row's source_id matches `manual`, but the target entity
+    # was created by `kap`. This must still raise.
+    run_manual_create = await _new_run(session, source_id="manual", job="create")
+    client_manual = EntityRegistryClient(session, run_manual_create)
+    with pytest.raises(EntityMergeRequired):
+        await client_manual.create_entity(
+            type="company",
+            legal_name="Aselsan",
+            identifiers={"bist_ticker": "ASELS"},
+        )
