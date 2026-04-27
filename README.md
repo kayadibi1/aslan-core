@@ -22,3 +22,17 @@ docker compose -f infra/docker-compose.yml up -d
 aslan migrate up
 aslan seed sources --file infra/sources.yaml
 ```
+
+## Local stack notes
+
+The canonical aslan local stack uses these ports:
+
+| Port | Service |
+|------|---------|
+| 5432 | Postgres + TimescaleDB |
+| 6432 | PgBouncer (transaction pooling — `aslan-core` connects here) |
+| 6379 | Redis |
+| 9000 | MinIO API |
+| 9001 | MinIO console |
+
+If you also run other Aslan-Terminal scrapers' local stacks (e.g. an older `kap-scraper` Compose that bundles its own Postgres on 5432), bring them down before starting the aslan stack. Per spec §11, consumer scrapers should `extends:` this Compose rather than ship their own DB services — that work happens repo-by-repo as each consumer migrates.
