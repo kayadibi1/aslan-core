@@ -1,0 +1,45 @@
+# .github/workflows/ci.yml
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv sync --all-groups
+      - run: uv run ruff format --check .
+      - run: uv run ruff check .
+      - run: uv run mypy src tests
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv sync --all-groups
+      # testcontainers needs the docker socket, which GHA provides by default.
+      - run: uv run pytest -ra
+        env:
+          # Settings.required envs — testcontainers overrides ASLAN_PG_DSN at runtime.
+          ASLAN_PG_DSN: postgresql+asyncpg://placeholder:placeholder@localhost:5432/placeholder
+          ASLAN_REDIS_URL: redis://localhost:6379/0
+          ASLAN_S3_ENDPOINT: http://localhost:9000
+          ASLAN_S3_REGION: us-east-1
+          ASLAN_S3_ACCESS_KEY: x
+          ASLAN_S3_SECRET_KEY: x
+
+      - name: Run integration tests
+        run: uv run pytest -m integration -ra
+        env:
+          ASLAN_PG_DSN: postgresql+asyncpg://placeholder:placeholder@localhost:5432/placeholder
+          ASLAN_REDIS_URL: redis://localhost:6379/0
+          ASLAN_S3_ENDPOINT: http://localhost:9000
+          ASLAN_S3_REGION: us-east-1
+          ASLAN_S3_ACCESS_KEY: x
+          ASLAN_S3_SECRET_KEY: x
