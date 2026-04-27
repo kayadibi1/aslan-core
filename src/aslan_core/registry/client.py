@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, date, datetime
 from typing import Any
 from uuid import UUID
@@ -10,7 +11,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.types import Text
 
 from aslan_core.errors import (
+    EntityMergeRequired,
     EntityNotFound,
+    IdentifierConflict,
     RegistryConstraintViolation,
 )
 from aslan_core.schemas.entity import Entity, EntityMatch
@@ -136,6 +139,142 @@ class EntityRegistryClient:
             out.append(EntityMatch(entity=ent, matched_identifiers=[], similarity=float(r.sim)))
         return out
 
+    # ─── Writes ───
+
+    async def create_entity(
+        self,
+        *,
+        type: str,  # noqa: A002 — public API mirrors Pydantic Entity.type
+        legal_name: str,
+        identifiers: dict[str, str],
+        short_name: str | None = None,
+        country_code: str = "TR",
+        domicile: str | None = None,
+        incorporation_dt: date | None = None,
+        status: str = "active",
+        fiscal_year_end: date | None = None,
+        parent_entity_id: UUID | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Entity:
+        my_source = await self._source_id()
+
+        # Look up existing identifier matches for any of the input pairs.
+        rows: list[Any] = []
+        if identifiers:
+            pairs = list(identifiers.items())
+            namespaces = [ns for ns, _ in pairs]
+            values = [v for _, v in pairs]
+            rows = list(
+                (
+                    await self._s.execute(
+                        text(
+                            "SELECT entity_id, namespace, value, source_id "
+                            "FROM ref.identifier "
+                            "WHERE (namespace, value) IN ( "
+                            "  SELECT * FROM unnest(:nss, :vs) "
+                            ") "
+                            "  AND now()::date >= valid_from AND now()::date < valid_to"
+                        ).bindparams(
+                            bindparam("nss", type_=ARRAY(Text())),
+                            bindparam("vs", type_=ARRAY(Text())),
+                        ),
+                        {"nss": namespaces, "vs": values},
+                    )
+                ).all()
+            )
+
+        match_eids = {r.entity_id for r in rows}
+
+        if len(match_eids) > 1:
+            raise EntityMergeRequired(
+                f"identifiers map to {len(match_eids)} distinct entities: {match_eids}",
+            )
+
+        if match_eids:
+            (target_eid,) = match_eids
+            for r in rows:
+                if r.source_id != my_source:
+                    raise EntityMergeRequired(
+                        f"identifier ({r.namespace}={r.value}) was written by "
+                        f"source_id={r.source_id}; current run is {my_source}",
+                    )
+            existing = {(r.namespace, r.value) for r in rows}
+            for ns, val in identifiers.items():
+                if (ns, val) not in existing:
+                    await self.add_identifier(target_eid, ns, val)
+            return await self.get(target_eid)
+
+        # Fresh INSERT.
+        eid: UUID = (
+            await self._s.execute(
+                text(
+                    "INSERT INTO ref.entity "
+                    "  (entity_type, legal_name, short_name, country_code, domicile, "
+                    "   incorporation_dt, fiscal_year_end, status, parent_entity_id, "
+                    "   metadata, source_id, ingestion_run_id) "
+                    "VALUES (:type, :ln, :sn, :cc, :dom, :inc, :fye, :status, :pid, "
+                    "        COALESCE(:md, '{}')::jsonb, :sid, :run) "
+                    "RETURNING entity_id"
+                ),
+                {
+                    "type": type,
+                    "ln": legal_name,
+                    "sn": short_name,
+                    "cc": country_code,
+                    "dom": domicile,
+                    "inc": incorporation_dt,
+                    "fye": fiscal_year_end,
+                    "status": status,
+                    "pid": parent_entity_id,
+                    "md": _jsonb(metadata),
+                    "sid": my_source,
+                    "run": self._run_id,
+                },
+            )
+        ).scalar_one()
+
+        for ns, val in identifiers.items():
+            await self.add_identifier(eid, ns, val, is_primary=False)
+
+        return await self.get(eid)
+
+    # MINIMAL stub — Task 22 replaces with the typed-conflict version
+    async def add_identifier(
+        self,
+        entity_id: UUID,
+        namespace: str,
+        value: str,
+        valid_from: date | None = None,
+        valid_to: date | None = None,
+        is_primary: bool = False,
+    ) -> None:
+        my_source = await self._source_id()
+        try:
+            await self._s.execute(
+                text(
+                    "INSERT INTO ref.identifier "
+                    "  (entity_id, namespace, value, valid_from, valid_to, "
+                    "   is_primary, source_id, ingestion_run_id) "
+                    "VALUES (:eid, :ns, :v, "
+                    "        COALESCE(:vf, DATE '1900-01-01'), "
+                    "        COALESCE(:vt, DATE '9999-12-31'), "
+                    "        :prim, :sid, :run)"
+                ),
+                {
+                    "eid": entity_id,
+                    "ns": namespace,
+                    "v": value,
+                    "vf": valid_from,
+                    "vt": valid_to,
+                    "prim": is_primary,
+                    "sid": my_source,
+                    "run": self._run_id,
+                },
+            )
+            await self._s.flush()
+        except Exception as e:
+            raise IdentifierConflict(str(e)) from e
+
     # ─── helpers ───
 
     @staticmethod
@@ -170,3 +309,9 @@ class EntityRegistryClient:
                 )
             self._source_id_cache = sid
         return self._source_id_cache
+
+
+def _jsonb(d: dict[str, Any] | None) -> str | None:
+    if d is None:
+        return None
+    return json.dumps(d)
