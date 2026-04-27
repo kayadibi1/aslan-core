@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import AsyncIterator, Iterator
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -47,6 +48,16 @@ def _apply_migrations(pg_dsn: str) -> None:
     os.environ.setdefault("ASLAN_S3_REGION", "us-east-1")
     os.environ.setdefault("ASLAN_S3_ACCESS_KEY", "x")
     os.environ.setdefault("ASLAN_S3_SECRET_KEY", "x")
+
+    # CLI tests subprocess to `python -m aslan_core.cli.main`; the editable
+    # install is unreliable on macOS+uv (uv writes .pth files with the
+    # macOS hidden flag, which CPython's site.py skips). Make src/ visible
+    # via PYTHONPATH so subprocess interpreters can import aslan_core.
+    src_path = str(Path(__file__).resolve().parents[3] / "src")
+    existing = os.environ.get("PYTHONPATH", "")
+    parts = existing.split(os.pathsep) if existing else []
+    if src_path not in parts:
+        os.environ["PYTHONPATH"] = f"{src_path}{os.pathsep}{existing}" if existing else src_path
 
     cfg = Config("alembic.ini")
     cfg.set_main_option("sqlalchemy.url", pg_dsn)
