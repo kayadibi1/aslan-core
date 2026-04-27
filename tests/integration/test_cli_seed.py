@@ -26,6 +26,32 @@ def _run(args: list[str], env_extra: dict[str, str]) -> subprocess.CompletedProc
     )
 
 
+_NON_DB_KEYS = (
+    "ASLAN_REDIS_URL",
+    "ASLAN_S3_ENDPOINT",
+    "ASLAN_S3_REGION",
+    "ASLAN_S3_ACCESS_KEY",
+    "ASLAN_S3_SECRET_KEY",
+)
+
+
+def _run_db_only(args: list[str], pg_dsn: str) -> subprocess.CompletedProcess[str]:
+    """Subprocess the CLI with Redis/S3 env vars stripped.
+
+    Proves DB-only commands do not require unrelated subsystem config.
+    """
+    env = {**os.environ, "ASLAN_PG_DSN": pg_dsn}
+    for k in _NON_DB_KEYS:
+        env.pop(k, None)
+    return subprocess.run(  # noqa: S603 — controlled args, not untrusted input
+        [sys.executable, "-m", "aslan_core.cli.main", *args],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+
+
 async def _wipe(session: AsyncSession) -> None:
     for stmt in [
         "DELETE FROM ref.entity_sector",
@@ -71,3 +97,9 @@ async def test_seed_sectors_bist(pg_dsn: str, session: AsyncSession) -> None:
     rows = await session.scalar(text("SELECT count(*) FROM ref.sector WHERE taxonomy = 'bist'"))
     assert rows is not None
     assert rows >= 1
+
+
+def test_seed_currencies_works_without_redis_or_s3_env(pg_dsn: str) -> None:
+    """DB-only seed commands must run without Redis/S3 configuration."""
+    proc = _run_db_only(["seed", "currencies"], pg_dsn)
+    assert proc.returncode == 0, proc.stderr

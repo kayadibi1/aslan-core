@@ -8,7 +8,7 @@ from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
-from aslan_core.config import Settings
+from aslan_core.config import postgres_dsn_from_env
 from aslan_core.models import Base
 from aslan_core.models import ref as _ref  # noqa: F401  (registers tables on Base.metadata)
 from aslan_core.models import src as _src  # noqa: F401
@@ -21,7 +21,7 @@ target_metadata = Base.metadata
 
 
 def _resolve_dsn() -> str:
-    return Settings().postgres_dsn
+    return postgres_dsn_from_env()
 
 
 def run_migrations_offline() -> None:

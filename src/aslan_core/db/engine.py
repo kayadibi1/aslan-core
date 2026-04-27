@@ -5,7 +5,7 @@ from urllib.parse import urlparse
 
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-from aslan_core.config import Settings
+from aslan_core.config import postgres_dsn_from_env
 
 
 def _is_pgbouncer_dsn(dsn: str) -> bool:
@@ -32,7 +32,7 @@ def create_engine(dsn: str | None = None, **kw: Any) -> AsyncEngine:
     connections keep the default cache. Caller-supplied ``connect_args``
     override the auto-detected defaults.
     """
-    actual = dsn or Settings().postgres_dsn
+    actual = dsn or postgres_dsn_from_env()
     caller_connect_args: dict[str, Any] = kw.pop("connect_args", {})
     connect_args: dict[str, Any] = {**_connect_args_for(actual), **caller_connect_args}
     return create_async_engine(actual, connect_args=connect_args, **kw)

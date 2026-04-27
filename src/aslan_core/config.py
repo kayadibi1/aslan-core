@@ -27,3 +27,28 @@ class Settings(BaseSettings):
             super().__init__(**kw)
         except ValidationError as e:
             raise ConfigError(str(e)) from e
+
+
+class _DbConfig(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        extra="ignore",
+        case_sensitive=False,
+    )
+
+    postgres_dsn: str = Field(validation_alias="ASLAN_PG_DSN")
+
+    def __init__(self, **kw: Any) -> None:
+        try:
+            super().__init__(**kw)
+        except ValidationError as e:
+            raise ConfigError(str(e)) from e
+
+
+def postgres_dsn_from_env() -> str:
+    """Load ``ASLAN_PG_DSN`` without requiring Redis/S3 settings.
+
+    Use from DB-only entry points (CLI seed/registry/migrate) so a missing
+    Redis or S3 env var doesn't mask a Postgres failure.
+    """
+    return _DbConfig().postgres_dsn
