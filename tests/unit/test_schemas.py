@@ -1,3 +1,9 @@
+from datetime import UTC, datetime
+from uuid import uuid4
+
+import pytest
+from pydantic import ValidationError
+
 from aslan_core.schemas.common import (
     EntityStatus,
     EntityType,
@@ -5,6 +11,36 @@ from aslan_core.schemas.common import (
     Namespace,
     RestatementBasis,
 )
+from aslan_core.schemas.entity import (
+    Entity,
+    EntityMatch,
+    Identifier,
+    IdentifierIn,
+)
+
+
+def _now() -> datetime:
+    return datetime.now(tz=UTC)
+
+
+def _make_entity() -> Entity:
+    return Entity(
+        entity_id=uuid4(),
+        type="company",
+        legal_name="X",
+        short_name=None,
+        country_code="TR",
+        domicile=None,
+        incorporation_dt=None,
+        status="active",
+        fiscal_year_end=None,
+        parent_entity_id=None,
+        metadata={},
+        source_id="kap",
+        ingestion_run_id=1,
+        created_at=_now(),
+        updated_at=_now(),
+    )
 
 
 def test_entity_type_values() -> None:
@@ -46,3 +82,41 @@ def test_frequency_values_present() -> None:
 def test_restatement_basis_default_nominal() -> None:
     assert RestatementBasis.NOMINAL.value == "nominal"
     assert RestatementBasis.TAS29_REAL.value == "tas29_real"
+
+
+def test_entity_is_frozen() -> None:
+    e = _make_entity()
+    with pytest.raises(ValidationError):
+        e.legal_name = "Y"  # type: ignore[misc]
+
+
+def test_identifier_in_defaults() -> None:
+    iin = IdentifierIn(namespace="bist_ticker", value="ASELS")
+    assert iin.valid_from is None
+    assert iin.valid_to is None
+    assert iin.is_primary is False
+
+
+def test_entity_match_carries_similarity() -> None:
+    e = _make_entity()
+    em = EntityMatch(entity=e, matched_identifiers=[], similarity=0.42)
+    assert em.similarity == 0.42
+    assert em.entity.entity_id == e.entity_id
+
+
+def test_identifier_is_frozen() -> None:
+    ident = Identifier(
+        identifier_id=1,
+        entity_id=uuid4(),
+        namespace="bist_ticker",
+        value="ASELS",
+        valid_from=_now().date(),
+        valid_to=_now().date(),
+        is_primary=True,
+        source_id="kap",
+        ingestion_run_id=1,
+        created_at=_now(),
+    )
+    assert ident.namespace == "bist_ticker"
+    with pytest.raises(ValidationError):
+        ident.value = "OTHER"  # type: ignore[misc]
