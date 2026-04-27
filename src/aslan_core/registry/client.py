@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from typing import Any, cast
 from uuid import UUID
 
@@ -351,6 +352,107 @@ class EntityRegistryClient:
         )
         if res.rowcount == 0:
             raise EntityNotFound(f"no active identifier ({namespace}={value!r})")
+
+    async def link(
+        self,
+        parent_id: UUID,
+        child_id: UUID,
+        rel_type: str,
+        weight: Decimal | None = None,
+        valid_from: date | None = None,
+        valid_to: date | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Idempotent on (parent_id, child_id, rel_type, valid_from).
+        Existing rows update weight / valid_to / metadata."""
+        my_source = await self._source_id()
+        await self._s.execute(
+            text(
+                "INSERT INTO ref.entity_relationship "
+                "  (parent_id, child_id, rel_type, weight, valid_from, valid_to, "
+                "   metadata, source_id, ingestion_run_id) "
+                "VALUES (:p, :c, :rt, :w, "
+                "        COALESCE(:vf, DATE '1900-01-01'), "
+                "        COALESCE(:vt, DATE '9999-12-31'), "
+                "        COALESCE(:md, '{}')::jsonb, :sid, :run) "
+                "ON CONFLICT (parent_id, child_id, rel_type, valid_from) "
+                "  DO UPDATE SET weight   = EXCLUDED.weight, "
+                "                valid_to = EXCLUDED.valid_to, "
+                "                metadata = EXCLUDED.metadata"
+            ),
+            {
+                "p": parent_id,
+                "c": child_id,
+                "rt": rel_type,
+                "w": weight,
+                "vf": valid_from,
+                "vt": valid_to,
+                "md": _jsonb(metadata),
+                "sid": my_source,
+                "run": self._run_id,
+            },
+        )
+
+    async def upsert_sector(
+        self,
+        *,
+        sector_id: str,
+        taxonomy: str,
+        code: str,
+        name_tr: str,
+        name_en: str | None = None,
+        parent_sector_id: str | None = None,
+    ) -> None:
+        await self._s.execute(
+            text(
+                "INSERT INTO ref.sector "
+                "  (sector_id, taxonomy, code, name_tr, name_en, parent_sector_id) "
+                "VALUES (:sid, :tax, :code, :ntr, :nen, :pid) "
+                "ON CONFLICT (sector_id) DO UPDATE "
+                "  SET taxonomy = EXCLUDED.taxonomy, "
+                "      code = EXCLUDED.code, "
+                "      name_tr = EXCLUDED.name_tr, "
+                "      name_en = EXCLUDED.name_en, "
+                "      parent_sector_id = EXCLUDED.parent_sector_id"
+            ),
+            {
+                "sid": sector_id,
+                "tax": taxonomy,
+                "code": code,
+                "ntr": name_tr,
+                "nen": name_en,
+                "pid": parent_sector_id,
+            },
+        )
+
+    async def assign_sector(
+        self,
+        entity_id: UUID,
+        sector_id: str,
+        is_primary: bool = False,
+        valid_from: date | None = None,
+        valid_to: date | None = None,
+    ) -> None:
+        """Idempotent on (entity_id, sector_id, valid_from)."""
+        await self._s.execute(
+            text(
+                "INSERT INTO ref.entity_sector "
+                "  (entity_id, sector_id, is_primary, valid_from, valid_to) "
+                "VALUES (:eid, :sid, :prim, "
+                "        COALESCE(:vf, DATE '1900-01-01'), "
+                "        COALESCE(:vt, DATE '9999-12-31')) "
+                "ON CONFLICT (entity_id, sector_id, valid_from) "
+                "  DO UPDATE SET is_primary = EXCLUDED.is_primary, "
+                "                valid_to   = EXCLUDED.valid_to"
+            ),
+            {
+                "eid": entity_id,
+                "sid": sector_id,
+                "prim": is_primary,
+                "vf": valid_from,
+                "vt": valid_to,
+            },
+        )
 
     # ─── helpers ───
 
