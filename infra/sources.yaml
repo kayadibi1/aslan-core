@@ -1,0 +1,21 @@
+sources:
+  - id: kap
+    name: Kamuyu Aydınlatma Platformu
+    kind: scraper
+    base_url: https://www.kap.org.tr
+    license_status: open
+  - id: evds
+    name: TCMB EVDS
+    kind: api
+    base_url: https://evds2.tcmb.gov.tr
+    license_status: free_with_key
+  - id: tefas
+    name: TEFAS
+    kind: scraper
+    base_url: https://www.tefas.gov.tr
+    license_status: open
+  - id: manual
+    name: Manual entries
+    kind: manual
+    base_url: null
+    license_status: open

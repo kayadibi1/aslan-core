@@ -1,0 +1,6 @@
+sources:
+  - id: kap
+    name: KAP test
+    kind: scraper
+    base_url: https://example.org
+    license_status: open
