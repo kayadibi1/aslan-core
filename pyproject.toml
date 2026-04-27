@@ -79,7 +79,7 @@ ignore_missing_imports = true
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = ["-ra", "--strict-markers", "--strict-config"]
+addopts = ["-ra", "--strict-markers", "--strict-config", "-m", "not integration"]
 filterwarnings = ["error"]
 markers = [
     "integration: requires the testcontainers Postgres+Timescale stack",
