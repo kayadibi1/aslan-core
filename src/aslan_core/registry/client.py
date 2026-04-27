@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, date, datetime
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import bindparam, text
+from sqlalchemy import CursorResult, bindparam, text
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.types import Text
@@ -238,7 +238,6 @@ class EntityRegistryClient:
 
         return await self.get(eid)
 
-    # MINIMAL stub — Task 22 replaces with the typed-conflict version
     async def add_identifier(
         self,
         entity_id: UUID,
@@ -248,7 +247,27 @@ class EntityRegistryClient:
         valid_to: date | None = None,
         is_primary: bool = False,
     ) -> None:
+        """Idempotent on (namespace, value, valid_from). Collision with a
+        different entity_id raises IdentifierConflict."""
         my_source = await self._source_id()
+        existing = (
+            await self._s.execute(
+                text(
+                    "SELECT entity_id, valid_from FROM ref.identifier "
+                    "WHERE namespace = :ns AND value = :v "
+                    "  AND valid_from = COALESCE(:vf, DATE '1900-01-01')"
+                ),
+                {"ns": namespace, "v": value, "vf": valid_from},
+            )
+        ).one_or_none()
+        if existing is not None:
+            if existing.entity_id != entity_id:
+                raise IdentifierConflict(
+                    f"({namespace}={value!r}, valid_from={existing.valid_from}) "
+                    f"already maps to entity {existing.entity_id}",
+                )
+            return  # idempotent no-op
+
         try:
             await self._s.execute(
                 text(
@@ -273,7 +292,65 @@ class EntityRegistryClient:
             )
             await self._s.flush()
         except Exception as e:
+            # GiST exclusion violation = a *different* entity holds an
+            # overlapping window for the same (namespace, value).
             raise IdentifierConflict(str(e)) from e
+
+    async def update_entity(
+        self,
+        entity_id: UUID,
+        *,
+        legal_name: str | None = None,
+        short_name: str | None = None,
+        status: str | None = None,
+        fiscal_year_end: date | None = None,
+        domicile: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Entity:
+        """Partial update. Touches updated_at."""
+        sets: list[str] = []
+        params: dict[str, Any] = {"eid": entity_id}
+        for field, val in (
+            ("legal_name", legal_name),
+            ("short_name", short_name),
+            ("status", status),
+            ("fiscal_year_end", fiscal_year_end),
+            ("domicile", domicile),
+        ):
+            if val is not None:
+                sets.append(f"{field} = :{field}")
+                params[field] = val
+        if metadata is not None:
+            sets.append("metadata = metadata || :md::jsonb")
+            params["md"] = _jsonb(metadata)
+        sets.append("updated_at = now()")
+        await self._s.execute(
+            text(f"UPDATE ref.entity SET {', '.join(sets)} WHERE entity_id = :eid"),  # noqa: S608
+            params,
+        )
+        return await self.get(entity_id)
+
+    async def expire_identifier(
+        self,
+        namespace: str,
+        value: str,
+        as_of: date,
+    ) -> None:
+        """Set valid_to = as_of (FIRST INVALID DAY) on the active row."""
+        res = cast(
+            "CursorResult[Any]",
+            await self._s.execute(
+                text(
+                    "UPDATE ref.identifier "
+                    "   SET valid_to = :asof "
+                    " WHERE namespace = :ns AND value = :v "
+                    "   AND :asof >= valid_from AND :asof < valid_to"
+                ),
+                {"ns": namespace, "v": value, "asof": as_of},
+            ),
+        )
+        if res.rowcount == 0:
+            raise EntityNotFound(f"no active identifier ({namespace}={value!r})")
 
     # ─── helpers ───
 
