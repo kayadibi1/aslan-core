@@ -48,6 +48,14 @@ class IngestionRunHandle:
     async def increment_errors(self, n: int = 1) -> None:
         self.errors += n
 
+    def set_metadata(self, d: dict[str, Any]) -> None:
+        """Replace the run's metadata dict (flushed to DB on context exit).
+
+        Calling this multiple times replaces the previous value wholesale.
+        The final value is written by _close_run as part of the status UPDATE.
+        """
+        self._metadata: dict[str, Any] = d
+
 
 @asynccontextmanager
 async def ingestion_run(
@@ -114,8 +122,34 @@ async def _close_run(
     status: str,
     error: str | None,
 ) -> None:
-    await conn.execute(
-        text(
+    md = getattr(handle, "_metadata", None)
+    params: dict[str, Any] = {
+        "status": status,
+        "rows": handle.rows,
+        "docs": handle.docs,
+        "bytes": handle.bytes,
+        "errors": handle.errors,
+        "err": error,
+        "id": handle.id,
+    }
+    if md is not None:
+        # Include metadata column only when the caller set it, so we don't
+        # accidentally overwrite an existing value with NULL.
+        params["md"] = _jsonb(md)
+        sql = (
+            "UPDATE src.ingestion_run "
+            "   SET status = :status, "
+            "       finished_at = now(), "
+            "       rows_written = :rows, "
+            "       docs_written = :docs, "
+            "       bytes_written = :bytes, "
+            "       error_count = :errors, "
+            "       error = :err, "
+            "       metadata = :md "
+            " WHERE ingestion_run_id = :id"
+        )
+    else:
+        sql = (
             "UPDATE src.ingestion_run "
             "   SET status = :status, "
             "       finished_at = now(), "
@@ -125,17 +159,8 @@ async def _close_run(
             "       error_count = :errors, "
             "       error = :err "
             " WHERE ingestion_run_id = :id"
-        ),
-        {
-            "status": status,
-            "rows": handle.rows,
-            "docs": handle.docs,
-            "bytes": handle.bytes,
-            "errors": handle.errors,
-            "err": error,
-            "id": handle.id,
-        },
-    )
+        )
+    await conn.execute(text(sql), params)
     await conn.commit()
 
 
