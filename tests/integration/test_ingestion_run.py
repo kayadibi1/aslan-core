@@ -111,3 +111,129 @@ async def test_run_row_visible_during_run(
             )
         ).one()
         assert row.status == "running"
+
+
+# ─── audit-content tests for Task 9 ────────────────────────────────────
+
+
+async def test_ingestion_run_with_actor_emits_start_and_complete_events(
+    engine: AsyncEngine,
+    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """ingestion_run(actor=) sets the actor on the ContextVar for the
+    scope and emits ingestion_run.start (at entry) +
+    ingestion_run.complete (at exit). The src.ingestion_run row's
+    denormalised audit cols also reflect the actor."""
+    from aslan_core.audit import Actor
+
+    await _seed_source(session, "kap")
+    async with session_factory() as s:
+        await s.execute(text("DELETE FROM audit.events"))
+        await s.commit()
+
+    actor = Actor(actor_id="user:cron", actor_kind="user")
+    async with ingestion_run(engine, source_id="kap", job_name="audited", actor=actor) as run:
+        run_id = run.id
+
+    async with session_factory() as s:
+        # Row's audit cols reflect actor.
+        row = (
+            await s.execute(
+                text(
+                    "SELECT actor_id, actor_kind FROM src.ingestion_run "
+                    "WHERE ingestion_run_id = :id"
+                ),
+                {"id": run_id},
+            )
+        ).one()
+        assert row.actor_id == "user:cron"
+        assert row.actor_kind == "user"
+
+        events = (
+            await s.execute(
+                text(
+                    "SELECT operation, actor_id FROM audit.events "
+                    "WHERE target_schema = 'src' AND target_table = 'ingestion_run' "
+                    "  AND ingestion_run_id = :id "
+                    "ORDER BY occurred_at"
+                ),
+                {"id": run_id},
+            )
+        ).all()
+        ops = [e.operation for e in events]
+        assert "ingestion_run.start" in ops
+        assert "ingestion_run.complete" in ops
+        for e in events:
+            assert e.actor_id == "user:cron"
+
+
+async def test_ingestion_run_set_metadata_emits_audit_event(
+    engine: AsyncEngine,
+    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Handle.set_metadata buffers an audit event that flushes to
+    audit.events alongside the close-run UPDATE."""
+    from aslan_core.audit import Actor
+
+    await _seed_source(session, "kap")
+    async with session_factory() as s:
+        await s.execute(text("DELETE FROM audit.events"))
+        await s.commit()
+
+    actor = Actor(actor_id="user:meta", actor_kind="user")
+    async with ingestion_run(engine, source_id="kap", job_name="meta", actor=actor) as run:
+        run.set_metadata({"k": "v"})
+        run_id = run.id
+
+    async with session_factory() as s:
+        events = (
+            await s.execute(
+                text(
+                    "SELECT operation, after FROM audit.events "
+                    "WHERE target_schema = 'src' AND ingestion_run_id = :id "
+                    "  AND operation = 'ingestion_run.set_metadata'"
+                ),
+                {"id": run_id},
+            )
+        ).all()
+        assert len(events) == 1
+        assert events[0].after["metadata"] == {"k": "v"}
+
+
+async def test_ingestion_run_increment_rows_emits_audit_event(
+    engine: AsyncEngine,
+    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Handle.increment_rows emits one audit event per call with the
+    rows-counter delta. Audit row goes through the run's connection."""
+    from aslan_core.audit import Actor
+
+    await _seed_source(session, "kap")
+    async with session_factory() as s:
+        await s.execute(text("DELETE FROM audit.events"))
+        await s.commit()
+
+    actor = Actor(actor_id="user:rows", actor_kind="user")
+    async with ingestion_run(engine, source_id="kap", job_name="rows", actor=actor) as run:
+        await run.increment_rows(3)
+        await run.increment_rows(5)
+        run_id = run.id
+
+    async with session_factory() as s:
+        events = (
+            await s.execute(
+                text(
+                    "SELECT operation, before, after FROM audit.events "
+                    "WHERE target_schema = 'src' AND ingestion_run_id = :id "
+                    "  AND operation = 'ingestion_run.increment_rows' "
+                    "ORDER BY occurred_at"
+                ),
+                {"id": run_id},
+            )
+        ).all()
+        assert len(events) == 2
+        assert events[0].after["rows"] == 3
+        assert events[1].after["rows"] == 8

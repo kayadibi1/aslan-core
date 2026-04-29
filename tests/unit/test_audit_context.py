@@ -9,6 +9,8 @@ import pytest
 from aslan_core.audit import (
     Actor,
     current_actor,
+    pop_actor,
+    push_actor,
     require_actor,
     set_actor,
 )
@@ -87,6 +89,28 @@ async def test_actor_propagates_into_async_subtask() -> None:
         assert captured[0].actor_id == "user:parent"
     finally:
         set_actor(None)
+
+
+def test_push_pop_actor_restores_previous_value() -> None:
+    """push_actor returns a Token that, when passed to pop_actor,
+    restores the ContextVar to its prior state — even if that prior
+    state was a different Actor (nested scopes) or None (unscoped)."""
+    assert current_actor() is None
+    outer = Actor(actor_id="user:outer", actor_kind="user")
+    inner = Actor(actor_id="user:inner", actor_kind="user")
+
+    t_outer = push_actor(outer)
+    try:
+        assert current_actor() == outer
+        t_inner = push_actor(inner)
+        try:
+            assert current_actor() == inner
+        finally:
+            pop_actor(t_inner)
+        assert current_actor() == outer
+    finally:
+        pop_actor(t_outer)
+    assert current_actor() is None
 
 
 @pytest.mark.asyncio(loop_scope="session")

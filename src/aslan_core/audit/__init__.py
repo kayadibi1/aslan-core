@@ -9,6 +9,8 @@ from aslan_core.audit.context import (
     Actor,
     ActorKind,
     current_actor,
+    pop_actor,
+    push_actor,
     require_actor,
     set_actor,
 )
@@ -19,6 +21,8 @@ __all__ = [
     "ActorKind",
     "AuditRecord",
     "current_actor",
+    "pop_actor",
+    "push_actor",
     "record",
     "require_actor",
     "set_actor",

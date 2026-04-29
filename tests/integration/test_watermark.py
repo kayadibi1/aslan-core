@@ -105,3 +105,172 @@ async def test_list_for_job_groups_keys(session: AsyncSession) -> None:
     await session.commit()
     rows = await store.list_for_job("kap", "j")
     assert rows == {"a": "1", "b": "2"}
+
+
+# ─── audit-content tests for Task 9 ────────────────────────────────────
+
+
+async def test_advance_emits_watermark_advance_event_on_success(
+    session: AsyncSession,
+) -> None:
+    """advance() success emits one watermark.advance event with
+    target_table='watermark' (codex F2). CAS-miss → no event."""
+    from aslan_core.audit import Actor, set_actor
+
+    await _seed_source(session)
+    await _wipe_watermarks(session)
+    await session.execute(text("DELETE FROM audit.events"))
+    await session.commit()
+
+    set_actor(Actor(actor_id="user:wm", actor_kind="user"))
+    store = WatermarkStore(session)
+
+    # Insert path.
+    ok = await store.advance("kap", "j", "k", new_cursor="1", expected_cursor=None)
+    await session.commit()
+    assert ok is True
+
+    # CAS path.
+    ok = await store.advance("kap", "j", "k", new_cursor="2", expected_cursor="1")
+    await session.commit()
+    assert ok is True
+
+    # CAS miss → no event.
+    ok = await store.advance("kap", "j", "k", new_cursor="3", expected_cursor="bogus")
+    await session.commit()
+    assert ok is False
+
+    events = (
+        await session.execute(
+            text(
+                "SELECT operation, before, after, actor_id FROM audit.events "
+                "WHERE target_schema = 'src' AND target_table = 'watermark' "
+                "ORDER BY occurred_at"
+            )
+        )
+    ).all()
+    assert [e.operation for e in events] == [
+        "watermark.advance",
+        "watermark.advance",
+    ]
+    assert events[0].before is None
+    assert events[0].after["cursor_value"] == "1"
+    assert events[1].before["cursor_value"] == "1"
+    assert events[1].after["cursor_value"] == "2"
+    for e in events:
+        assert e.actor_id == "user:wm"
+
+    # Row's denormalised audit cols.
+    row = (
+        await session.execute(
+            text(
+                "SELECT actor_id FROM src.watermark "
+                "WHERE source_id = 'kap' AND job_name = 'j' AND key = 'k'"
+            )
+        )
+    ).one()
+    assert row.actor_id == "user:wm"
+
+    set_actor(None)
+
+
+async def test_set_idempotent_hit_preserves_original_attribution(
+    session: AsyncSession,
+) -> None:
+    """Codex F1: a second actor calling set() with the same cursor
+    value as the existing row must NOT rewrite the row's audit cols.
+    Emits watermark.idempotent_hit; first writer's actor stays on the
+    row."""
+    from aslan_core.audit import Actor, set_actor
+
+    await _seed_source(session)
+    await _wipe_watermarks(session)
+    await session.execute(text("DELETE FROM audit.events"))
+    await session.commit()
+
+    set_actor(Actor(actor_id="user:first", actor_kind="user"))
+    store = WatermarkStore(session)
+    await store.set("kap", "j", "k", "5")
+    await session.commit()
+
+    set_actor(Actor(actor_id="user:retry", actor_kind="user"))
+    await store.set("kap", "j", "k", "5")  # same value → idempotent hit
+    await session.commit()
+
+    row = (
+        await session.execute(
+            text(
+                "SELECT actor_id FROM src.watermark "
+                "WHERE source_id = 'kap' AND job_name = 'j' AND key = 'k'"
+            )
+        )
+    ).one()
+    assert row.actor_id == "user:first"
+
+    events = (
+        await session.execute(
+            text(
+                "SELECT operation, actor_id FROM audit.events "
+                "WHERE target_schema = 'src' AND target_table = 'watermark' "
+                "ORDER BY occurred_at"
+            )
+        )
+    ).all()
+    assert [e.operation for e in events] == [
+        "watermark.set",
+        "watermark.idempotent_hit",
+    ]
+    assert events[0].actor_id == "user:first"
+    assert events[1].actor_id == "user:retry"
+
+    set_actor(None)
+
+
+async def test_set_force_overwrite_emits_force_set_event(
+    session: AsyncSession,
+) -> None:
+    """set() with a different value than the existing row emits
+    watermark.force_set with before/after. Last-writer-wins on the
+    row's audit cols."""
+    from aslan_core.audit import Actor, set_actor
+
+    await _seed_source(session)
+    await _wipe_watermarks(session)
+    await session.execute(text("DELETE FROM audit.events"))
+    await session.commit()
+
+    set_actor(Actor(actor_id="user:first", actor_kind="user"))
+    store = WatermarkStore(session)
+    await store.advance("kap", "j", "k", new_cursor="10", expected_cursor=None)
+    await session.commit()
+
+    set_actor(Actor(actor_id="user:repair", actor_kind="user"))
+    await store.set("kap", "j", "k", "1")  # regression — force_set
+    await session.commit()
+
+    events = (
+        await session.execute(
+            text(
+                "SELECT operation, before, after, actor_id FROM audit.events "
+                "WHERE target_schema = 'src' AND target_table = 'watermark' "
+                "  AND operation = 'watermark.force_set'"
+            )
+        )
+    ).all()
+    assert len(events) == 1
+    assert events[0].before["cursor_value"] == "10"
+    assert events[0].after["cursor_value"] == "1"
+    assert events[0].actor_id == "user:repair"
+
+    # Row last-writer-wins on audit cols.
+    row = (
+        await session.execute(
+            text(
+                "SELECT actor_id FROM src.watermark "
+                "WHERE source_id = 'kap' AND job_name = 'j' AND key = 'k'"
+            )
+        )
+    ).one()
+    assert row.actor_id == "user:repair"
+
+    set_actor(None)

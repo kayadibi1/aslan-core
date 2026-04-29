@@ -10,7 +10,7 @@ inside a subtask do NOT leak back to the parent.
 
 from __future__ import annotations
 
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from typing import Final, Literal
 from uuid import UUID
@@ -80,3 +80,26 @@ def require_actor() -> Actor:
             "request/job boundary, or pass actor= to ingestion_run(...)"
         )
     return a
+
+
+def push_actor(actor: Actor) -> Token[Actor | None]:
+    """Set the actor and return a Token that can later restore the
+    previous value via :func:`pop_actor`.
+
+    Used by scope-bounded helpers like :func:`ingestion_run` so the
+    parent context's actor (if any) is restored when the scope exits.
+    Equivalent to ``set_actor(actor)`` plus tracking the token; prefer
+    the matched push/pop pair when entering and exiting a finite scope.
+    """
+    return _current_actor.set(actor)
+
+
+def pop_actor(token: Token[Actor | None]) -> None:
+    """Restore the actor ContextVar to the value captured at the
+    matching :func:`push_actor` call.
+
+    The Token is opaque per :mod:`contextvars`; the runtime treats
+    out-of-order resets as an error. The push/pop helper pair is the
+    symmetric API to :func:`set_actor` (which is the unscoped form).
+    """
+    _current_actor.reset(token)
