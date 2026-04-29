@@ -915,3 +915,112 @@ async def test_caller_rollback_without_release_leaves_orphans(
     # The manifest is still in caller's hands for deferred cleanup
     assert len(result.object_keys) == 2
     assert result.bucket == "aslan-filings"
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_dedup_hit_skips_attachments_and_returns_empty_manifest(
+    session: AsyncSession,
+    object_storage_fake: object,
+) -> None:
+    """Codex 2026-04-29: when put_filing hits primary-hash dedup
+    (`created=False`), the attachment phase is skipped entirely. The
+    existing filing already owns its attachments; running the attachment
+    phase against the existing filing_id would (a) overwrite blobs the
+    existing row owns if filenames collide, and (b) lure release(result)
+    into deleting blobs the caller never inserted.
+
+    Verifies: dedup hit returns an empty manifest, original blobs and
+    attachment rows untouched, and a follow-up release(result) is a
+    safe no-op.
+    """
+    from aslan_core.documents.client import DocumentStore
+    from aslan_core.schemas.filing import AttachmentIn
+
+    run_id = await _seed(session)
+    store = DocumentStore(
+        session,
+        object_client=object_storage_fake,  # type: ignore[arg-type]
+        ingestion_run_id=run_id,
+    )
+
+    primary = b"<html>main</html>"
+    original_attachment_bytes = b"original exhibit bytes"
+    a1 = AttachmentIn(
+        bytes=original_attachment_bytes,
+        mime="application/pdf",
+        filename="exhibit.pdf",
+        role="exhibit",
+        sequence=1,
+    )
+
+    # First put — happy path: primary + 1 attachment uploaded and inserted.
+    r1 = await store.put_filing(
+        source_id="kap",
+        source_filing_ref="DEDUP-A",
+        entity_id=None,
+        kind="news",
+        title="t",
+        published_at=datetime(2026, 4, 28, tzinfo=UTC),
+        primary_bytes=primary,
+        primary_mime="text/html",
+        primary_filename="main.html",
+        attachments=[a1],
+    )
+    await session.commit()
+
+    assert r1.created is True
+    assert len(r1.object_keys) == 2  # primary + 1 attachment
+    bucket_state_before = dict(object_storage_fake._bodies)  # type: ignore[attr-defined]
+    assert len(bucket_state_before) == 2
+
+    # Second put — SAME primary bytes (case A), DIFFERENT attachment bytes
+    # under the SAME filename. Without the guard, _persist_attachments
+    # would compute the deterministic key from the existing filing_id +
+    # 'exhibit.pdf', overwrite the existing blob with the new bytes, and
+    # add the key to the manifest.
+    a1_evil = AttachmentIn(
+        bytes=b"DIFFERENT bytes that would corrupt the original if uploaded",
+        mime="application/pdf",
+        filename="exhibit.pdf",
+        role="exhibit",
+        sequence=1,
+    )
+    r2 = await store.put_filing(
+        source_id="kap",
+        source_filing_ref="DEDUP-A",
+        entity_id=None,
+        kind="news",
+        title="t",
+        published_at=datetime(2026, 4, 28, tzinfo=UTC),
+        primary_bytes=primary,
+        primary_mime="text/html",
+        primary_filename="main.html",
+        attachments=[a1_evil],
+    )
+    await session.commit()
+
+    # Dedup hit: same filing returned, no new blobs, empty manifest.
+    assert r2.created is False
+    assert r2.filing.filing_id == r1.filing.filing_id
+    assert r2.object_keys == []
+
+    # Bucket: identical to the post-r1 state. The attempted overwrite
+    # never happened.
+    bucket_state_after = dict(object_storage_fake._bodies)  # type: ignore[attr-defined]
+    assert bucket_state_after == bucket_state_before
+
+    # The original attachment blob bytes are intact.
+    [att_key] = [k for k in r1.object_keys if k != r1.filing.primary_object_key]
+    assert object_storage_fake.get_body(r1.bucket, att_key) == original_attachment_bytes  # type: ignore[attr-defined]
+
+    # The attachment row count is still 1 (no second row inserted).
+    att_count = await session.scalar(
+        text("SELECT COUNT(*) FROM doc.filing_attachment WHERE filing_id = :fid"),
+        {"fid": r1.filing.filing_id},
+    )
+    assert att_count == 1
+
+    # release(r2) is a no-op: empty manifest. Original blobs survive.
+    await store.release(r2)
+    bucket_state_post_release = dict(object_storage_fake._bodies)  # type: ignore[attr-defined]
+    assert bucket_state_post_release == bucket_state_before

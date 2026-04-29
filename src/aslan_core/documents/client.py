@@ -343,7 +343,17 @@ class DocumentStore:
             # attachments uploaded). codex 2026-04-28: per-attachment cleanup
             # is unsound because the filing INSERT and attachment INSERTs all
             # live in the same uncommitted transaction.
-            if attachments:
+            #
+            # Dedup-hit guard (codex 2026-04-29): skip attachments entirely
+            # when `created=False`. The existing filing already owns its
+            # attachments; running the attachment phase here would (a) build
+            # deterministic keys from the existing filing_id and overwrite
+            # blobs the existing row owns if filenames collide, and (b)
+            # append those keys to `_uploaded_keys`, luring `release(result)`
+            # into deleting blobs the caller never inserted. Case A (pure
+            # rerun) and case B (republished_as) both have "this content
+            # already exists; we are not adding anything new" semantics.
+            if attachments and created:
                 await self._persist_attachments(
                     filing_id=actual_filing_id,
                     attachments=attachments,
