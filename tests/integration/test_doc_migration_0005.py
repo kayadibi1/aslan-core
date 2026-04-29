@@ -74,9 +74,9 @@ async def test_filing_unique_constraints(session: AsyncSession) -> None:
         "source_id",
         "primary_sha256",
     ) in cols_sets, "expected UNIQUE (source_id, primary_sha256) for hash dedup"
-    assert (
-        ("source_id", "source_filing_ref", "revision_no") in cols_sets
-    ), "expected UNIQUE (source_id, source_filing_ref, revision_no) for single-head invariant"
+    assert ("source_id", "source_filing_ref", "revision_no") in cols_sets, (
+        "expected UNIQUE (source_id, source_filing_ref, revision_no) for single-head invariant"
+    )
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -90,6 +90,6 @@ async def test_filing_lookup_index_exists(session: AsyncSession) -> None:
         )
     ).all()
     names = {r.indexname for r in rows}
-    assert any(
-        "source_ref" in n for n in names
-    ), "expected an index covering (source_id, source_filing_ref, revision_no DESC)"
+    assert any("source_ref" in n for n in names), (
+        "expected an index covering (source_id, source_filing_ref, revision_no DESC)"
+    )

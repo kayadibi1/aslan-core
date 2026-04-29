@@ -172,9 +172,9 @@ async def test_doc_release_deletes_blob_and_row(
 
     # Release.
     release_result = await _invoke(cli, ["doc", "release", filing_id])
-    assert (
-        release_result.exit_code == 0
-    ), f"output={release_result.output}\nexc={release_result.exception!r}"
+    assert release_result.exit_code == 0, (
+        f"output={release_result.output}\nexc={release_result.exception!r}"
+    )
 
     # Bucket empty + row gone.
     assert object_storage_fake.all_keys() == set()
