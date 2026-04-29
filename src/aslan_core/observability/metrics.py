@@ -65,6 +65,29 @@ _KNOWN_FILING_KINDS: frozenset[str] = frozenset(
 of the metric stays bounded by ``len(_KNOWN_FILING_KINDS)``. Expand
 deliberately when a new domain value is added to the spec."""
 
+_KNOWN_FREQUENCIES: frozenset[str] = frozenset(
+    {
+        "tick",
+        "1s",
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "1h",
+        "1d",
+        "1w",
+        "1mo",
+        "1q",
+        "1y",
+        "irregular",
+    }
+)
+"""Allow-list of every ``frequency`` string the v0.4 timeseries Pydantic
+``Frequency`` literal accepts. Bounds the cardinality of
+``aslan_series_upserts_total{frequency=...}``: any value outside this
+set collapses to ``"other"`` (the same defensive normalisation pattern
+used for ``filing_puts.kind`` and ``audit_events.operation``)."""
+
 _KNOWN_AUDIT_OPERATIONS: frozenset[str] = frozenset(
     {
         "entity.create",
@@ -351,6 +374,15 @@ audit_events = _LazyCounter(
     labelnames=("operation", "actor_kind"),
 )
 
+series_upserts = _LazyCounter(
+    name="aslan_series_upserts_total",
+    documentation=(
+        "Total ObservationWriter.upsert_series calls (fresh + idempotent + "
+        "field-change paths combined)."
+    ),
+    labelnames=("source_id", "frequency"),
+)
+
 
 # ── Histograms ───────────────────────────────────────────────────────
 
@@ -400,6 +432,7 @@ __all__ = [
     "object_storage_op_duration",
     "object_storage_orphans",
     "observation_writes",
+    "series_upserts",
 ]
 
 # The cardinality-bounding helper and allow-lists are intentionally

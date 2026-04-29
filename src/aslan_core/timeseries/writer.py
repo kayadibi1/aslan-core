@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from aslan_core.audit import (
     Actor,
     AuditRecord,
+    assert_actor_or_strict_raise,
     current_actor,
 )
 from aslan_core.audit import record as audit_record
@@ -28,6 +29,7 @@ from aslan_core.errors import (
     MetadataSchemaViolation,
     SeriesCodeConflict,
 )
+from aslan_core.observability import metrics
 from aslan_core.observability.tracing import traced
 from aslan_core.schemas.timeseries import (
     Frequency,
@@ -155,6 +157,10 @@ class ObservationWriter:
         fresh INSERT and ``created=False`` on idempotent / field-change
         paths (Tasks 9 + 10).
         """
+        # Strict-mode early check (codex F3 from v0.3): raise BEFORE
+        # any DB I/O if audit_strict=True and no actor is set. Lenient
+        # mode falls through and audit.record() writes system:unknown.
+        assert_actor_or_strict_raise()
         actor = current_actor()
         meta: dict[str, Any] = metadata if metadata is not None else {}
 
@@ -185,6 +191,17 @@ class ObservationWriter:
             # Codex F18 + F19: scan metadata recursively (only top-level
             # ``subjects`` is skipped — ``fields`` IS scanned).
             _raise_if_pii_in_metadata(metadata)
+
+        # Prometheus: count one upsert per call (fresh + idempotent +
+        # field-change paths combined; the per-path outcome is already
+        # captured in ``aslan_audit_events_total{operation=series.*}``).
+        # The ``frequency`` label is bounded by the closed allow-list
+        # ``_KNOWN_FREQUENCIES``; values outside the spec literal
+        # collapse to ``"other"``.
+        metrics.series_upserts.labels(
+            source_id=source_id,
+            frequency=metrics._normalize_metric_label(frequency, metrics._KNOWN_FREQUENCIES),
+        ).inc()
 
         # Look up existing row by series_code.
         existing = (
