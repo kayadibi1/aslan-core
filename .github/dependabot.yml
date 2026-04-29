@@ -1,0 +1,20 @@
+# .github/dependabot.yml
+# Automated dependency updates (Task 22, v0.3.0).
+#
+# Python deps run weekly so security backports land within a sprint
+# without overwhelming review bandwidth. GitHub Actions move slower,
+# so monthly cadence is enough.
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels: ["deps"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    labels: ["ci"]
