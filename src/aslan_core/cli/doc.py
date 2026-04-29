@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import mimetypes
 from collections.abc import Callable
 from datetime import date as _date
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -18,6 +21,7 @@ from aslan_core.documents.object_storage import (
     Aioboto3ObjectStorageClient,
     ObjectStorageClient,
 )
+from aslan_core.ingestion.run import ingestion_run
 
 
 def _default_object_client() -> ObjectStorageClient:
@@ -277,5 +281,164 @@ async def _stats_impl(since: _date | None, json_flag: bool) -> None:
         else:
             for r in payload:
                 click.echo(f"{r['source_id']}\t{r['kind']}\t{r['count']}")
+    finally:
+        await engine.dispose()
+
+
+# ─── Task 29: put (manual filing insert) ──────────────────────────────────
+
+
+def _parse_published_at(s: str) -> datetime:
+    """Parse an ISO-8601 timestamp; reject naive datetimes (UTC required)."""
+    # ``datetime.fromisoformat`` accepts trailing 'Z' on Python 3.11+.
+    dt = (
+        datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if s.endswith("Z")
+        else (datetime.fromisoformat(s))
+    )
+    if dt.tzinfo is None:
+        raise click.BadParameter(
+            "--published-at must be timezone-aware (UTC); append 'Z' or '+00:00'"
+        )
+    return dt
+
+
+@doc.command("put")
+@click.option("--source-id", required=True, help="Must reference an existing src.source row.")
+@click.option("--source-ref", required=True, help="Source's per-row identifier.")
+@click.option("--kind", required=True, help="e.g. 'news', 'material_event', 'financial_report'.")
+@click.option("--title", required=True)
+@click.option(
+    "--published-at",
+    "published_at_str",
+    required=True,
+    metavar="ISO-8601",
+    help="Tz-aware ISO-8601 timestamp (e.g. 2026-04-28T12:00:00Z).",
+)
+@click.option(
+    "--primary-file",
+    "primary_file",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, readable=True),
+    help="Local path to the filing's primary document.",
+)
+@click.option(
+    "--primary-mime",
+    "primary_mime",
+    default=None,
+    help="MIME type. Inferred from filename when omitted.",
+)
+@click.option("--language", default="tr", show_default=True)
+@click.option("--subkind", default=None)
+@click.option("--source-url", default=None)
+@click.option("--entity", "entity_id_str", default=None, help="UUID of the resolved entity.")
+@click.option("--json", "json_flag", is_flag=True, help="Emit a JSON manifest.")
+def put_cmd(
+    source_id: str,
+    source_ref: str,
+    kind: str,
+    title: str,
+    published_at_str: str,
+    primary_file: str,
+    primary_mime: str | None,
+    language: str,
+    subkind: str | None,
+    source_url: str | None,
+    entity_id_str: str | None,
+    json_flag: bool,
+) -> None:
+    """Manually insert a filing from a local file.
+
+    Reads ``--primary-file`` into memory, infers MIME if ``--primary-mime``
+    is not passed, opens an ``ingestion_run`` row tied to ``--source-id``
+    so the FK on ``doc.filing.ingestion_run_id`` is satisfied, and calls
+    ``DocumentStore.put_filing``.
+    """
+    published_at = _parse_published_at(published_at_str)
+    path = Path(primary_file)
+    body = path.read_bytes()
+    mime = primary_mime or _guess_mime(path)
+    entity_id = UUID(entity_id_str) if entity_id_str else None
+    asyncio.run(
+        _put_impl(
+            source_id=source_id,
+            source_ref=source_ref,
+            kind=kind,
+            title=title,
+            published_at=published_at,
+            primary_filename=path.name,
+            primary_bytes=body,
+            primary_mime=mime,
+            language=language,
+            subkind=subkind,
+            source_url=source_url,
+            entity_id=entity_id,
+            json_flag=json_flag,
+        )
+    )
+
+
+def _guess_mime(path: Path) -> str:
+    """Filename → MIME via stdlib ``mimetypes``; falls back to octet-stream."""
+    guessed, _enc = mimetypes.guess_type(path.name)
+    return guessed or "application/octet-stream"
+
+
+async def _put_impl(
+    *,
+    source_id: str,
+    source_ref: str,
+    kind: str,
+    title: str,
+    published_at: datetime,
+    primary_filename: str,
+    primary_bytes: bytes,
+    primary_mime: str,
+    language: str,
+    subkind: str | None,
+    source_url: str | None,
+    entity_id: UUID | None,
+    json_flag: bool,
+) -> None:
+    engine = create_engine()
+    factory = create_session_factory(engine)
+    try:
+        oc = _object_client_factory()
+        async with (
+            ingestion_run(engine, source_id=source_id, job_name="cli.doc.put") as run,
+            session_scope(factory) as s,
+        ):
+            store = DocumentStore(s, object_client=oc, ingestion_run_id=run.id)
+            result = await store.put_filing(
+                source_id=source_id,
+                source_filing_ref=source_ref,
+                entity_id=entity_id,
+                kind=kind,
+                title=title,
+                published_at=published_at,
+                primary_bytes=primary_bytes,
+                primary_mime=primary_mime,
+                primary_filename=primary_filename,
+                language=language,
+                subkind=subkind,
+                source_url=source_url,
+            )
+            await run.increment_docs(1)
+            await run.increment_bytes(len(primary_bytes))
+        payload = {
+            "filing_id": str(result.filing.filing_id),
+            "created": result.created,
+            "is_revision": result.is_revision,
+            "revision_no": result.revision_no,
+            "bucket": result.bucket,
+            "object_keys": list(result.object_keys),
+        }
+        if json_flag:
+            click.echo(json.dumps(payload))
+        else:
+            click.echo(
+                f"{payload['filing_id']}\tcreated={payload['created']}\t"
+                f"v{payload['revision_no']}\tbucket={payload['bucket']}"
+            )
     finally:
         await engine.dispose()
