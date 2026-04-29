@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 import pytest
 from pydantic import BaseModel, ValidationError
 
@@ -16,11 +18,18 @@ from aslan_core.errors import (
     EntityNotFound,
     FilingNotFound,
     IdentifierConflict,
+    IdentifyingSeriesMetadataPii,
+    IdentifyingSeriesMissingSubject,
+    IdentifyingSeriesPiiInClearText,
+    MetadataSchemaViolation,
     ObjectStoreError,
+    ObservationConflict,
     ObservationConstraintViolation,
     ObservationError,
+    ObservationValidationError,
     RegistryConstraintViolation,
     RegistryError,
+    SeriesCodeConflict,
     SeriesNotFound,
     StreamDeserializeError,
     StreamError,
@@ -81,3 +90,43 @@ def test_validation_wrapping_chains_original() -> None:
     except ValidationError as ve:
         wrapped = AslanCoreValidationError.from_pydantic(ve)
         assert wrapped.__cause__ is ve
+
+
+# v0.4.0 timeseries error types ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "cls",
+    [
+        SeriesCodeConflict,
+        ObservationValidationError,
+        ObservationConflict,
+        IdentifyingSeriesPiiInClearText,
+        IdentifyingSeriesMissingSubject,
+        IdentifyingSeriesMetadataPii,
+        MetadataSchemaViolation,
+    ],
+)
+def test_v0_4_timeseries_errors_inherit_aslan_core_error(
+    cls: type[Exception],
+) -> None:
+    assert issubclass(cls, AslanCoreError)
+
+
+def test_observation_conflict_carries_diagnostic_fields() -> None:
+    k = (
+        1,
+        datetime(2026, 1, 1, tzinfo=UTC),
+        datetime(2026, 1, 2, tzinfo=UTC),
+    )
+    e = ObservationConflict("boom", key=k, existing_hash="a", new_hash="b")
+    assert e.key == k
+    assert e.existing_hash == "a"
+    assert e.new_hash == "b"
+
+
+def test_observation_conflict_minimal_construction() -> None:
+    e = ObservationConflict("boom")
+    assert e.key is None
+    assert e.existing_hash is None
+    assert e.new_hash is None
