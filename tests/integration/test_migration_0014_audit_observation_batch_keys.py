@@ -252,3 +252,51 @@ async def test_batch_keys_cascade_deletes_on_event_delete(session: AsyncSession)
         {"eid": eid},
     )
     assert n_after == 0
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_batch_keys_rejects_non_hex_payload_hash(session: AsyncSession) -> None:
+    """Codex Batch 1 F3 — payload_hash must match ``^[0-9a-f]{64}$``.
+    64 'z' chars is the right length but not hex, so the storage
+    boundary rejects it (defense-in-depth on top of CHAR(64)+length
+    CHECK)."""
+    eid, oat = await _insert_parent_event(session, operation="hash_nonhex")
+    with pytest.raises(IntegrityError):
+        await session.execute(
+            text(
+                "INSERT INTO audit.observation_batch_keys "
+                "(event_id, occurred_at, series_id, ts, as_of, payload_hash, action) "
+                "VALUES (:eid, :oat, 1, now(), now(), repeat('z', 64), 'inserted')"
+            ),
+            {"eid": eid, "oat": oat},
+        )
+        await session.commit()
+    await session.rollback()
+    await session.execute(
+        text("DELETE FROM audit.events WHERE event_id = :eid"),
+        {"eid": eid},
+    )
+    await session.commit()
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_batch_keys_rejects_uppercase_payload_hash(session: AsyncSession) -> None:
+    """Codex Batch 1 F3 — uppercase hex is also rejected;
+    hashlib.sha256().hexdigest() always returns lowercase."""
+    eid, oat = await _insert_parent_event(session, operation="hash_upper")
+    with pytest.raises(IntegrityError):
+        await session.execute(
+            text(
+                "INSERT INTO audit.observation_batch_keys "
+                "(event_id, occurred_at, series_id, ts, as_of, payload_hash, action) "
+                "VALUES (:eid, :oat, 1, now(), now(), repeat('A', 64), 'inserted')"
+            ),
+            {"eid": eid, "oat": oat},
+        )
+        await session.commit()
+    await session.rollback()
+    await session.execute(
+        text("DELETE FROM audit.events WHERE event_id = :eid"),
+        {"eid": eid},
+    )
+    await session.commit()

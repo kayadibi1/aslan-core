@@ -96,6 +96,10 @@ class Observation(Base):
             "(value IS NULL) <> (value_text IS NULL)",
             name="observation_value_check",
         ),
+        CheckConstraint(
+            "payload_hash ~ '^[0-9a-f]{64}$'",
+            name="observation_payload_hash_hex",
+        ),
         Index("observation_series_ts_as_of", "series_id", "ts", "as_of"),
         Index("observation_run", "ingestion_run_id"),
         {"schema": "ts"},

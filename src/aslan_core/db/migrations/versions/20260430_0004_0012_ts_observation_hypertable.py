@@ -26,6 +26,15 @@ raises ObservationConflict.
             as_of DESC`).
         observation_run              (ingestion_run_id)
             for forensic by-run lookups.
+
+CHECK constraints:
+
+  - ``(value IS NULL) <> (value_text IS NULL)`` — codex Batch 1 F1,
+    XOR not OR; exactly one of value/value_text must be set.
+  - ``payload_hash ~ '^[0-9a-f]{64}$'`` — codex Batch 1 F3, lowercase
+    SHA-256 hex (64 hex chars). Mirrors the
+    aslan_core.schemas.timeseries canonical payload-hash contract
+    (hashlib.sha256(...).hexdigest() is always lowercase).
 """
 
 from __future__ import annotations
@@ -52,7 +61,8 @@ def upgrade() -> None:
             quality_flag           SMALLINT NOT NULL DEFAULT 0,
             ingestion_run_id       BIGINT NOT NULL
                 REFERENCES src.ingestion_run(ingestion_run_id),
-            payload_hash           CHAR(64) NOT NULL,
+            payload_hash           CHAR(64) NOT NULL
+                CHECK (payload_hash ~ '^[0-9a-f]{64}$'),
             metadata               JSONB NOT NULL DEFAULT '{}'::jsonb,
             -- audit columns (v0.3 contract)
             actor_id               TEXT,

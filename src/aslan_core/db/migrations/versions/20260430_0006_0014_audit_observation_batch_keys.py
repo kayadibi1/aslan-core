@@ -33,6 +33,11 @@ CHECK constraints:
   - ``char_length(payload_hash) = 64`` — defense-in-depth on top of
     CHAR(64) so a writer bug feeding a short hex prefix is rejected
     at the storage boundary instead of silently right-padded.
+  - ``payload_hash ~ '^[0-9a-f]{64}$'`` — codex Batch 1 F3, lowercase
+    SHA-256 hex (64 hex chars). The canonical payload-hash contract
+    in ``aslan_core.schemas.timeseries`` is hashlib.sha256(...).hexdigest()
+    which is always lowercase; this CHECK rejects uppercase or
+    non-hex strings before they reach the audit chunk.
 """
 
 from __future__ import annotations
@@ -55,7 +60,9 @@ def upgrade() -> None:
             series_id         BIGINT NOT NULL,
             ts                TIMESTAMPTZ NOT NULL,
             as_of             TIMESTAMPTZ NOT NULL,
-            payload_hash      CHAR(64) NOT NULL CHECK (char_length(payload_hash) = 64),
+            payload_hash      CHAR(64) NOT NULL
+                CHECK (char_length(payload_hash) = 64)
+                CHECK (payload_hash ~ '^[0-9a-f]{64}$'),
             action            TEXT NOT NULL CHECK (action IN ('inserted', 'unchanged')),
             PRIMARY KEY (event_id, occurred_at, series_id, ts, as_of)
         )

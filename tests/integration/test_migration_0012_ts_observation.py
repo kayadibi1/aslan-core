@@ -191,6 +191,86 @@ async def test_observation_rejects_both_value_and_value_text(session: AsyncSessi
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_observation_rejects_non_hex_payload_hash(session: AsyncSession) -> None:
+    """Codex Batch 1 F3 — payload_hash must be lowercase SHA-256 hex
+    (``^[0-9a-f]{64}$``). 64 'z' chars is the right length but not hex,
+    so it must be rejected at the storage boundary."""
+    await _ensure_source(session)
+    await session.execute(
+        text(
+            "INSERT INTO ts.series_catalog (series_code, source_id, metric, frequency, unit) "
+            "VALUES ('mig12_hash_nonhex', 'kap', 'm', '1d', 'TRY') ON CONFLICT DO NOTHING"
+        )
+    )
+    sid = await session.scalar(
+        text("SELECT series_id FROM ts.series_catalog WHERE series_code='mig12_hash_nonhex'")
+    )
+    rid = await session.scalar(
+        text(
+            "INSERT INTO src.ingestion_run (source_id, job_name, status) "
+            "VALUES ('kap', 'mig12_hash_nonhex', 'succeeded') RETURNING ingestion_run_id"
+        )
+    )
+    await session.commit()
+
+    with pytest.raises(IntegrityError):
+        await session.execute(
+            text(
+                "INSERT INTO ts.observation "
+                "(series_id, ts, as_of, value, ingestion_run_id, payload_hash) "
+                "VALUES (:sid, now(), now(), 1.0, :rid, repeat('z', 64))"
+            ),
+            {"sid": sid, "rid": rid},
+        )
+        await session.commit()
+    await session.rollback()
+    await session.execute(
+        text("DELETE FROM ts.series_catalog WHERE series_code='mig12_hash_nonhex'")
+    )
+    await session.commit()
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_observation_rejects_uppercase_payload_hash(session: AsyncSession) -> None:
+    """Codex Batch 1 F3 — uppercase hex (``[A-F]``) is also rejected;
+    hashlib.sha256().hexdigest() always returns lowercase, so anything
+    else is a writer bug we want to surface immediately."""
+    await _ensure_source(session)
+    await session.execute(
+        text(
+            "INSERT INTO ts.series_catalog (series_code, source_id, metric, frequency, unit) "
+            "VALUES ('mig12_hash_upper', 'kap', 'm', '1d', 'TRY') ON CONFLICT DO NOTHING"
+        )
+    )
+    sid = await session.scalar(
+        text("SELECT series_id FROM ts.series_catalog WHERE series_code='mig12_hash_upper'")
+    )
+    rid = await session.scalar(
+        text(
+            "INSERT INTO src.ingestion_run (source_id, job_name, status) "
+            "VALUES ('kap', 'mig12_hash_upper', 'succeeded') RETURNING ingestion_run_id"
+        )
+    )
+    await session.commit()
+
+    with pytest.raises(IntegrityError):
+        await session.execute(
+            text(
+                "INSERT INTO ts.observation "
+                "(series_id, ts, as_of, value, ingestion_run_id, payload_hash) "
+                "VALUES (:sid, now(), now(), 1.0, :rid, repeat('A', 64))"
+            ),
+            {"sid": sid, "rid": rid},
+        )
+        await session.commit()
+    await session.rollback()
+    await session.execute(
+        text("DELETE FROM ts.series_catalog WHERE series_code='mig12_hash_upper'")
+    )
+    await session.commit()
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_observation_fk_to_series_is_restrict(session: AsyncSession) -> None:
     """FK to ts.series_catalog must be ON DELETE RESTRICT (not CASCADE)
     so a stray DELETE on series_catalog doesn't silently nuke history.
