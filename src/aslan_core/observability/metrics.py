@@ -65,6 +65,29 @@ _KNOWN_FILING_KINDS: frozenset[str] = frozenset(
 of the metric stays bounded by ``len(_KNOWN_FILING_KINDS)``. Expand
 deliberately when a new domain value is added to the spec."""
 
+_KNOWN_FREQUENCIES: frozenset[str] = frozenset(
+    {
+        "tick",
+        "1s",
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "1h",
+        "1d",
+        "1w",
+        "1mo",
+        "1q",
+        "1y",
+        "irregular",
+    }
+)
+"""Allow-list of every ``frequency`` string the v0.4 timeseries Pydantic
+``Frequency`` literal accepts. Bounds the cardinality of
+``aslan_series_upserts_total{frequency=...}``: any value outside this
+set collapses to ``"other"`` (the same defensive normalisation pattern
+used for ``filing_puts.kind`` and ``audit_events.operation``)."""
+
 _KNOWN_AUDIT_OPERATIONS: frozenset[str] = frozenset(
     {
         "entity.create",
@@ -94,6 +117,26 @@ _KNOWN_AUDIT_OPERATIONS: frozenset[str] = frozenset(
         "ingestion_run.complete",
         "ingestion_run.set_metadata",
         "ingestion_run.increment_rows",
+        # ``series.*`` operations from ObservationWriter.upsert_series
+        # (v0.4.0 Tasks 8-13).
+        "series.upsert",
+        "series.idempotent_hit",
+        "series.update",
+        # Bulk-write batch event from ObservationWriter.write (Task 16).
+        # ONE event per write() call carrying bounded forensic
+        # metadata; per-key detail lives in audit.observation_batch_keys.
+        "observation.write_batch",
+        # v0.4.0 Task 25 — Art. 17 deletion runtime + PII tripwires.
+        # Emitted by the aslan-service deletion runtime (NOT by aslan-core
+        # itself; aslan-core only enforces upsert-time PII rejection).
+        # Listed here so a service-side emitter that lands an audit row
+        # under one of these operations gets a bounded Prometheus label
+        # instead of inflating cardinality.
+        "series.subject_erased",
+        "series.metadata_pii_scrubbed",
+        "series.metadata_bypass_detected",
+        "observation.metadata_pii_scrubbed",
+        "observation.metadata_bypass_detected",
     }
 )
 """Allow-list of every ``operation=`` string emitted by aslan-core's
@@ -345,6 +388,15 @@ audit_events = _LazyCounter(
     labelnames=("operation", "actor_kind"),
 )
 
+series_upserts = _LazyCounter(
+    name="aslan_series_upserts_total",
+    documentation=(
+        "Total ObservationWriter.upsert_series calls (fresh + idempotent + "
+        "field-change paths combined)."
+    ),
+    labelnames=("source_id", "frequency"),
+)
+
 
 # ── Histograms ───────────────────────────────────────────────────────
 
@@ -370,6 +422,25 @@ object_storage_op_duration = _LazyHistogram(
     buckets=_DURATION_BUCKETS,
 )
 
+# v0.4 ObservationWriter.write — per-batch sample size (used by
+# operators for capacity planning + p99 batch-size alerts). No labels:
+# the histogram is a global signal; per-source breakdown lives on
+# ``observation_writes``.
+observation_write_batch_size = _LazyHistogram(
+    name="aslan_observation_write_batch_size",
+    documentation="Per-write batch size (number of ObservationIn rows attempted).",
+    buckets=(1, 10, 100, 500, 1_000, 5_000, 10_000, 50_000),
+)
+
+# End-to-end wall-clock for ObservationWriter.write. Wired in Task 19;
+# declared here so the metric is registered before the first call.
+observation_write_duration = _LazyHistogram(
+    name="aslan_observation_write_duration_seconds",
+    documentation="ObservationWriter.write end-to-end duration.",
+    labelnames=("source_id",),
+    buckets=(0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0),
+)
+
 
 # ── Gauges ───────────────────────────────────────────────────────────
 
@@ -393,7 +464,10 @@ __all__ = [
     "filing_releases",
     "object_storage_op_duration",
     "object_storage_orphans",
+    "observation_write_batch_size",
+    "observation_write_duration",
     "observation_writes",
+    "series_upserts",
 ]
 
 # The cardinality-bounding helper and allow-lists are intentionally

@@ -185,3 +185,143 @@ def test_known_audit_operations_contains_every_emitted_op() -> None:
         "ingestion_run.increment_rows",
     }
     assert expected <= _KNOWN_AUDIT_OPERATIONS
+
+
+def test_known_audit_operations_contains_v04_timeseries_ops() -> None:
+    """v0.4.0 Task 25: every ``series.*`` / ``observation.*`` audit
+    operation emitted by the v0.4 timeseries surface must be in the
+    allow-list. Includes the writer operations (already added in earlier
+    batches) AND the deletion-runtime / PII-tripwire operations
+    (``*_subject_erased``, ``*_metadata_pii_scrubbed``,
+    ``*_metadata_bypass_detected``) which the aslan-service Art. 17
+    runtime emits — the allow-list is shared so a service-side emitter
+    that bypasses the writer still lands a bounded metric label here.
+    """
+    from aslan_core.observability.metrics import _KNOWN_AUDIT_OPERATIONS
+
+    expected_v04 = {
+        # ObservationWriter.upsert_series
+        "series.upsert",
+        "series.idempotent_hit",
+        "series.update",
+        # ObservationWriter.write
+        "observation.write_batch",
+        # Art. 17 deletion runtime + PII tripwires (aslan-service)
+        "series.subject_erased",
+        "series.metadata_pii_scrubbed",
+        "series.metadata_bypass_detected",
+        "observation.metadata_pii_scrubbed",
+        "observation.metadata_bypass_detected",
+    }
+    assert expected_v04 <= _KNOWN_AUDIT_OPERATIONS, (
+        f"missing v0.4 operations: {expected_v04 - _KNOWN_AUDIT_OPERATIONS}"
+    )
+
+
+def test_known_audit_operations_set_pinned_exactly() -> None:
+    """Codex 2026-04-29: prevent silent cardinality drift. The
+    allow-list IS the cardinality boundary — every entry becomes a
+    real Prometheus label value, not a wildcard. Any addition must be
+    accompanied by an update here so the change is visible in code
+    review.
+
+    To add a new operation: add it to `_KNOWN_AUDIT_OPERATIONS` AND
+    to the expected set below. The test catches both directions:
+    additions to the allow-list without updating expected, and
+    additions to expected without updating the allow-list.
+    """
+    from aslan_core.observability.metrics import _KNOWN_AUDIT_OPERATIONS
+
+    expected_full = {
+        # v0.1-v0.3 baseline (registry, identifier, sector, relationship,
+        # entity, filing, filing_body, watermark, ingestion_run)
+        "entity.create",
+        "entity.idempotent_hit",
+        "entity.update",
+        "identifier.add",
+        "identifier.idempotent_hit",
+        "identifier.expire",
+        "entity_sector.upsert",
+        "entity_sector.idempotent_hit",
+        "entity_relationship.link",
+        "entity_relationship.idempotent_hit",
+        "sector.upsert",
+        "sector.idempotent_hit",
+        "filing.put",
+        "filing.dedup_hit",
+        "filing.idempotent_hit",
+        "filing.republished_alias_added",
+        "filing_body.create",
+        "filing_body.update",
+        "filing.release",
+        "watermark.set",
+        "watermark.idempotent_hit",
+        "watermark.advance",
+        "watermark.force_set",
+        "ingestion_run.start",
+        "ingestion_run.complete",
+        "ingestion_run.set_metadata",
+        "ingestion_run.increment_rows",
+        # v0.4 timeseries (writer + deletion runtime / PII tripwires)
+        "series.upsert",
+        "series.idempotent_hit",
+        "series.update",
+        "observation.write_batch",
+        "series.subject_erased",
+        "series.metadata_pii_scrubbed",
+        "series.metadata_bypass_detected",
+        "observation.metadata_pii_scrubbed",
+        "observation.metadata_bypass_detected",
+    }
+    assert expected_full == _KNOWN_AUDIT_OPERATIONS, (
+        f"allow-list drift detected. "
+        f"unexpected additions: {sorted(_KNOWN_AUDIT_OPERATIONS - expected_full)} | "
+        f"missing entries: {sorted(expected_full - _KNOWN_AUDIT_OPERATIONS)}"
+    )
+
+
+def test_known_frequencies_matches_spec_literal() -> None:
+    """v0.4.0 Task 25: ``_KNOWN_FREQUENCIES`` MUST contain exactly the
+    13 strings that the ``Frequency`` Pydantic literal accepts. Bounds
+    the cardinality of ``aslan_series_upserts_total{frequency=...}``
+    so a typo in a future caller can never inflate the metric beyond
+    ``len(spec) + 1`` (the ``+1`` is for the ``"other"`` fallback)."""
+    from aslan_core.observability.metrics import _KNOWN_FREQUENCIES
+
+    spec = {
+        "tick",
+        "1s",
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "1h",
+        "1d",
+        "1w",
+        "1mo",
+        "1q",
+        "1y",
+        "irregular",
+    }
+    assert spec == _KNOWN_FREQUENCIES, (
+        f"_KNOWN_FREQUENCIES drift — extra={_KNOWN_FREQUENCIES - spec}, "
+        f"missing={spec - _KNOWN_FREQUENCIES}"
+    )
+    assert len(_KNOWN_FREQUENCIES) == 13
+
+
+def test_unknown_frequency_maps_to_other() -> None:
+    """v0.4.0 Task 25: defensive check on the ``Frequency`` label.
+    A typo or future-extension value collapses to ``"other"`` so the
+    Prometheus cardinality stays bounded by the allow-list."""
+    from aslan_core.observability.metrics import (
+        _KNOWN_FREQUENCIES,
+        _normalize_metric_label,
+    )
+
+    assert _normalize_metric_label("1d", _KNOWN_FREQUENCIES) == "1d"
+    assert _normalize_metric_label("irregular", _KNOWN_FREQUENCIES) == "irregular"
+    # Typos and out-of-spec values map to "other".
+    assert _normalize_metric_label("daily", _KNOWN_FREQUENCIES) == "other"
+    assert _normalize_metric_label("1day", _KNOWN_FREQUENCIES) == "other"
+    assert _normalize_metric_label("", _KNOWN_FREQUENCIES) == "other"
