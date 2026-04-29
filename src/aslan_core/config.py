@@ -13,6 +13,12 @@ class Settings(BaseSettings):
         env_file=".env",
         extra="ignore",
         case_sensitive=False,
+        # Codex 2026-04-29: prevent ValidationError text from echoing
+        # raw secret input back through ConfigError. Without this,
+        # `Settings(ASLAN_PG_DSN={"x": "...secret..."})` would surface
+        # the secret in the error message via Pydantic's default
+        # `input_value=...` rendering.
+        hide_input_in_errors=True,
     )
 
     # Credential-bearing fields are wrapped in ``SecretStr`` so that
@@ -91,6 +97,7 @@ class _DbConfig(BaseSettings):
         env_file=".env",
         extra="ignore",
         case_sensitive=False,
+        hide_input_in_errors=True,
     )
 
     postgres_dsn: SecretStr = Field(validation_alias="ASLAN_PG_DSN")

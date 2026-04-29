@@ -192,3 +192,31 @@ def test_secret_fields_unwrap_via_get_secret_value(monkeypatch: pytest.MonkeyPat
     assert s.postgres_dsn.get_secret_value() == "postgresql+asyncpg://u:p@host:6432/db"
     assert s.s3_access_key.get_secret_value() == "ak-123"
     assert s.s3_secret_key.get_secret_value() == "sk-456"
+
+
+def test_config_error_does_not_leak_pg_dsn_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Codex 2026-04-29: Pydantic's default validation errors include
+    `input_value`. Settings catches ValidationError and re-raises ConfigError;
+    without `hide_input_in_errors=True`, raw inputs (including DSNs containing
+    passwords) leak through ConfigError text."""
+    from aslan_core.config import Settings
+    from aslan_core.errors import ConfigError
+
+    monkeypatch.delenv("ASLAN_PG_DSN", raising=False)
+    secret = "supersecret-do-not-leak-via-error"
+    with pytest.raises(ConfigError) as exc_info:
+        Settings(ASLAN_PG_DSN={"unexpected": f"postgresql://u:{secret}@h/d"})
+    msg = str(exc_info.value)
+    assert secret not in msg
+
+
+def test_config_error_does_not_leak_s3_secret_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    from aslan_core.config import Settings
+    from aslan_core.errors import ConfigError
+
+    secret = "supersecret-s3-do-not-leak"
+    monkeypatch.delenv("ASLAN_S3_SECRET_KEY", raising=False)
+    with pytest.raises(ConfigError) as exc_info:
+        Settings(ASLAN_S3_SECRET_KEY={"weird": secret})
+    msg = str(exc_info.value)
+    assert secret not in msg
