@@ -1705,6 +1705,140 @@ async def test_put_filing_case_b_alias_add_writes_republished_event(
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_case_b_repeated_alias_emits_idempotent_hit_not_added(
+    session: AsyncSession,
+    object_storage_fake: object,
+) -> None:
+    """Codex (Batch 2 review F2): a put_filing with same bytes + same
+    NEW source_filing_ref called twice must emit one
+    filing.republished_alias_added event for the FIRST alias-add and
+    one filing.idempotent_hit for the SECOND call (alias already in
+    republished_as).
+
+    The canonical row's actor_id MUST NOT be rewritten on the second
+    call — the SQL CASE already no-ops the row mutation, but the audit
+    classification was emitting filing.republished_alias_added on every
+    repeat. Three events expected:
+      1. filing.put           (actor A, original creator under ref X)
+      2. filing.republished_alias_added (actor A, adds ref Y as alias)
+      3. filing.idempotent_hit (actor C, ref Y already aliased — no-op)
+    """
+    from aslan_core.audit import Actor, set_actor
+    from aslan_core.documents.client import DocumentStore
+
+    run_id = await _seed(session)
+    await session.execute(text("DELETE FROM audit.events"))
+    await session.commit()
+
+    body = b"<html>case-b-repeat</html>"
+
+    # Round 1: actor A creates filing under ref X.
+    set_actor(Actor(actor_id="user:A", actor_kind="user"))
+    store = DocumentStore(session, object_client=object_storage_fake, ingestion_run_id=run_id)  # type: ignore[arg-type]
+    r_x = await store.put_filing(
+        source_id="kap",
+        source_filing_ref="REF-X",
+        entity_id=None,
+        kind="news",
+        title="t",
+        published_at=datetime(2026, 4, 28, tzinfo=UTC),
+        primary_bytes=body,
+        primary_mime="text/html",
+        primary_filename="main.html",
+    )
+    await session.commit()
+    canonical_filing_id = r_x.filing.filing_id
+
+    # Round 2: actor A puts same bytes under NEW ref Y → case B
+    # alias-add. Row's actor cols last-writer-win on this call, but
+    # since A == A here that's still A.
+    r_y = await store.put_filing(
+        source_id="kap",
+        source_filing_ref="REF-Y",
+        entity_id=None,
+        kind="news",
+        title="t",
+        published_at=datetime(2026, 4, 28, tzinfo=UTC),
+        primary_bytes=body,
+        primary_mime="text/html",
+        primary_filename="main.html",
+    )
+    await session.commit()
+    assert r_y.created is False
+    assert r_y.filing.filing_id == canonical_filing_id
+    assert r_y.filing.metadata.get("republished_as") == ["REF-Y"]
+
+    # Capture the row's actor_id at this point — it must be the
+    # alias-adder of round 2, which is actor A.
+    row_after_round_2 = (
+        await session.execute(
+            text("SELECT actor_id FROM doc.filing WHERE filing_id = :fid"),
+            {"fid": canonical_filing_id},
+        )
+    ).one()
+    assert row_after_round_2.actor_id == "user:A"
+
+    # Round 3: actor C calls put_filing again with same bytes + ref Y.
+    # Ref Y is already in metadata.republished_as on the canonical row,
+    # so the SQL CASE no-ops the row mutation. The audit classification
+    # MUST detect this and emit filing.idempotent_hit, not
+    # filing.republished_alias_added (the bug being fixed).
+    set_actor(Actor(actor_id="user:C", actor_kind="user"))
+    r_y2 = await store.put_filing(
+        source_id="kap",
+        source_filing_ref="REF-Y",
+        entity_id=None,
+        kind="news",
+        title="t",
+        published_at=datetime(2026, 4, 28, tzinfo=UTC),
+        primary_bytes=body,
+        primary_mime="text/html",
+        primary_filename="main.html",
+    )
+    await session.commit()
+    assert r_y2.created is False
+    assert r_y2.filing.filing_id == canonical_filing_id
+    # republished_as unchanged (no duplicate of REF-Y appended).
+    assert r_y2.filing.metadata.get("republished_as") == ["REF-Y"]
+
+    # Canonical row's actor_id MUST still be A — actor C did not rewrite
+    # attribution on the idempotent hit.
+    row_final = (
+        await session.execute(
+            text("SELECT actor_id FROM doc.filing WHERE filing_id = :fid"),
+            {"fid": canonical_filing_id},
+        )
+    ).one()
+    assert row_final.actor_id == "user:A"
+
+    # Three events total in the expected order.
+    events = (
+        await session.execute(
+            text(
+                "SELECT operation, actor_id, before, after FROM audit.events "
+                "WHERE target_schema = 'doc' AND target_table = 'filing' "
+                "ORDER BY occurred_at"
+            )
+        )
+    ).all()
+    assert [e.operation for e in events] == [
+        "filing.put",
+        "filing.republished_alias_added",
+        "filing.idempotent_hit",
+    ]
+    assert events[0].actor_id == "user:A"
+    assert events[1].actor_id == "user:A"
+    assert events[2].actor_id == "user:C"
+    # idempotent_hit's before == after (no row mutation occurred).
+    idem = events[2]
+    assert idem.before is not None
+    assert idem.after is not None
+    assert idem.before.get("metadata") == idem.after.get("metadata")
+
+    set_actor(None)
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_attach_extracted_text_writes_audit_row(
     session: AsyncSession,
     object_storage_fake: object,

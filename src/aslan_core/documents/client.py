@@ -574,17 +574,25 @@ class DocumentStore:
             filing = await self.get_filing(actual_filing_id)
 
             # Step 7 (audit): emit the appropriate event based on which
-            # case fired. Event categories per spec §5.4:
+            # SQL CASE branch fired. Event categories per spec §5.4 +
+            # codex Batch 2 F2 (2026-04-29):
             #
-            #   - created=True              → filing.put (fresh INSERT, may
-            #                                 be revision_no > 1 case C
-            #                                 chain advance)
-            #   - created=False, pre.ref==new ref → filing.dedup_hit (case A,
-            #                                 true no-op)
-            #   - created=False, pre.ref!=new ref → filing.republished_alias_added
-            #                                 (case B, alias added; row's
-            #                                 audit cols just got
-            #                                 overwritten by this actor)
+            #   - created=True                                → filing.put
+            #     Fresh INSERT, may be revision_no > 1 case C chain advance.
+            #   - created=False, pre.ref == new ref           → filing.dedup_hit
+            #     Case A pure rerun: same source_filing_ref, same bytes.
+            #     The SQL CASE preserved metadata + audit cols.
+            #   - created=False, pre.ref != new ref AND       → filing.idempotent_hit
+            #     republished_as ALREADY contains new ref
+            #     The new ref was already aliased on a prior call. The SQL
+            #     CASE preserved metadata + audit cols. Without this branch,
+            #     a repeated alias-add would be misclassified as
+            #     filing.republished_alias_added even though no row
+            #     mutation occurred (codex Batch 2 F2).
+            #   - created=False, otherwise                    → filing.republished_alias_added
+            #     Case B alias add: the new ref is appended to
+            #     metadata.republished_as; row's audit cols overwritten
+            #     by this actor (last-writer-wins).
             after_audit = _filing_audit_payload(filing)
             after_audit["attachments"] = [
                 {"sequence": a.sequence, "filename": a.filename, "bytes": len(a.bytes)}
@@ -597,15 +605,26 @@ class DocumentStore:
                 # pre is non-None on the not-created path: a hash-dedup
                 # hit means an existing canonical row matched.
                 assert pre is not None
+                pre_metadata: dict[str, Any] = pre.metadata or {}
                 before_audit = {
                     "filing_id": str(pre.filing_id),
                     "source_filing_ref": pre.source_filing_ref,
-                    "metadata": pre.metadata or {},
+                    "metadata": pre_metadata,
                     "actor_id": pre.actor_id,
                     "actor_kind": pre.actor_kind,
                 }
                 if pre.source_filing_ref == source_filing_ref:
                     op = "filing.dedup_hit"
+                elif source_filing_ref in pre_metadata.get("republished_as", []):
+                    # Codex Batch 2 F2: alias already present from a
+                    # prior alias-add — the SQL CASE no-oped the row.
+                    # Emit idempotent_hit, NOT republished_alias_added.
+                    # `after_audit` is built from the post-call SELECT
+                    # of the canonical row, which equals pre_metadata
+                    # for this branch (no mutation), so before/after
+                    # are naturally symmetric — caller-visible diff
+                    # is zero.
+                    op = "filing.idempotent_hit"
                 else:
                     op = "filing.republished_alias_added"
             await audit_record(
