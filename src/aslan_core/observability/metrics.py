@@ -137,6 +137,9 @@ _KNOWN_AUDIT_OPERATIONS: frozenset[str] = frozenset(
         "series.metadata_bypass_detected",
         "observation.metadata_pii_scrubbed",
         "observation.metadata_bypass_detected",
+        # v0.5.0 stream-publish + outbox-drainer audit operations.
+        "stream.publish",
+        "stream.outbox_drained",
     }
 )
 """Allow-list of every ``operation=`` string emitted by aslan-core's
@@ -146,6 +149,30 @@ collapse to ``"other"`` rather than create an unbounded metric. Update
 this set whenever a new ``operation`` string is added to a public
 mutation path; the corresponding allow-list test in
 ``tests/unit/test_metrics_cardinality.py`` enforces parity."""
+
+
+_KNOWN_STREAMS: frozenset[str] = frozenset(
+    {
+        "aslan.kap.filings.new",
+        "aslan.kap.filings.amended",
+        "aslan.kap.filings.financial_report",
+        "aslan.evds.observations.new",
+        "aslan.tefas.observations.new",
+        "aslan.tefas.nav.new",
+        # Per-symbol BIST ticks streams (e.g. ``aslan.bist.ticks.AKBNK``)
+        # collapse to this prefix via :func:`aslan_core.streams.names
+        # .normalize_bist_ticks_label` before label emission.
+        "aslan.bist.ticks",
+        "aslan.entity.created",
+        "other",
+    }
+)
+"""Allow-list of canonical stream names that may appear on the
+Prometheus ``stream`` label (codex spec §9). Mirrors
+:data:`aslan_core.streams.names.STREAMS` plus ``"other"`` for any
+out-of-allow-list stream that the producer / drainer / consumer
+collapses defensively. Hardened in Task 20 with a parity test against
+``aslan_core.streams.names.STREAMS``."""
 
 
 def _normalize_metric_label(
@@ -453,9 +480,42 @@ advisory_lock_holders = _LazyGauge(
     ),
 )
 
+# v0.5.0 stream-outbox pending counter — kept current by the drainer
+# after each batch (codex spec §6).
+aslan_stream_outbox_pending = _LazyGauge(
+    name="aslan_stream_outbox_pending",
+    documentation="Count of streams.outbox rows whose published_at IS NULL.",
+)
+
+
+# ── v0.5.0 stream metrics ────────────────────────────────────────────
+
+aslan_stream_publishes_total = _LazyCounter(
+    name="aslan_stream_publishes_total",
+    documentation=("Number of stream events published via StreamProducer.publish / publish_many."),
+    labelnames=("stream", "source_id"),
+)
+
+aslan_stream_publish_duration_seconds = _LazyHistogram(
+    name="aslan_stream_publish_duration_seconds",
+    documentation="End-to-end duration of a single StreamProducer.publish call.",
+    labelnames=("stream",),
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5),
+)
+
+aslan_stream_outbox_drain_duration_seconds = _LazyHistogram(
+    name="aslan_stream_outbox_drain_duration_seconds",
+    documentation="Wall-clock duration of one drain_outbox iteration.",
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
+)
+
 
 __all__ = [
     "advisory_lock_holders",
+    "aslan_stream_outbox_drain_duration_seconds",
+    "aslan_stream_outbox_pending",
+    "aslan_stream_publish_duration_seconds",
+    "aslan_stream_publishes_total",
     "audit_events",
     "db_query_duration",
     "entity_creates",

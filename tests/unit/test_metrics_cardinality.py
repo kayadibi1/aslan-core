@@ -272,6 +272,9 @@ def test_known_audit_operations_set_pinned_exactly() -> None:
         "series.metadata_bypass_detected",
         "observation.metadata_pii_scrubbed",
         "observation.metadata_bypass_detected",
+        # v0.5 streams (publish + outbox-drainer)
+        "stream.publish",
+        "stream.outbox_drained",
     }
     assert expected_full == _KNOWN_AUDIT_OPERATIONS, (
         f"allow-list drift detected. "
