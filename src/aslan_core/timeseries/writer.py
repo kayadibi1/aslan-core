@@ -20,6 +20,7 @@ from aslan_core.audit import (
     current_actor,
 )
 from aslan_core.audit import record as audit_record
+from aslan_core.errors import SeriesCodeConflict
 from aslan_core.observability.tracing import traced
 from aslan_core.schemas.timeseries import (
     Frequency,
@@ -151,8 +152,108 @@ class ObservationWriter:
                 ),
             )
             return SeriesUpsertResult(series_id=int(existing.series_id), created=False)
-        # Field-change path lands in Task 10.
-        raise NotImplementedError("Task 10 — field-change path")
+
+        # Field-change path. If observations exist, block changing
+        # immutable-once-written fields (source_id / frequency / unit —
+        # changing any of these silently breaks time-series semantics).
+        immutable_changes: list[str] = []
+        if existing.source_id != source_id:
+            immutable_changes.append("source_id")
+        if existing.frequency != frequency:
+            immutable_changes.append("frequency")
+        if existing.unit != unit:
+            immutable_changes.append("unit")
+        if immutable_changes:
+            obs_count = await self._s.scalar(
+                text("SELECT COUNT(*) FROM ts.observation WHERE series_id = :sid"),
+                {"sid": existing.series_id},
+            )
+            if obs_count and obs_count > 0:
+                raise SeriesCodeConflict(
+                    f"cannot change {', '.join(immutable_changes)} on "
+                    f"series_code={series_code!r}: {obs_count} observations exist"
+                )
+
+        before_payload: dict[str, Any] = {
+            "series_id": existing.series_id,
+            "series_code": series_code,
+            "source_id": existing.source_id,
+            "metric": existing.metric,
+            "frequency": existing.frequency,
+            "unit": existing.unit,
+            "currency_code": existing.currency_code,
+            "restatement_basis": existing.restatement_basis,
+            "accounting_standard": existing.accounting_standard,
+            "consolidation": existing.consolidation,
+            "period_type": existing.period_type,
+            "description": existing.description,
+            "pii_class": existing.pii_class,
+            "metadata": existing.metadata,
+        }
+        await self._s.execute(
+            text(
+                "UPDATE ts.series_catalog SET "
+                "  source_id = :sid, entity_id = :eid, metric = :metric, "
+                "  frequency = :freq, unit = :unit, currency_code = :ccy, "
+                "  restatement_basis = :rb, accounting_standard = :acct, "
+                "  consolidation = :consol, period_type = :pt, "
+                "  description = :desc, pii_class = :pii, "
+                "  metadata = CAST(:meta AS JSONB), "
+                "  actor_id = :aid, actor_kind = :ak, client_ip = :cip, "
+                "  user_agent = :ua, request_id = :rid, "
+                "  updated_at = now() "
+                "WHERE series_id = :series_id"
+            ),
+            {
+                "series_id": existing.series_id,
+                "sid": source_id,
+                "eid": entity_id,
+                "metric": metric,
+                "freq": frequency,
+                "unit": unit,
+                "ccy": currency_code,
+                "rb": restatement_basis,
+                "acct": accounting_standard,
+                "consol": consolidation,
+                "pt": period_type,
+                "desc": description,
+                "pii": pii_class,
+                "meta": json.dumps(meta),
+                "aid": actor.actor_id if actor else None,
+                "ak": actor.actor_kind if actor else None,
+                "cip": actor.client_ip if actor else None,
+                "ua": actor.user_agent if actor else None,
+                "rid": actor.request_id if actor else None,
+            },
+        )
+        after_payload: dict[str, Any] = {
+            **before_payload,
+            "source_id": source_id,
+            "metric": metric,
+            "frequency": frequency,
+            "unit": unit,
+            "currency_code": currency_code,
+            "restatement_basis": restatement_basis,
+            "accounting_standard": accounting_standard,
+            "consolidation": consolidation,
+            "period_type": period_type,
+            "description": description,
+            "pii_class": pii_class,
+            "metadata": meta,
+        }
+        await audit_record(
+            self._s,
+            record=AuditRecord(
+                operation="series.update",
+                target_schema="ts",
+                target_table="series_catalog",
+                target_pk={"series_id": existing.series_id},
+                before=before_payload,
+                after=after_payload,
+                ingestion_run_id=self._run_id,
+            ),
+        )
+        return SeriesUpsertResult(series_id=int(existing.series_id), created=False)
 
     async def _upsert_series_fresh(
         self,
