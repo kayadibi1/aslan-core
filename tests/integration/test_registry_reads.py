@@ -22,6 +22,9 @@ async def _wipe(session: AsyncSession) -> None:
         "DELETE FROM ref.identifier",
         "DELETE FROM ref.entity",
         "DELETE FROM ref.sector",
+        "DELETE FROM doc.filing_body",
+        "DELETE FROM doc.filing_attachment",
+        "DELETE FROM doc.filing",
         "DELETE FROM src.ingestion_run",
         "DELETE FROM src.source",
     ]:

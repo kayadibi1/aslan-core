@@ -13,6 +13,7 @@ from testcontainers.postgres import PostgresContainer
 
 from aslan_core.db.engine import create_engine
 from aslan_core.db.session import create_session_factory
+from aslan_core.documents.object_storage import InMemoryFake as _InMemoryFake
 
 TIMESCALE_IMAGE = "timescale/timescaledb:latest-pg16"
 
@@ -86,3 +87,10 @@ async def session(
             yield s
         finally:
             await s.rollback()
+
+
+@pytest.fixture
+def object_storage_fake() -> _InMemoryFake:
+    """Function-scoped fresh InMemoryFake. Tests assert against
+    fake.all_keys() / fake.get_body() to verify cleanup behavior."""
+    return _InMemoryFake()

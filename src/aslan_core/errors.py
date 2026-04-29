@@ -91,6 +91,11 @@ class FilingNotFound(DocumentError):
     pass
 
 
+class DocumentNotFound(DocumentError):
+    """Raised by DocumentStore.get_filing / amendment_chain when the
+    filing_id is unknown."""
+
+
 class WatermarkError(AslanCoreError):
     pass
 

@@ -1,6 +1,6 @@
 [project]
 name = "aslan-core"
-version = "0.1.3"
+version = "0.2.0"
 description = "Shared Python package for the Aslan Terminal data-plane services."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -16,13 +16,14 @@ dependencies = [
     "click>=8.1",
     "pyyaml>=6.0",
     "structlog>=24.4",
+    "aioboto3>=13.0",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
-    "testcontainers[postgres]>=4.7",
+    "testcontainers[postgres,minio]>=4.7",
     "hypothesis>=6.110",
     "ruff>=0.7",
     "mypy>=1.20",
@@ -73,7 +74,7 @@ warn_unused_ignores = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["asyncpg.*", "alembic.*", "testcontainers.*"]
+module = ["asyncpg.*", "alembic.*", "testcontainers.*", "aioboto3.*", "botocore.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
