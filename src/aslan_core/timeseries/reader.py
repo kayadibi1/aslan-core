@@ -10,14 +10,14 @@ Public methods land per task:
   reserved for callers that explicitly assert presence).
 * :meth:`ObservationReader.latest` (Task 21) — latest observation by
   ``ts`` for a series, with point-in-time (PIT) collapse over ``as_of``.
-* ``range`` (Task 22) lands in a subsequent commit with the same
-  PIT-collapse pattern over a half-open ``[ts_start, ts_end)`` window.
+* :meth:`ObservationReader.range` (Task 22) — half-open
+  ``[ts_start, ts_end)`` range with the same PIT-collapse pattern.
 
-Point-in-time semantics (codex F1, 2026-04-29). :meth:`latest` (and
-:meth:`range`, when it lands) uses ``DISTINCT ON (series_id, ts)`` so
-each ``(series_id, ts)`` collapses to exactly one row: the row with
-the maximum ``as_of <= pit``. Without this, a restated observation
-appears as multiple rows in the result.
+Point-in-time semantics (codex F1, 2026-04-29). Both :meth:`latest`
+and :meth:`range` use ``DISTINCT ON (series_id, ts)`` so each
+``(series_id, ts)`` collapses to exactly one row: the row with the
+maximum ``as_of <= pit``. Without this, a restated observation appears
+as multiple rows in the result.
 
 Reader is read-only — no audit events, no actor stamping, no
 strict-mode checks. Strict-mode applies only to mutations.
@@ -157,3 +157,74 @@ class ObservationReader:
             ingestion_run_id=row.ingestion_run_id,
             metadata=row.metadata if row.metadata is not None else {},
         )
+
+    @traced("ObservationReader.range")
+    async def range(
+        self,
+        series_id: int,
+        ts_start: datetime,
+        ts_end: datetime,
+        *,
+        as_of: datetime | None = None,
+        limit: int | None = None,
+    ) -> list[Observation]:
+        """Half-open ``[ts_start, ts_end)`` range over ``series_id``
+        with PIT collapse on ``as_of``.
+
+        Returns at most one row per ``ts`` (DISTINCT ON collapses
+        restated rows). ``ORDER BY series_id ASC, ts ASC, as_of DESC``
+        means the row with the highest ``as_of <= pit`` wins per ``ts``;
+        the outer SELECT then orders ascending by ``ts`` so the caller
+        can iterate in time order.
+
+        ``ts_start`` is inclusive, ``ts_end`` is exclusive — matches
+        the half-open range convention used elsewhere in aslan-core.
+        ``limit`` caps the post-collapse row count when supplied;
+        ``None`` returns every row in the window.
+
+        ``as_of`` filters BEFORE the DISTINCT ON: a row whose own
+        winning ``as_of`` exceeds the PIT is excluded entirely (not
+        merely deprioritised) so a future restatement does not "appear"
+        in a historical PIT replay.
+        """
+        # Limit composition: built into the SQL only when provided so a
+        # caller passing ``None`` does not bind an unused placeholder.
+        # The composition uses an internal-only Python flag — no caller
+        # input ever reaches the SQL string.
+        sql = (
+            "SELECT * FROM ("
+            "  SELECT DISTINCT ON (series_id, ts) "
+            "    series_id, ts, as_of, value, value_text, "
+            "    quality_flag, ingestion_run_id, metadata "
+            "  FROM ts.observation "
+            "  WHERE series_id = :sid "
+            "    AND ts >= :ts_start AND ts < :ts_end "
+            "    AND (CAST(:pit AS TIMESTAMPTZ) IS NULL "
+            "         OR as_of <= CAST(:pit AS TIMESTAMPTZ)) "
+            "  ORDER BY series_id, ts ASC, as_of DESC"
+            ") sub "
+            "ORDER BY ts ASC"
+        )
+        params: dict[str, object] = {
+            "sid": series_id,
+            "ts_start": ts_start,
+            "ts_end": ts_end,
+            "pit": as_of,
+        }
+        if limit is not None:
+            sql += " LIMIT :lim"
+            params["lim"] = limit
+        rows = (await self._s.execute(text(sql), params)).all()
+        return [
+            Observation(
+                series_id=r.series_id,
+                ts=r.ts,
+                as_of=r.as_of,
+                value=r.value,
+                value_text=r.value_text,
+                quality_flag=r.quality_flag,
+                ingestion_run_id=r.ingestion_run_id,
+                metadata=r.metadata if r.metadata is not None else {},
+            )
+            for r in rows
+        ]
