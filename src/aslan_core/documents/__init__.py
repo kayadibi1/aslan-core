@@ -1,3 +1,4 @@
+from aslan_core.documents.client import DocumentStore
 from aslan_core.documents.object_storage import (
     Aioboto3ObjectStorageClient,
     InMemoryFake,
@@ -7,6 +8,7 @@ from aslan_core.documents.object_storage import (
 
 __all__ = [
     "Aioboto3ObjectStorageClient",
+    "DocumentStore",
     "InMemoryFake",
     "ObjectMetadata",
     "ObjectStorageClient",
