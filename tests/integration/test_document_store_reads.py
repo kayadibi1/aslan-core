@@ -76,3 +76,53 @@ async def test_get_filing_raises_on_missing(
     store = DocumentStore(session, object_client=object_storage_fake, ingestion_run_id=run_id)  # type: ignore[arg-type]
     with pytest.raises(DocumentNotFound):
         await store.get_filing(uuid4())
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_find_by_source_ref_returns_latest_revision(
+    session: AsyncSession, object_storage_fake: object
+) -> None:
+    from aslan_core.documents.client import DocumentStore
+
+    run_id = await _seed(session)
+
+    fid_v1 = uuid4()
+    fid_v2 = uuid4()
+    await session.execute(
+        text(
+            "INSERT INTO doc.filing ("
+            "  filing_id, source_id, source_filing_ref, kind, title, language, "
+            "  published_at, primary_object_key, primary_mime, primary_sha256, "
+            "  primary_bytes, ingestion_run_id, revision_no, previous_filing_id, is_amendment"
+            ") VALUES "
+            "(:f1, 'kap', 'AMEND-1', 'news', 'orig', 'tr', :pub1, 'k1', 'text/html', :s1, 1, :run, 1, NULL, false), "  # noqa: E501
+            "(:f2, 'kap', 'AMEND-1', 'news', 'amended', 'tr', :pub2, 'k2', 'text/html', :s2, 1, :run, 2, :f1, true)"  # noqa: E501
+        ),
+        {
+            "f1": fid_v1,
+            "pub1": datetime(2026, 4, 27, tzinfo=UTC),
+            "s1": "f" * 64,
+            "f2": fid_v2,
+            "pub2": datetime(2026, 4, 28, tzinfo=UTC),
+            "s2": "g" * 64,
+            "run": run_id,
+        },
+    )
+    await session.commit()
+
+    store = DocumentStore(session, object_client=object_storage_fake, ingestion_run_id=run_id)  # type: ignore[arg-type]
+    found = await store.find_by_source_ref(source_id="kap", source_filing_ref="AMEND-1")
+    assert found is not None
+    assert found.filing_id == fid_v2
+    assert found.revision_no == 2
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_find_by_source_ref_returns_none_when_unknown(
+    session: AsyncSession, object_storage_fake: object
+) -> None:
+    from aslan_core.documents.client import DocumentStore
+
+    run_id = await _seed(session)
+    store = DocumentStore(session, object_client=object_storage_fake, ingestion_run_id=run_id)  # type: ignore[arg-type]
+    assert await store.find_by_source_ref(source_id="kap", source_filing_ref="NONE") is None

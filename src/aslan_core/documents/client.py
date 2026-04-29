@@ -62,6 +62,29 @@ class DocumentStore:
             raise DocumentNotFound(str(filing_id))
         return _row_to_filing(row)
 
+    async def find_by_source_ref(self, *, source_id: str, source_filing_ref: str) -> Filing | None:
+        """Return the latest revision (highest revision_no) for the given
+        (source_id, source_filing_ref). None if no revision exists."""
+        row = (
+            await self._s.execute(
+                text(
+                    "SELECT filing_id, source_id, source_filing_ref, entity_id, "
+                    "       kind, subkind, title, language, published_at, "
+                    "       period_start, period_end, source_url, is_amendment, "
+                    "       previous_filing_id, primary_object_key, primary_mime, "
+                    "       primary_sha256, primary_bytes, has_xbrl, xbrl_object_key, "
+                    "       metadata, discovered_at, revision_no "
+                    "FROM doc.filing "
+                    "WHERE source_id = :sid AND source_filing_ref = :ref "
+                    "ORDER BY revision_no DESC LIMIT 1"
+                ),
+                {"sid": source_id, "ref": source_filing_ref},
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+        return _row_to_filing(row)
+
 
 def _row_to_filing(row: Any) -> Filing:
     return Filing(
