@@ -77,6 +77,18 @@ plugins = ["pydantic.mypy"]
 module = ["asyncpg.*", "alembic.*", "testcontainers.*", "aioboto3.*", "botocore.*"]
 ignore_missing_imports = true
 
+# v0.3.0 [obs] extra — sentry-sdk, opentelemetry, prometheus_client are
+# optional install deps. The observability modules use lazy imports so
+# the base install runs without them; mypy on a base venv must not
+# fail for the missing imports inside those lazy bodies.
+[[tool.mypy.overrides]]
+module = [
+    "sentry_sdk.*",
+    "opentelemetry.*",
+    "prometheus_client.*",
+]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
