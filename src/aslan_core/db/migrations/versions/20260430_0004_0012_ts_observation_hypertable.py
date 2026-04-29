@@ -61,7 +61,7 @@ def upgrade() -> None:
             user_agent             TEXT,
             request_id             UUID,
             PRIMARY KEY (series_id, ts, as_of),
-            CHECK ((value IS NOT NULL) OR (value_text IS NOT NULL))
+            CHECK ((value IS NULL) <> (value_text IS NULL))
         )
     """)
     op.execute(

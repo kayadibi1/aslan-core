@@ -2,9 +2,9 @@
 
 Verifies the table exists, is registered as a hypertable with a
 90-day chunk_time_interval, has the composite PK ``(series_id, ts,
-as_of)``, the value-or-value_text CHECK, and both indexes
-(``observation_series_ts_as_of`` for PIT queries, ``observation_run``
-for forensic-by-run lookups).
+as_of)``, the exactly-one-of-(value,value_text) CHECK (codex Batch 1
+F1 — XOR not OR), and both indexes (``observation_series_ts_as_of``
+for PIT queries, ``observation_run`` for forensic-by-run lookups).
 
 Codex F10 — value MUST be ``DOUBLE PRECISION``, never ``NUMERIC``.
 The hypertable's ``chunk_time_interval`` is intentionally larger than
@@ -101,22 +101,28 @@ async def test_observation_indexes_present(session: AsyncSession) -> None:
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_observation_value_check_constraint_enforced(session: AsyncSession) -> None:
-    """Inserting a row with NULL value AND NULL value_text must fail."""
+async def test_observation_rejects_neither_value_nor_value_text(session: AsyncSession) -> None:
+    """Codex Batch 1 F1 — exactly-one CHECK rejects both-NULL.
+
+    The CHECK is the XOR pattern ``(value IS NULL) <> (value_text IS NULL)``,
+    so a row with neither value nor value_text set must be rejected at the
+    DB layer (defense-in-depth on top of ObservationIn's Pydantic
+    exactly-one validator).
+    """
     await _ensure_source(session)
     await session.execute(
         text(
             "INSERT INTO ts.series_catalog (series_code, source_id, metric, frequency, unit) "
-            "VALUES ('mig12_chk', 'kap', 'm', '1d', 'TRY') ON CONFLICT DO NOTHING"
+            "VALUES ('mig12_chk_neither', 'kap', 'm', '1d', 'TRY') ON CONFLICT DO NOTHING"
         )
     )
     sid = await session.scalar(
-        text("SELECT series_id FROM ts.series_catalog WHERE series_code='mig12_chk'")
+        text("SELECT series_id FROM ts.series_catalog WHERE series_code='mig12_chk_neither'")
     )
     rid = await session.scalar(
         text(
             "INSERT INTO src.ingestion_run (source_id, job_name, status) "
-            "VALUES ('kap', 'mig12_chk', 'succeeded') RETURNING ingestion_run_id"
+            "VALUES ('kap', 'mig12_chk_neither', 'succeeded') RETURNING ingestion_run_id"
         )
     )
     await session.commit()
@@ -133,7 +139,54 @@ async def test_observation_value_check_constraint_enforced(session: AsyncSession
         await session.commit()
     await session.rollback()
     # Cleanup so the FK pin doesn't keep the test series alive across runs.
-    await session.execute(text("DELETE FROM ts.series_catalog WHERE series_code='mig12_chk'"))
+    await session.execute(
+        text("DELETE FROM ts.series_catalog WHERE series_code='mig12_chk_neither'")
+    )
+    await session.commit()
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_observation_rejects_both_value_and_value_text(session: AsyncSession) -> None:
+    """Codex Batch 1 F1 — exactly-one CHECK rejects both-set.
+
+    Pre-fix the table-level CHECK was ``OR`` (at-least-one), which let a
+    row with BOTH ``value`` and ``value_text`` populated through the
+    storage boundary even though ObservationIn's Pydantic validator
+    forbids it. The XOR rewrite ``(value IS NULL) <> (value_text IS NULL)``
+    makes the DB authoritative — both-set is rejected as
+    IntegrityError/CheckViolation.
+    """
+    await _ensure_source(session)
+    await session.execute(
+        text(
+            "INSERT INTO ts.series_catalog (series_code, source_id, metric, frequency, unit) "
+            "VALUES ('mig12_chk_both', 'kap', 'm', '1d', 'TRY') ON CONFLICT DO NOTHING"
+        )
+    )
+    sid = await session.scalar(
+        text("SELECT series_id FROM ts.series_catalog WHERE series_code='mig12_chk_both'")
+    )
+    rid = await session.scalar(
+        text(
+            "INSERT INTO src.ingestion_run (source_id, job_name, status) "
+            "VALUES ('kap', 'mig12_chk_both', 'succeeded') RETURNING ingestion_run_id"
+        )
+    )
+    await session.commit()
+
+    with pytest.raises(IntegrityError):
+        await session.execute(
+            text(
+                "INSERT INTO ts.observation "
+                "(series_id, ts, as_of, value, value_text, ingestion_run_id, payload_hash) "
+                "VALUES (:sid, now(), now(), 1.0, 'x', :rid, repeat('a', 64))"
+            ),
+            {"sid": sid, "rid": rid},
+        )
+        await session.commit()
+    await session.rollback()
+    # Cleanup so the FK pin doesn't keep the test series alive across runs.
+    await session.execute(text("DELETE FROM ts.series_catalog WHERE series_code='mig12_chk_both'"))
     await session.commit()
 
 

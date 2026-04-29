@@ -93,7 +93,7 @@ class Observation(Base):
     __tablename__ = "observation"
     __table_args__ = (
         CheckConstraint(
-            "(value IS NOT NULL) OR (value_text IS NOT NULL)",
+            "(value IS NULL) <> (value_text IS NULL)",
             name="observation_value_check",
         ),
         Index("observation_series_ts_as_of", "series_id", "ts", "as_of"),
