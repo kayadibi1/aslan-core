@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import cast
 
@@ -14,6 +15,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from aslan_core.documents.object_storage import InMemoryFake
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.fixture(autouse=True)
+async def _cleanup_doc_tables(session: AsyncSession) -> AsyncIterator[None]:
+    """Each doc-CLI test commits via the CLI's own session, leaving rows
+    behind that the test session's rollback can't reach. Wipe doc.* +
+    src.ingestion_run rows committed during the test before downstream
+    tests start, so DELETE FROM src.ingestion_run elsewhere doesn't trip
+    the doc.filing FK."""
+    yield
+    await session.rollback()
+    await session.execute(text("DELETE FROM doc.filing_body"))
+    await session.execute(text("DELETE FROM doc.filing_attachment"))
+    await session.execute(text("DELETE FROM doc.filing"))
+    await session.execute(text("DELETE FROM src.ingestion_run"))
+    await session.commit()
 
 
 async def _seed_kap_source(session: AsyncSession) -> None:

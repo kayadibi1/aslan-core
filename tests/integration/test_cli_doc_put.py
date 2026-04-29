@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
 from pathlib import Path
 from uuid import UUID
 
@@ -14,6 +15,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from aslan_core.documents.object_storage import InMemoryFake
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.fixture(autouse=True)
+async def _cleanup_doc_tables(session: AsyncSession) -> AsyncIterator[None]:
+    """Each doc-CLI test commits via the CLI's own session, leaving rows
+    behind that the test session's rollback can't reach. Wipe doc.* +
+    src.ingestion_run rows committed during the test before downstream
+    tests start, so DELETE FROM src.ingestion_run elsewhere doesn't trip
+    the doc.filing FK."""
+    yield
+    await session.rollback()
+    await session.execute(text("DELETE FROM doc.filing_body"))
+    await session.execute(text("DELETE FROM doc.filing_attachment"))
+    await session.execute(text("DELETE FROM doc.filing"))
+    await session.execute(text("DELETE FROM src.ingestion_run"))
+    await session.commit()
 
 
 async def _seed_sources(session: AsyncSession) -> None:
@@ -107,6 +124,81 @@ async def test_doc_put_inserts_filing_and_uploads_blob(
         {"fid": filing_id},
     )
     assert row_count == 1
+
+
+# ─── Task 30 ─────────────────────────────────────────────────────────────
+
+
+async def test_doc_release_deletes_blob_and_row(
+    session: AsyncSession,
+    object_storage_fake: InMemoryFake,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """`aslan doc release <filing_id>` deletes every recorded bucket key
+    (primary + xbrl + attachments) AND removes the doc.filing row."""
+    from aslan_core.cli.main import cli
+
+    await _seed_sources(session)
+    _patch_factory(monkeypatch, object_storage_fake)
+
+    primary = tmp_path / "manual.html"
+    primary.write_bytes(b"<html>release-test</html>")
+
+    put_result = await _invoke(
+        cli,
+        [
+            "doc",
+            "put",
+            "--source-id",
+            "manual",
+            "--source-ref",
+            "RELEASE-1",
+            "--kind",
+            "news",
+            "--title",
+            "Release test",
+            "--published-at",
+            "2026-04-28T12:00:00Z",
+            "--primary-file",
+            str(primary),
+            "--json",
+        ],
+    )
+    assert put_result.exit_code == 0, f"output={put_result.output}\nexc={put_result.exception!r}"
+    payload = json.loads(put_result.output)
+    filing_id = payload["filing_id"]
+    assert len(object_storage_fake.all_keys()) == 1
+
+    # Release.
+    release_result = await _invoke(cli, ["doc", "release", filing_id])
+    assert (
+        release_result.exit_code == 0
+    ), f"output={release_result.output}\nexc={release_result.exception!r}"
+
+    # Bucket empty + row gone.
+    assert object_storage_fake.all_keys() == set()
+    await session.rollback()
+    row_count = await session.scalar(
+        text("SELECT COUNT(*) FROM doc.filing WHERE filing_id = :fid"),
+        {"fid": UUID(filing_id)},
+    )
+    assert row_count == 0
+
+
+async def test_doc_release_unknown_filing_id_exits_nonzero(
+    session: AsyncSession,
+    object_storage_fake: InMemoryFake,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aslan_core.cli.main import cli
+
+    await _seed_sources(session)
+    _patch_factory(monkeypatch, object_storage_fake)
+
+    bogus = "00000000-0000-0000-0000-000000000000"
+    result = await _invoke(cli, ["doc", "release", bogus])
+    assert result.exit_code != 0
 
 
 async def test_doc_put_infers_mime_when_not_passed(

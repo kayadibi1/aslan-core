@@ -16,7 +16,7 @@ from sqlalchemy import text
 from aslan_core.config import Settings
 from aslan_core.db.engine import create_engine
 from aslan_core.db.session import create_session_factory, session_scope
-from aslan_core.documents.client import DocumentStore
+from aslan_core.documents.client import _DEFAULT_BUCKETS, DocumentStore
 from aslan_core.documents.object_storage import (
     Aioboto3ObjectStorageClient,
     ObjectStorageClient,
@@ -440,5 +440,88 @@ async def _put_impl(
                 f"{payload['filing_id']}\tcreated={payload['created']}\t"
                 f"v{payload['revision_no']}\tbucket={payload['bucket']}"
             )
+    finally:
+        await engine.dispose()
+
+
+# ─── Task 30: release ─────────────────────────────────────────────────────
+
+
+@doc.command("release")
+@click.argument("filing_id")
+@click.option(
+    "--keep-row",
+    is_flag=True,
+    help="Delete the bucket objects but leave the doc.filing row intact.",
+)
+def release_cmd(filing_id: str, keep_row: bool) -> None:
+    """Delete a filing's bucket objects and (by default) its DB row.
+
+    Reconstructs the put-time manifest from ``doc.filing`` columns
+    (``primary_object_key``, ``xbrl_object_key``) and ``doc.filing_attachment``
+    (every ``object_key`` for the filing), then deletes each from the bucket
+    via ``oc.delete_object``. Each delete is best-effort: missing keys are
+    fine (S3 semantics), other errors are logged via the same orphan-cleanup
+    path that ``DocumentStore.release`` uses.
+
+    Unlike ``DocumentStore.release(PutFilingResult)`` — which is the in-flight
+    rollback path that runs against the put_filing manifest in memory — this
+    CLI command queries the DB for the manifest, so it is safe to call any
+    time after the put_filing transaction has committed. ``DELETE FROM
+    doc.filing`` cascades through ``doc.filing_attachment`` (FK ON DELETE
+    CASCADE) and ``doc.filing_body`` (no cascade declared but ``filing_id``
+    is the PK there so the row is eligible — see migration 0007).
+    """
+    asyncio.run(_release_impl(UUID(filing_id), keep_row))
+
+
+async def _release_impl(filing_id: UUID, keep_row: bool) -> None:
+    engine = create_engine()
+    factory = create_session_factory(engine)
+    try:
+        oc = _object_client_factory()
+        async with session_scope(factory) as s:
+            store = DocumentStore(s, object_client=oc, ingestion_run_id=0)
+            # Raises DocumentNotFound on unknown filing_id — surfaced as a
+            # nonzero exit by Click's default exception handler.
+            filing = await store.get_filing(filing_id)
+            bucket = _DEFAULT_BUCKETS.get(filing.source_id, "aslan-filings")
+
+            keys: list[str] = [filing.primary_object_key]
+            if filing.xbrl_object_key:
+                keys.append(filing.xbrl_object_key)
+
+            att_rows = (
+                await s.execute(
+                    text(
+                        "SELECT object_key FROM doc.filing_attachment "
+                        "WHERE filing_id = :fid ORDER BY sequence, attachment_id"
+                    ),
+                    {"fid": filing_id},
+                )
+            ).all()
+            keys.extend(r.object_key for r in att_rows)
+
+            for key in keys:
+                # Idempotent: missing keys on the fake / S3 are fine.
+                await oc.delete_object(bucket=bucket, key=key)
+
+            if not keep_row:
+                # ON DELETE CASCADE on doc.filing_attachment.filing_id removes
+                # attachment rows; doc.filing_body uses filing_id as PK so we
+                # delete it explicitly to avoid an orphan body row.
+                await s.execute(
+                    text("DELETE FROM doc.filing_body WHERE filing_id = :fid"),
+                    {"fid": filing_id},
+                )
+                await s.execute(
+                    text("DELETE FROM doc.filing WHERE filing_id = :fid"),
+                    {"fid": filing_id},
+                )
+
+        click.echo(
+            f"released {filing_id}: deleted {len(keys)} object(s)"
+            + (" (DB row kept)" if keep_row else " + DB row")
+        )
     finally:
         await engine.dispose()
