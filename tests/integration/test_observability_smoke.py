@@ -115,7 +115,11 @@ async def test_audit_events_counter_increments_on_record(
     await session.execute(text("DELETE FROM audit.events"))
     await session.commit()
 
-    op = "smoke.test"
+    # Use a real allow-listed operation — the metric label is bounded
+    # via _normalize_metric_label, so an unknown smoke string would
+    # land in operation=other and the per-op counter would not move
+    # (codex Batch 4 cardinality fix).
+    op = "entity.create"
     before = _counter_value(metrics.audit_events, operation=op, actor_kind="user")
     await record(
         session,

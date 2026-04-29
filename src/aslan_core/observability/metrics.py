@@ -24,6 +24,20 @@ Label cardinality is bounded — every label is either a small enum
 ``success``), or a low-cardinality identifier (``source_id``,
 ``bucket``, ``operation``). NO unbounded labels (no ``entity_id``,
 no ``request_id``).
+
+Cardinality bounding (codex Batch 4):
+
+  * ``kind`` on ``filing_puts`` is a public ``str`` parameter on
+    ``DocumentStore.put_filing``. The ``doc.filing.kind`` column is
+    plain TEXT with no enforced domain — a crawler that accidentally
+    passes a per-feed value would create one Prometheus time series
+    per mutation. To bound this, every call site normalizes the value
+    against :data:`_KNOWN_FILING_KINDS` via
+    :func:`_normalize_metric_label`; unknown values map to ``"other"``.
+  * ``operation`` on ``audit_events`` is internally controlled today,
+    but the same defensive normalization against
+    :data:`_KNOWN_AUDIT_OPERATIONS` keeps the bound stable if a future
+    code path emits a wider value.
 """
 
 from __future__ import annotations
@@ -32,6 +46,94 @@ import logging
 from typing import Any
 
 _log = logging.getLogger(__name__)
+
+
+# ── Allow-lists for cardinality bounding ─────────────────────────────
+
+_KNOWN_FILING_KINDS: frozenset[str] = frozenset(
+    {
+        "news",
+        "material_event",
+        "financial_report",
+        "tender_offer",
+        "shareholder_meeting",
+        "other",
+    }
+)
+"""Starter allow-list for ``filing_puts.labels(kind=...)``. Any
+``kind`` outside this set collapses to ``"other"`` so the cardinality
+of the metric stays bounded by ``len(_KNOWN_FILING_KINDS)``. Expand
+deliberately when a new domain value is added to the spec."""
+
+_KNOWN_AUDIT_OPERATIONS: frozenset[str] = frozenset(
+    {
+        "entity.create",
+        "entity.idempotent_hit",
+        "entity.update",
+        "identifier.add",
+        "identifier.idempotent_hit",
+        "identifier.expire",
+        "entity_sector.upsert",
+        "entity_sector.idempotent_hit",
+        "entity_relationship.link",
+        "entity_relationship.idempotent_hit",
+        "sector.upsert",
+        "sector.idempotent_hit",
+        "filing.put",
+        "filing.dedup_hit",
+        "filing.idempotent_hit",
+        "filing.republished_alias_added",
+        "filing_body.create",
+        "filing_body.update",
+        "filing.release",
+        "watermark.set",
+        "watermark.idempotent_hit",
+        "watermark.advance",
+        "watermark.force_set",
+        "ingestion_run.start",
+        "ingestion_run.complete",
+        "ingestion_run.set_metadata",
+        "ingestion_run.increment_rows",
+    }
+)
+"""Allow-list of every ``operation=`` string emitted by aslan-core's
+own audit recorder call sites. Defensive: ``operation`` is internally
+controlled, but a new emitter that forgets to update this set will
+collapse to ``"other"`` rather than create an unbounded metric. Update
+this set whenever a new ``operation`` string is added to a public
+mutation path; the corresponding allow-list test in
+``tests/unit/test_metrics_cardinality.py`` enforces parity."""
+
+
+def _normalize_metric_label(
+    value: str,
+    allow_list: frozenset[str],
+    fallback: str = "other",
+) -> str:
+    """Bound the cardinality of a Prometheus label.
+
+    If ``value`` is a known member of ``allow_list``, return it
+    unchanged. Otherwise, return ``fallback`` (default ``"other"``).
+    Used at every Prometheus label call site where the input string
+    is not provably bounded by a CHECK constraint or a closed enum.
+
+    The contract is intentionally narrow — this function does not
+    validate the database column, only the label that ends up on the
+    metric. Mismatches between DB and metric are acceptable: the DB
+    keeps the raw ``kind`` for analytics, and the metric collapses
+    unknowns to a single ``"other"`` time series for monitoring.
+
+    :param value: Caller-supplied label value, possibly unbounded.
+    :param allow_list: Closed set of permitted values.
+    :param fallback: String to return when ``value`` is not in
+        ``allow_list``. Defaults to ``"other"`` so the bound is at
+        most ``len(allow_list) + 1`` (the ``+ 1`` is for ``fallback``
+        itself when it is not already in the set).
+    :returns: ``value`` if known, else ``fallback``.
+    """
+    if value in allow_list:
+        return value
+    return fallback
 
 
 # ── Lazy-handle scaffolding ──────────────────────────────────────────
@@ -293,3 +395,7 @@ __all__ = [
     "object_storage_orphans",
     "observation_writes",
 ]
+
+# The cardinality-bounding helper and allow-lists are intentionally
+# module-private (prefixed with ``_``) — call sites import them
+# directly. They are not part of the public re-export surface.

@@ -651,9 +651,15 @@ class DocumentStore:
             # (source_id, kind, created). created="true"|"false"
             # distinguishes fresh inserts from hash-dedup hits — the
             # case-distribution telemetry the spec calls for.
+            #
+            # ``kind`` is normalized against the closed allow-list to
+            # bound metric cardinality (codex Batch 4) — a crawler
+            # passing per-feed values would otherwise create one time
+            # series per mutation. The DB column keeps the raw kind;
+            # only the metric label is collapsed.
             metrics.filing_puts.labels(
                 source_id=source_id,
-                kind=kind,
+                kind=metrics._normalize_metric_label(kind, metrics._KNOWN_FILING_KINDS),
                 created="true" if created else "false",
             ).inc()
 

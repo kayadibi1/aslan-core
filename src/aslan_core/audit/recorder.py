@@ -180,6 +180,18 @@ async def record(
     # Prometheus: count audit events by (operation, actor_kind). The
     # metric is a no-op when prometheus_client is not installed (the
     # base venv without [obs] extra) — see metrics module docstring.
+    #
+    # ``operation`` is normalized against the closed allow-list to
+    # bound metric cardinality (codex Batch 4) — defensive for the
+    # case where a future emitter adds a new operation string but
+    # forgets to update _KNOWN_AUDIT_OPERATIONS. ``actor_kind`` is
+    # already CHECK-constrained in audit.events to {user, service,
+    # system}, so no normalization is needed there.
     from aslan_core.observability import metrics
 
-    metrics.audit_events.labels(operation=record.operation, actor_kind=actor_kind).inc()
+    metrics.audit_events.labels(
+        operation=metrics._normalize_metric_label(
+            record.operation, metrics._KNOWN_AUDIT_OPERATIONS
+        ),
+        actor_kind=actor_kind,
+    ).inc()
