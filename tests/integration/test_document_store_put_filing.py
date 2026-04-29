@@ -7,7 +7,34 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from aslan_core.documents.object_storage import InMemoryFake
+
 pytestmark = pytest.mark.integration
+
+
+class _FakeWithControlledFailure(InMemoryFake):
+    """Test helper: lets a test control which operation raises.
+
+    fail_put_object_substring: any key containing this substring raises.
+    fail_delete_object_substring: any delete on a key containing this raises.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_put_object_substring: list[str] = []
+        self.fail_delete_object_substring: list[str] = []
+
+    async def put_object(self, *, bucket: str, key: str, body: bytes, content_type: str) -> None:
+        for s in self.fail_put_object_substring:
+            if s in key:
+                raise RuntimeError(f"simulated put failure for {key}")
+        await super().put_object(bucket=bucket, key=key, body=body, content_type=content_type)
+
+    async def delete_object(self, *, bucket: str, key: str) -> None:
+        for s in self.fail_delete_object_substring:
+            if s in key:
+                raise RuntimeError(f"simulated delete failure for {key}")
+        await super().delete_object(bucket=bucket, key=key)
 
 
 async def _seed(session: AsyncSession) -> int:
@@ -336,3 +363,40 @@ async def test_attach_extracted_text_inserts_or_updates(
         {"fid": r.filing.filing_id},
     )
     assert body2 == "Updated text"
+
+
+# ─── Atomicity tests (spec §5.5) ──────────────────────────────────────
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_atomicity_object_upload_fail_raises_objectstoreerror(session: AsyncSession) -> None:
+    """Spec §5.5 row 1: object upload fails → no DB write, no leftover blob."""
+    from aslan_core.documents.client import DocumentStore
+    from aslan_core.errors import ObjectStoreError
+
+    run_id = await _seed(session)
+
+    fake = _FakeWithControlledFailure()
+    fake.fail_put_object_substring = ["main.html"]  # primary upload fails
+
+    store = DocumentStore(session, object_client=fake, ingestion_run_id=run_id)
+    with pytest.raises(ObjectStoreError):
+        await store.put_filing(
+            source_id="kap",
+            source_filing_ref="UPLOAD-FAIL",
+            entity_id=None,
+            kind="news",
+            title="t",
+            published_at=datetime(2026, 4, 28, tzinfo=UTC),
+            primary_bytes=b"x",
+            primary_mime="text/html",
+            primary_filename="main.html",
+        )
+
+    # No DB row written
+    n = await session.scalar(
+        text("SELECT COUNT(*) FROM doc.filing WHERE source_filing_ref = 'UPLOAD-FAIL'")
+    )
+    assert n == 0
+    # No leftover blob
+    assert fake.all_keys() == set()
