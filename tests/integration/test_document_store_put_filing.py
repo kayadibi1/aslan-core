@@ -449,9 +449,8 @@ async def test_atomicity_db_upsert_fail_after_upload_cleans_up_blob(
         )
 
     # Primary blob was uploaded then deleted by cleanup
-    assert (
-        fake.all_keys() == set()
-    ), "expected primary blob to be deleted by cleanup loop in put_filing's except"
+    blob_keys = fake.all_keys()
+    assert blob_keys == set(), f"expected empty bucket after cleanup; got {blob_keys}"
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -503,9 +502,8 @@ async def test_atomicity_blob_delete_fail_after_db_fail_logs_orphan(
 
     # The blob is still in the bucket because the cleanup delete failed
     keys = fake.all_keys()
-    assert any(
-        "main.html" in k for (_, k) in keys
-    ), "expected the blob to remain (delete was forced to fail)"
+    remaining = [k for (_, k) in keys if "main.html" in k]
+    assert remaining, "expected the blob to remain (delete was forced to fail)"
 
     # Structured orphan_cleanup_failed log emitted
     orphan_logs = [log for log in logs if log.get("event") == "orphan_cleanup_failed"]
