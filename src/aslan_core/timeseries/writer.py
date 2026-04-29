@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
@@ -728,54 +729,74 @@ class ObservationWriter:
             metrics.observation_writes.labels(source_id="unknown", kind="bulk").inc(attempted)
             return WriteCount(attempted=attempted, inserted=0, updated=0, unchanged=0)
 
-        # Phase 1 — per-series advisory lock for the txn lifetime so
-        # concurrent writers on the same series serialise (concurrent
-        # writers on different series do not contend).
-        await self._s.execute(
-            text("SELECT pg_advisory_xact_lock(  hashtextextended('ts.write:' || :sid, 0))"),
-            {"sid": str(series_id)},
-        )
-
-        # Phase 2 — chunked INSERT in batches of 500. Resolve conflicts
-        # by comparing payload_hash against the existing row.
-        chunk_size = 500
-        inserted_keys_total: set[tuple[datetime, datetime]] = set()
-        unchanged_keys_total: set[tuple[datetime, datetime]] = set()
-        for chunk in (deduped[i : i + chunk_size] for i in range(0, len(deduped), chunk_size)):
-            inserted_keys, unchanged_keys = await self._write_chunk(series_id, chunk, actor)
-            inserted_keys_total |= inserted_keys
-            unchanged_keys_total |= unchanged_keys
-
-        inserted = len(inserted_keys_total)
-        unchanged = len(unchanged_keys_total)
-
-        # Audit emission (codex F3 + F6): one event per write() call,
-        # plus per-key forensic rows in audit.observation_batch_keys.
-        # Same transaction as the observation INSERTs — if the per-key
-        # INSERT fails (e.g., CHECK violation, OOM) the whole batch
-        # rolls back atomically.
-        await self._emit_write_batch_audit(
-            series_id=series_id,
-            attempted=attempted,
-            deduped=deduped,
-            seen=seen,
-            inserted_keys=inserted_keys_total,
-            unchanged_keys=unchanged_keys_total,
-            inserted=inserted,
-            unchanged=unchanged,
-            actor=actor,
-        )
-
-        # Prometheus: count rows attempted (NOT batch count). The
-        # source_id label is resolved by SELECTing
-        # ts.series_catalog.source_id — bounded cardinality because
-        # sources are an enumerated set per spec.
-        source_id_for_metrics = await self._s.scalar(
+        # Resolve source_id for the metric labels NOW (after Phase 0,
+        # before Phase 1 + Phase 2 + audit). This is the first DB
+        # round-trip — the F14 spy test passes because Phase 0 already
+        # returned by this point, so a structurally-invalid batch
+        # never reaches this lookup. The label is bounded by the
+        # enumerated ``src.source.source_id`` set per spec.
+        source_id_for_metrics_raw = await self._s.scalar(
             text("SELECT source_id FROM ts.series_catalog WHERE series_id = :sid"),
             {"sid": series_id},
         )
+        source_id_for_metrics = source_id_for_metrics_raw or "unknown"
+
+        # Wall-clock duration timer wraps Phase 1 + Phase 2 + audit so
+        # operators see end-to-end latency including lock-wait time.
+        # Observed in a finally so a raised ObservationConflict still
+        # records its (failing) duration — the histogram label is the
+        # source_id, not a success bool, so the failure case shows up
+        # as a tail-bucket sample.
+        _start = time.monotonic()
+        try:
+            # Phase 1 — per-series advisory lock for the txn lifetime so
+            # concurrent writers on the same series serialise (concurrent
+            # writers on different series do not contend).
+            await self._s.execute(
+                text("SELECT pg_advisory_xact_lock(  hashtextextended('ts.write:' || :sid, 0))"),
+                {"sid": str(series_id)},
+            )
+
+            # Phase 2 — chunked INSERT in batches of 500. Resolve
+            # conflicts by comparing payload_hash against the existing
+            # row.
+            chunk_size = 500
+            inserted_keys_total: set[tuple[datetime, datetime]] = set()
+            unchanged_keys_total: set[tuple[datetime, datetime]] = set()
+            for chunk in (deduped[i : i + chunk_size] for i in range(0, len(deduped), chunk_size)):
+                inserted_keys, unchanged_keys = await self._write_chunk(series_id, chunk, actor)
+                inserted_keys_total |= inserted_keys
+                unchanged_keys_total |= unchanged_keys
+
+            inserted = len(inserted_keys_total)
+            unchanged = len(unchanged_keys_total)
+
+            # Audit emission (codex F3 + F6): one event per write() call,
+            # plus per-key forensic rows in audit.observation_batch_keys.
+            # Same transaction as the observation INSERTs — if the per-key
+            # INSERT fails (e.g., CHECK violation, OOM) the whole batch
+            # rolls back atomically.
+            await self._emit_write_batch_audit(
+                series_id=series_id,
+                attempted=attempted,
+                deduped=deduped,
+                seen=seen,
+                inserted_keys=inserted_keys_total,
+                unchanged_keys=unchanged_keys_total,
+                inserted=inserted,
+                unchanged=unchanged,
+                actor=actor,
+            )
+        finally:
+            metrics.observation_write_duration.labels(
+                source_id=source_id_for_metrics,
+            ).observe(time.monotonic() - _start)
+
+        # Prometheus: count rows attempted (NOT batch count). The
+        # source_id label is the resolved value above; bounded
+        # cardinality.
         metrics.observation_writes.labels(
-            source_id=source_id_for_metrics or "unknown",
+            source_id=source_id_for_metrics,
             kind="bulk",
         ).inc(attempted)
 
