@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 from sqlalchemy import text
@@ -400,3 +401,53 @@ async def test_atomicity_object_upload_fail_raises_objectstoreerror(session: Asy
     assert n == 0
     # No leftover blob
     assert fake.all_keys() == set()
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_atomicity_db_upsert_fail_after_upload_cleans_up_blob(
+    session: AsyncSession,
+) -> None:
+    """Spec §5.5 row 2: object upload OK, DB INSERT fails → best-effort
+    blob delete, DocumentDBError raised. Verifies the codex-corrected
+    single-outer-try cleanup pattern."""
+    from unittest.mock import patch
+
+    from aslan_core.documents.client import DocumentStore
+    from aslan_core.errors import DocumentDBError
+
+    run_id = await _seed(session)
+
+    fake = _FakeWithControlledFailure()
+    store = DocumentStore(session, object_client=fake, ingestion_run_id=run_id)
+
+    body = b"<html>db-fail-test</html>"
+
+    # Monkey-patch session.execute to raise when the doc.filing INSERT runs.
+    real_execute = session.execute
+
+    async def _failing_execute(stmt: Any, *args: Any, **kwargs: Any) -> Any:
+        sql = str(stmt)
+        if "INSERT INTO doc.filing " in sql:
+            raise RuntimeError("simulated DB failure on doc.filing INSERT")
+        return await real_execute(stmt, *args, **kwargs)
+
+    with (
+        patch.object(session, "execute", side_effect=_failing_execute),
+        pytest.raises(DocumentDBError),
+    ):
+        await store.put_filing(
+            source_id="kap",
+            source_filing_ref="DB-FAIL",
+            entity_id=None,
+            kind="news",
+            title="t",
+            published_at=datetime(2026, 4, 28, tzinfo=UTC),
+            primary_bytes=body,
+            primary_mime="text/html",
+            primary_filename="main.html",
+        )
+
+    # Primary blob was uploaded then deleted by cleanup
+    assert (
+        fake.all_keys() == set()
+    ), "expected primary blob to be deleted by cleanup loop in put_filing's except"
