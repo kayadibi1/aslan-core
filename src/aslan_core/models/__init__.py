@@ -12,3 +12,6 @@ NAMING_CONVENTION = {
 
 class Base(DeclarativeBase):
     metadata = MetaData(naming_convention=NAMING_CONVENTION)
+
+
+from aslan_core.models import doc as _doc  # noqa: F401, E402  (registers tables on Base.metadata)
