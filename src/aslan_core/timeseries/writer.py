@@ -237,6 +237,64 @@ class ObservationWriter:
                 subjects=subjects,
             )
 
+        return await self._reconcile_existing(
+            existing=existing,
+            series_code=series_code,
+            source_id=source_id,
+            metric=metric,
+            frequency=frequency,
+            unit=unit,
+            entity_id=entity_id,
+            currency_code=currency_code,
+            restatement_basis=restatement_basis,
+            accounting_standard=accounting_standard,
+            consolidation=consolidation,
+            period_type=period_type,
+            description=description,
+            pii_class=pii_class,
+            metadata=meta,
+            actor=actor,
+            subjects=subjects,
+        )
+
+    async def _reconcile_existing(
+        self,
+        *,
+        existing: Any,
+        series_code: str,
+        source_id: str,
+        metric: str,
+        frequency: str,
+        unit: str,
+        entity_id: UUID | None,
+        currency_code: str | None,
+        restatement_basis: str,
+        accounting_standard: str | None,
+        consolidation: str | None,
+        period_type: str | None,
+        description: str | None,
+        pii_class: str,
+        metadata: dict[str, Any],
+        actor: Actor | None,
+        subjects: tuple[SubjectRef, ...],
+    ) -> SeriesUpsertResult:
+        """Reconcile a caller's intent against an existing
+        ``ts.series_catalog`` row.
+
+        Either:
+        * idempotent hit → emit ``series.idempotent_hit``, no row update;
+        * field change → run ``_upsert_series_field_change`` (UPDATE +
+          ``series.update`` audit event), gated by the immutable-field
+          guard when observations exist.
+
+        Called from two sites: the ordinary "row already existed when we
+        looked" branch of :meth:`upsert_series`, and the post-race
+        fallback in :meth:`_upsert_series_fresh` when ``INSERT ... ON
+        CONFLICT DO NOTHING`` returns no row (codex 2026-04-29 — another
+        writer beat us between our SELECT and INSERT). Centralising the
+        logic guarantees the race fallback walks identical idempotent /
+        field-change branches as the ordinary path.
+        """
         # Compare every relevant field. If all match, idempotent path.
         same = (
             existing.source_id == source_id
@@ -251,7 +309,7 @@ class ObservationWriter:
             and existing.period_type == period_type
             and existing.description == description
             and existing.pii_class == pii_class
-            and existing.metadata == meta
+            and existing.metadata == metadata
         )
         if same:
             # Subjects round-trip even on the idempotent catalog path so
@@ -288,9 +346,58 @@ class ObservationWriter:
             )
             return SeriesUpsertResult(series_id=int(existing.series_id), created=False)
 
-        # Field-change path. If observations exist, block changing
-        # immutable-once-written fields (source_id / frequency / unit —
-        # changing any of these silently breaks time-series semantics).
+        return await self._upsert_series_field_change(
+            existing=existing,
+            series_code=series_code,
+            source_id=source_id,
+            metric=metric,
+            frequency=frequency,
+            unit=unit,
+            entity_id=entity_id,
+            currency_code=currency_code,
+            restatement_basis=restatement_basis,
+            accounting_standard=accounting_standard,
+            consolidation=consolidation,
+            period_type=period_type,
+            description=description,
+            pii_class=pii_class,
+            metadata=metadata,
+            actor=actor,
+            subjects=subjects,
+        )
+
+    async def _upsert_series_field_change(
+        self,
+        *,
+        existing: Any,
+        series_code: str,
+        source_id: str,
+        metric: str,
+        frequency: str,
+        unit: str,
+        entity_id: UUID | None,
+        currency_code: str | None,
+        restatement_basis: str,
+        accounting_standard: str | None,
+        consolidation: str | None,
+        period_type: str | None,
+        description: str | None,
+        pii_class: str,
+        metadata: dict[str, Any],
+        actor: Actor | None,
+        subjects: tuple[SubjectRef, ...],
+    ) -> SeriesUpsertResult:
+        """UPDATE-with-immutable-field-guard branch of
+        :meth:`upsert_series`.
+
+        Extracted from the inline body so the post-race fallback in
+        :meth:`_upsert_series_fresh` can dispatch to the same code path
+        without duplicating the immutable-field guard or the audit
+        payload-assembly.
+        """
+        # If observations exist, block changing immutable-once-written
+        # fields (source_id / frequency / unit — changing any of these
+        # silently breaks time-series semantics).
         immutable_changes: list[str] = []
         if existing.source_id != source_id:
             immutable_changes.append("source_id")
@@ -353,7 +460,7 @@ class ObservationWriter:
                 "pt": period_type,
                 "desc": description,
                 "pii": pii_class,
-                "meta": json.dumps(meta),
+                "meta": json.dumps(metadata),
                 "aid": actor.actor_id if actor else None,
                 "ak": actor.actor_kind if actor else None,
                 "cip": actor.client_ip if actor else None,
@@ -375,7 +482,7 @@ class ObservationWriter:
             "period_type": period_type,
             "description": description,
             "pii_class": pii_class,
-            "metadata": meta,
+            "metadata": metadata,
         }
         await audit_record(
             self._s,
@@ -411,10 +518,21 @@ class ObservationWriter:
         actor: Actor | None,
         subjects: tuple[SubjectRef, ...],
     ) -> SeriesUpsertResult:
-        """Single-round-trip INSERT with audit cols stamped IN the
-        statement (codex F1: never a post-write UPDATE — that would let
-        an idempotent retry rewrite the original creator's
-        attribution).
+        """Race-safe INSERT with audit cols stamped IN the statement.
+
+        Codex F1: never a post-write UPDATE — that would let an
+        idempotent retry rewrite the original creator's attribution.
+
+        Codex 2026-04-29 Batch 2: ``ON CONFLICT (series_code) DO
+        NOTHING`` makes the fresh path tolerant of two writers racing
+        on the same new ``series_code``. Without it, the loser saw
+        ``existing=None`` from the prior SELECT, then hit
+        ``UniqueViolation`` on ``series_catalog_series_code_key``
+        instead of falling through to the idempotent path. Postgres
+        guarantees ``ON CONFLICT DO NOTHING`` blocks on an uncommitted
+        conflicting INSERT until the other transaction commits or
+        rolls back, so the post-race ``SELECT`` here always sees the
+        winner's committed row.
         """
         sid_raw = await self._s.scalar(
             text(
@@ -428,7 +546,8 @@ class ObservationWriter:
                 "  :ccy, :rb, :acct, :consol, :pt, :desc, :pii, "
                 "  CAST(:meta AS JSONB), "
                 "  :aid, :ak, :cip, :ua, :rid"
-                ") RETURNING series_id"
+                ") ON CONFLICT (series_code) DO NOTHING "
+                "RETURNING series_id"
             ),
             {
                 "code": series_code,
@@ -452,6 +571,53 @@ class ObservationWriter:
                 "rid": actor.request_id if actor else None,
             },
         )
+
+        if sid_raw is None:
+            # We lost the race. Another writer's INSERT on the same
+            # ``series_code`` committed between our prior SELECT (which
+            # saw None) and this INSERT. Re-fetch the now-committed
+            # winner row and dispatch to ``_reconcile_existing`` so the
+            # losing call walks identical idempotent / field-change
+            # branches as the ordinary "row already existed" path.
+            existing = (
+                await self._s.execute(
+                    text(
+                        "SELECT series_id, source_id, entity_id, metric, frequency, "
+                        "       unit, currency_code, restatement_basis, "
+                        "       accounting_standard, consolidation, period_type, "
+                        "       description, pii_class, metadata, actor_id "
+                        "FROM ts.series_catalog WHERE series_code = :code"
+                    ),
+                    {"code": series_code},
+                )
+            ).first()
+            # ``existing`` should never be None here: the only way
+            # ON CONFLICT DO NOTHING fires is a committed conflicting
+            # row (uncommitted conflicts block until the other tx
+            # commits or rolls back; on rollback our INSERT proceeds).
+            assert existing is not None, (
+                f"ON CONFLICT DO NOTHING fired but no row found for series_code={series_code!r}"
+            )
+            return await self._reconcile_existing(
+                existing=existing,
+                series_code=series_code,
+                source_id=source_id,
+                metric=metric,
+                frequency=frequency,
+                unit=unit,
+                entity_id=entity_id,
+                currency_code=currency_code,
+                restatement_basis=restatement_basis,
+                accounting_standard=accounting_standard,
+                consolidation=consolidation,
+                period_type=period_type,
+                description=description,
+                pii_class=pii_class,
+                metadata=metadata,
+                actor=actor,
+                subjects=subjects,
+            )
+
         sid = int(sid_raw)
         await self._persist_subjects(sid, subjects, actor)
         after_payload: dict[str, Any] = {
