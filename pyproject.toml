@@ -19,6 +19,26 @@ dependencies = [
     "aioboto3>=13.0",
 ]
 
+[project.optional-dependencies]
+# v0.3.0 observability extra. Consumers that want Sentry error
+# capture, OpenTelemetry tracing (with SQLAlchemy + asyncpg
+# auto-instrumentation), and Prometheus metrics scraping install
+# ``aslan-core[obs]``. The base install runs without these — the
+# observability modules use lazy imports so a missing dep raises
+# ImportError only when ``setup_sentry("dsn")`` or
+# ``setup_tracing("endpoint")`` is actually called with a non-None
+# argument; ``setup_*(None)`` is always a no-op and never imports
+# the SDK.
+obs = [
+    "sentry-sdk>=2.18",
+    "opentelemetry-api>=1.27",
+    "opentelemetry-sdk>=1.27",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.27",
+    "opentelemetry-instrumentation-sqlalchemy>=0.48b0",
+    "opentelemetry-instrumentation-asyncpg>=0.48b0",
+    "prometheus-client>=0.21",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8.3",
@@ -88,6 +108,17 @@ module = [
     "prometheus_client.*",
 ]
 ignore_missing_imports = true
+
+# opentelemetry-instrumentation-* ships untyped __init__ args
+# (capture_parameters=False without a type annotation), so calling
+# their constructors from strict-mypy code triggers no-untyped-call.
+# Relax this in the modules that touch the instrumentation API.
+[[tool.mypy.overrides]]
+module = [
+    "aslan_core.observability.tracing",
+    "tests.integration.test_observability_smoke",
+]
+disallow_untyped_calls = false
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
