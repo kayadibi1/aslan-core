@@ -43,3 +43,31 @@ jobs:
           ASLAN_S3_REGION: us-east-1
           ASLAN_S3_ACCESS_KEY: x
           ASLAN_S3_SECRET_KEY: x
+
+  # CVE scan (Task 20, v0.3.0).
+  # Audits the project's locked dependency graph (including [obs]
+  # extras) — NOT the tool env. Contract: pip-audit fails the build
+  # on ANY vulnerability; see the pip-audit.json artifact for details.
+  # Dependabot opens a remediation PR within 24h of any new CVE.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+      - name: Sync project (with obs extras)
+        run: uv sync --extra obs
+      - name: Export locked requirements
+        # --no-emit-project: drop the editable `-e .` self-reference.
+        # pip-audit looks up every line on PyPI; aslan-core isn't there
+        # (and auditing the project against itself is meaningless).
+        run: uv export --extra obs --format requirements-txt --no-hashes --no-emit-project --output-file requirements-locked.txt
+      - name: pip-audit (CVE scan)
+        run: uv tool run pip-audit --strict --requirement requirements-locked.txt --format json --output pip-audit.json
+      - name: Upload pip-audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-audit-report
+          path: pip-audit.json

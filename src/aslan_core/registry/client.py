@@ -11,12 +11,19 @@ from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.types import Text
 
+from aslan_core.audit import (
+    AuditRecord,
+    assert_actor_or_strict_raise,
+    current_actor,
+)
+from aslan_core.audit import record as audit_record
 from aslan_core.errors import (
     EntityMergeRequired,
     EntityNotFound,
     IdentifierConflict,
     RegistryConstraintViolation,
 )
+from aslan_core.observability import metrics
 from aslan_core.schemas.entity import Entity, EntityMatch
 
 
@@ -157,6 +164,10 @@ class EntityRegistryClient:
         parent_entity_id: UUID | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> Entity:
+        # Strict-mode early check (codex F3): raise BEFORE any I/O if
+        # audit_strict=True and no actor is set. Lenient mode falls
+        # through and audit.record() writes system:unknown later.
+        assert_actor_or_strict_raise()
         my_source = await self._source_id()
 
         # Look up existing identifier matches for any of the input pairs.
@@ -187,6 +198,7 @@ class EntityRegistryClient:
         match_eids = {r.entity_id for r in rows}
 
         if len(match_eids) > 1:
+            metrics.entity_merge_required.labels(source_id=my_source).inc()
             raise EntityMergeRequired(
                 f"identifiers map to {len(match_eids)} distinct entities: {match_eids}",
             )
@@ -199,12 +211,14 @@ class EntityRegistryClient:
             # then "merge" into it on the next create_entity call.
             target_entity = await self.get(target_eid)
             if target_entity.source_id != my_source:
+                metrics.entity_merge_required.labels(source_id=my_source).inc()
                 raise EntityMergeRequired(
                     f"target entity {target_eid} owned by "
                     f"source_id={target_entity.source_id}; current run is {my_source}",
                 )
             for r in rows:
                 if r.source_id != my_source:
+                    metrics.entity_merge_required.labels(source_id=my_source).inc()
                     raise EntityMergeRequired(
                         f"identifier ({r.namespace}={r.value}) was written by "
                         f"source_id={r.source_id}; current run is {my_source}",
@@ -213,18 +227,36 @@ class EntityRegistryClient:
             for ns, val in identifiers.items():
                 if (ns, val) not in existing:
                     await self.add_identifier(target_eid, ns, val)
+            # Codex F1, 2026-04-29: do NOT mutate the existing row's audit
+            # columns on an idempotent hit — the original creator's
+            # attribution is preserved forever. Emit one
+            # `entity.idempotent_hit` event with the current actor in the
+            # event row so forensics still see "user X retried at time Z".
+            await self._emit_audit(
+                operation="entity.idempotent_hit",
+                target_table="entity",
+                target_pk={"entity_id": str(target_entity.entity_id)},
+                before=target_entity.model_dump(mode="json"),
+                after=target_entity.model_dump(mode="json"),
+                metadata={"returned_existing": True},
+            )
             return target_entity
 
-        # Fresh INSERT.
+        # Fresh INSERT — stamp audit columns IN the INSERT (single
+        # round-trip). A separate post-write UPDATE would create a
+        # rewrite-on-retry vulnerability per codex F1.
+        ac = _audit_cols()
         eid: UUID = (
             await self._s.execute(
                 text(
                     "INSERT INTO ref.entity "
                     "  (entity_type, legal_name, short_name, country_code, domicile, "
                     "   incorporation_dt, fiscal_year_end, status, parent_entity_id, "
-                    "   metadata, source_id, ingestion_run_id) "
+                    "   metadata, source_id, ingestion_run_id, "
+                    "   actor_id, actor_kind, client_ip, user_agent, request_id) "
                     "VALUES (:type, :ln, :sn, :cc, :dom, :inc, :fye, :status, :pid, "
-                    "        COALESCE(:md, '{}')::jsonb, :sid, :run) "
+                    "        COALESCE(:md, '{}')::jsonb, :sid, :run, "
+                    "        :actor_id, :actor_kind, :client_ip, :user_agent, :request_id) "
                     "RETURNING entity_id"
                 ),
                 {
@@ -240,6 +272,7 @@ class EntityRegistryClient:
                     "md": _jsonb(metadata),
                     "sid": my_source,
                     "run": self._run_id,
+                    **ac,
                 },
             )
         ).scalar_one()
@@ -247,7 +280,20 @@ class EntityRegistryClient:
         for ns, val in identifiers.items():
             await self.add_identifier(eid, ns, val, is_primary=False)
 
-        return await self.get(eid)
+        new_entity = await self.get(eid)
+        await self._emit_audit(
+            operation="entity.create",
+            target_table="entity",
+            target_pk={"entity_id": str(new_entity.entity_id)},
+            before=None,
+            after=new_entity.model_dump(mode="json"),
+        )
+        # Prometheus: count fresh entity creates per source. Idempotent
+        # hits (already-resolved identifiers) are NOT counted here —
+        # those return earlier and emit entity.idempotent_hit, which
+        # is observable via aslan_audit_events_total.
+        metrics.entity_creates.labels(source_id=my_source).inc()
+        return new_entity
 
     async def add_identifier(
         self,
@@ -260,11 +306,13 @@ class EntityRegistryClient:
     ) -> None:
         """Idempotent on (namespace, value, valid_from). Collision with a
         different entity_id raises IdentifierConflict."""
+        assert_actor_or_strict_raise()
         my_source = await self._source_id()
         existing = (
             await self._s.execute(
                 text(
-                    "SELECT entity_id, valid_from FROM ref.identifier "
+                    "SELECT identifier_id, entity_id, valid_from "
+                    "FROM ref.identifier "
                     "WHERE namespace = :ns AND value = :v "
                     "  AND valid_from = COALESCE(:vf, DATE '1900-01-01')"
                 ),
@@ -277,35 +325,80 @@ class EntityRegistryClient:
                     f"({namespace}={value!r}, valid_from={existing.valid_from}) "
                     f"already maps to entity {existing.entity_id}",
                 )
-            return  # idempotent no-op
+            # Codex F1, 2026-04-29: idempotent hit — same (namespace,
+            # value, valid_from) already pointing at this entity. Do NOT
+            # mutate the existing row's audit columns; emit one
+            # identifier.idempotent_hit event with the current actor.
+            snap = {
+                "identifier_id": existing.identifier_id,
+                "entity_id": str(existing.entity_id),
+                "namespace": namespace,
+                "value": value,
+                "valid_from": str(existing.valid_from),
+            }
+            await self._emit_audit(
+                operation="identifier.idempotent_hit",
+                target_table="identifier",
+                target_pk={"identifier_id": existing.identifier_id},
+                before=snap,
+                after=snap,
+                metadata={"returned_existing": True},
+            )
+            return
 
         try:
-            await self._s.execute(
-                text(
-                    "INSERT INTO ref.identifier "
-                    "  (entity_id, namespace, value, valid_from, valid_to, "
-                    "   is_primary, source_id, ingestion_run_id) "
-                    "VALUES (:eid, :ns, :v, "
-                    "        COALESCE(:vf, DATE '1900-01-01'), "
-                    "        COALESCE(:vt, DATE '9999-12-31'), "
-                    "        :prim, :sid, :run)"
-                ),
-                {
-                    "eid": entity_id,
-                    "ns": namespace,
-                    "v": value,
-                    "vf": valid_from,
-                    "vt": valid_to,
-                    "prim": is_primary,
-                    "sid": my_source,
-                    "run": self._run_id,
-                },
-            )
+            ac = _audit_cols()
+            new_id: int = (
+                await self._s.execute(
+                    text(
+                        "INSERT INTO ref.identifier "
+                        "  (entity_id, namespace, value, valid_from, valid_to, "
+                        "   is_primary, source_id, ingestion_run_id, "
+                        "   actor_id, actor_kind, client_ip, user_agent, request_id) "
+                        "VALUES (:eid, :ns, :v, "
+                        "        COALESCE(:vf, DATE '1900-01-01'), "
+                        "        COALESCE(:vt, DATE '9999-12-31'), "
+                        "        :prim, :sid, :run, "
+                        "        :actor_id, :actor_kind, :client_ip, "
+                        "        :user_agent, :request_id) "
+                        "RETURNING identifier_id"
+                    ),
+                    {
+                        "eid": entity_id,
+                        "ns": namespace,
+                        "v": value,
+                        "vf": valid_from,
+                        "vt": valid_to,
+                        "prim": is_primary,
+                        "sid": my_source,
+                        "run": self._run_id,
+                        **ac,
+                    },
+                )
+            ).scalar_one()
             await self._s.flush()
+        except IdentifierConflict:
+            raise
         except Exception as e:
             # GiST exclusion violation = a *different* entity holds an
             # overlapping window for the same (namespace, value).
             raise IdentifierConflict(str(e)) from e
+
+        await self._emit_audit(
+            operation="identifier.add",
+            target_table="identifier",
+            target_pk={"identifier_id": new_id},
+            before=None,
+            after={
+                "identifier_id": new_id,
+                "entity_id": str(entity_id),
+                "namespace": namespace,
+                "value": value,
+                "valid_from": str(valid_from) if valid_from else "1900-01-01",
+                "valid_to": str(valid_to) if valid_to else "9999-12-31",
+                "is_primary": is_primary,
+            },
+        )
 
     async def update_entity(
         self,
@@ -318,7 +411,16 @@ class EntityRegistryClient:
         domicile: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> Entity:
-        """Partial update. Touches updated_at."""
+        """Partial update. Touches updated_at.
+
+        Always a fresh write — by the global "row audit cols = last
+        writer" invariant, the row's denormalised audit cols are stamped
+        with the current actor on every successful UPDATE.
+        """
+        assert_actor_or_strict_raise()
+        # Capture pre-update snapshot for the audit event's `before`.
+        before_entity = await self.get(entity_id)
+
         sets: list[str] = []
         params: dict[str, Any] = {"eid": entity_id}
         for field, val in (
@@ -335,11 +437,29 @@ class EntityRegistryClient:
             sets.append("metadata = metadata || :md::jsonb")
             params["md"] = _jsonb(metadata)
         sets.append("updated_at = now()")
+        # Stamp audit cols in the same UPDATE so we never need a
+        # post-write second statement (codex F1: separate UPDATEs are
+        # vulnerable to retry-rewriting attribution).
+        ac = _audit_cols()
+        sets.append("actor_id = :actor_id")
+        sets.append("actor_kind = :actor_kind")
+        sets.append("client_ip = :client_ip")
+        sets.append("user_agent = :user_agent")
+        sets.append("request_id = :request_id")
+        params.update(ac)
         await self._s.execute(
             text(f"UPDATE ref.entity SET {', '.join(sets)} WHERE entity_id = :eid"),  # noqa: S608
             params,
         )
-        return await self.get(entity_id)
+        after_entity = await self.get(entity_id)
+        await self._emit_audit(
+            operation="entity.update",
+            target_table="entity",
+            target_pk={"entity_id": str(entity_id)},
+            before=before_entity.model_dump(mode="json"),
+            after=after_entity.model_dump(mode="json"),
+        )
+        return after_entity
 
     async def expire_identifier(
         self,
@@ -347,21 +467,71 @@ class EntityRegistryClient:
         value: str,
         as_of: date,
     ) -> None:
-        """Set valid_to = as_of (FIRST INVALID DAY) on the active row."""
+        """Set valid_to = as_of (FIRST INVALID DAY) on the active row.
+
+        Always a fresh write — stamps audit cols on the UPDATE in a
+        single round-trip and emits one identifier.expire event with
+        before/after capturing the valid_to flip.
+        """
+        assert_actor_or_strict_raise()
+        ac = _audit_cols()
+        # Use a CTE-style "before snapshot + UPDATE" to capture the
+        # pre-update valid_to atomically. Returns one row when the WHERE
+        # clause matched an active identifier; zero rows otherwise.
         res = cast(
             "CursorResult[Any]",
             await self._s.execute(
                 text(
-                    "UPDATE ref.identifier "
-                    "   SET valid_to = :asof "
-                    " WHERE namespace = :ns AND value = :v "
-                    "   AND :asof >= valid_from AND :asof < valid_to"
+                    "WITH old AS ( "
+                    "  SELECT identifier_id, entity_id, valid_from, valid_to "
+                    "    FROM ref.identifier "
+                    "   WHERE namespace = :ns AND value = :v "
+                    "     AND :asof >= valid_from AND :asof < valid_to "
+                    "  FOR UPDATE "
+                    "), upd AS ( "
+                    "  UPDATE ref.identifier r "
+                    "     SET valid_to   = :asof, "
+                    "         actor_id   = :actor_id, "
+                    "         actor_kind = :actor_kind, "
+                    "         client_ip  = :client_ip, "
+                    "         user_agent = :user_agent, "
+                    "         request_id = :request_id "
+                    "    FROM old "
+                    "   WHERE r.identifier_id = old.identifier_id "
+                    "  RETURNING r.identifier_id "
+                    ") "
+                    "SELECT old.identifier_id, old.entity_id, "
+                    "       old.valid_from, old.valid_to "
+                    "  FROM old"
                 ),
-                {"ns": namespace, "v": value, "asof": as_of},
+                {"ns": namespace, "v": value, "asof": as_of, **ac},
             ),
         )
-        if res.rowcount == 0:
+        row = res.one_or_none()
+        if row is None:
             raise EntityNotFound(f"no active identifier ({namespace}={value!r})")
+
+        await self._emit_audit(
+            operation="identifier.expire",
+            target_table="identifier",
+            target_pk={"identifier_id": row.identifier_id},
+            before={
+                "identifier_id": row.identifier_id,
+                "entity_id": str(row.entity_id),
+                "namespace": namespace,
+                "value": value,
+                "valid_from": str(row.valid_from),
+                "valid_to": str(row.valid_to),
+            },
+            after={
+                "identifier_id": row.identifier_id,
+                "entity_id": str(row.entity_id),
+                "namespace": namespace,
+                "value": value,
+                "valid_from": str(row.valid_from),
+                "valid_to": str(as_of),
+            },
+        )
 
     async def link(
         self,
@@ -374,21 +544,85 @@ class EntityRegistryClient:
         metadata: dict[str, Any] | None = None,
     ) -> None:
         """Idempotent on (parent_id, child_id, rel_type, valid_from).
-        Existing rows update weight / valid_to / metadata."""
+        Existing rows update weight / valid_to / metadata.
+
+        Idempotent-hit (codex F1): a call with the same values as the
+        existing row is a true no-op — the row's audit columns stay
+        frozen on the original linker. A call that actually mutates a
+        field (different weight, valid_to, or metadata) is a fresh
+        write and last-writer-wins on audit cols.
+        """
+        assert_actor_or_strict_raise()
         my_source = await self._source_id()
+        vf = valid_from or date(1900, 1, 1)
+        vt = valid_to or date(9999, 12, 31)
+        md_in = metadata or {}
+
+        # Pre-SELECT to detect idempotent-hit vs fresh-write.
+        existing = (
+            await self._s.execute(
+                text(
+                    "SELECT relationship_id, weight, valid_to, metadata "
+                    "FROM ref.entity_relationship "
+                    "WHERE parent_id = :p AND child_id = :c "
+                    "  AND rel_type = :rt AND valid_from = :vf"
+                ),
+                {"p": parent_id, "c": child_id, "rt": rel_type, "vf": vf},
+            )
+        ).one_or_none()
+
+        if existing is not None:
+            same = (
+                existing.weight == weight
+                and existing.valid_to == vt
+                and (existing.metadata or {}) == md_in
+            )
+            if same:
+                snap = {
+                    "relationship_id": existing.relationship_id,
+                    "parent_id": str(parent_id),
+                    "child_id": str(child_id),
+                    "rel_type": rel_type,
+                    "weight": str(existing.weight) if existing.weight is not None else None,
+                    "valid_from": str(vf),
+                    "valid_to": str(existing.valid_to),
+                    "metadata": existing.metadata or {},
+                }
+                await self._emit_audit(
+                    operation="entity_relationship.idempotent_hit",
+                    target_table="entity_relationship",
+                    target_pk={"relationship_id": existing.relationship_id},
+                    before=snap,
+                    after=snap,
+                    metadata={"returned_existing": True},
+                )
+                return
+
+        # Fresh write — INSERT or DO UPDATE branch. Stamp audit cols on
+        # both branches so last-writer-wins on the row's denormalised
+        # audit columns.
+        ac = _audit_cols()
         await self._s.execute(
             text(
                 "INSERT INTO ref.entity_relationship "
                 "  (parent_id, child_id, rel_type, weight, valid_from, valid_to, "
-                "   metadata, source_id, ingestion_run_id) "
+                "   metadata, source_id, ingestion_run_id, "
+                "   actor_id, actor_kind, client_ip, user_agent, request_id) "
                 "VALUES (:p, :c, :rt, :w, "
                 "        COALESCE(:vf, DATE '1900-01-01'), "
                 "        COALESCE(:vt, DATE '9999-12-31'), "
-                "        COALESCE(:md, '{}')::jsonb, :sid, :run) "
+                "        COALESCE(:md, '{}')::jsonb, :sid, :run, "
+                "        :actor_id, :actor_kind, :client_ip, "
+                "        :user_agent, :request_id) "
                 "ON CONFLICT (parent_id, child_id, rel_type, valid_from) "
-                "  DO UPDATE SET weight   = EXCLUDED.weight, "
-                "                valid_to = EXCLUDED.valid_to, "
-                "                metadata = EXCLUDED.metadata"
+                "  DO UPDATE SET weight     = EXCLUDED.weight, "
+                "                valid_to   = EXCLUDED.valid_to, "
+                "                metadata   = EXCLUDED.metadata, "
+                "                actor_id   = EXCLUDED.actor_id, "
+                "                actor_kind = EXCLUDED.actor_kind, "
+                "                client_ip  = EXCLUDED.client_ip, "
+                "                user_agent = EXCLUDED.user_agent, "
+                "                request_id = EXCLUDED.request_id"
             ),
             {
                 "p": parent_id,
@@ -400,7 +634,51 @@ class EntityRegistryClient:
                 "md": _jsonb(metadata),
                 "sid": my_source,
                 "run": self._run_id,
+                **ac,
             },
+        )
+
+        before_snap = (
+            None
+            if existing is None
+            else {
+                "relationship_id": existing.relationship_id,
+                "parent_id": str(parent_id),
+                "child_id": str(child_id),
+                "rel_type": rel_type,
+                "weight": str(existing.weight) if existing.weight is not None else None,
+                "valid_from": str(vf),
+                "valid_to": str(existing.valid_to),
+                "metadata": existing.metadata or {},
+            }
+        )
+        # Look up the relationship_id for the after snapshot and pk.
+        rel_id: int = (
+            await self._s.execute(
+                text(
+                    "SELECT relationship_id FROM ref.entity_relationship "
+                    "WHERE parent_id = :p AND child_id = :c "
+                    "  AND rel_type = :rt AND valid_from = :vf"
+                ),
+                {"p": parent_id, "c": child_id, "rt": rel_type, "vf": vf},
+            )
+        ).scalar_one()
+        after_snap: dict[str, Any] = {
+            "relationship_id": rel_id,
+            "parent_id": str(parent_id),
+            "child_id": str(child_id),
+            "rel_type": rel_type,
+            "weight": str(weight) if weight is not None else None,
+            "valid_from": str(vf),
+            "valid_to": str(vt),
+            "metadata": md_in,
+        }
+        await self._emit_audit(
+            operation="entity_relationship.link",
+            target_table="entity_relationship",
+            target_pk={"relationship_id": rel_id},
+            before=before_snap,
+            after=after_snap,
         )
 
     async def upsert_sector(
@@ -413,17 +691,78 @@ class EntityRegistryClient:
         name_en: str | None = None,
         parent_sector_id: str | None = None,
     ) -> None:
+        """Idempotent on sector_id. Existing rows update taxonomy / code /
+        names / parent.
+
+        Idempotent-hit (codex Batch 2 F1, 2026-04-29): a call with the
+        same fields as the existing row is a true no-op — the row's
+        audit columns stay frozen on the original definer. A call that
+        mutates any field is a fresh write and last-writer-wins on
+        audit cols.
+        """
+        assert_actor_or_strict_raise()
+        # Pre-SELECT to detect idempotent-hit vs fresh-write.
+        existing = (
+            await self._s.execute(
+                text(
+                    "SELECT taxonomy, code, name_tr, name_en, parent_sector_id "
+                    "FROM ref.sector WHERE sector_id = :sid"
+                ),
+                {"sid": sector_id},
+            )
+        ).one_or_none()
+
+        if existing is not None:
+            same = (
+                existing.taxonomy == taxonomy
+                and existing.code == code
+                and existing.name_tr == name_tr
+                and existing.name_en == name_en
+                and existing.parent_sector_id == parent_sector_id
+            )
+            if same:
+                snap = {
+                    "sector_id": sector_id,
+                    "taxonomy": existing.taxonomy,
+                    "code": existing.code,
+                    "name_tr": existing.name_tr,
+                    "name_en": existing.name_en,
+                    "parent_sector_id": existing.parent_sector_id,
+                }
+                await self._emit_audit(
+                    operation="sector.idempotent_hit",
+                    target_table="sector",
+                    target_pk={"sector_id": sector_id},
+                    before=snap,
+                    after=snap,
+                    metadata={"returned_existing": True},
+                )
+                return
+
+        # Fresh write — INSERT or DO UPDATE branch. Stamp audit cols on
+        # both branches so last-writer-wins on the row's denormalised
+        # audit columns (single round-trip, no post-write UPDATE per
+        # codex F1).
+        ac = _audit_cols()
         await self._s.execute(
             text(
                 "INSERT INTO ref.sector "
-                "  (sector_id, taxonomy, code, name_tr, name_en, parent_sector_id) "
-                "VALUES (:sid, :tax, :code, :ntr, :nen, :pid) "
+                "  (sector_id, taxonomy, code, name_tr, name_en, parent_sector_id, "
+                "   actor_id, actor_kind, client_ip, user_agent, request_id) "
+                "VALUES (:sid, :tax, :code, :ntr, :nen, :pid, "
+                "        :actor_id, :actor_kind, :client_ip, "
+                "        :user_agent, :request_id) "
                 "ON CONFLICT (sector_id) DO UPDATE "
-                "  SET taxonomy = EXCLUDED.taxonomy, "
-                "      code = EXCLUDED.code, "
-                "      name_tr = EXCLUDED.name_tr, "
-                "      name_en = EXCLUDED.name_en, "
-                "      parent_sector_id = EXCLUDED.parent_sector_id"
+                "  SET taxonomy         = EXCLUDED.taxonomy, "
+                "      code             = EXCLUDED.code, "
+                "      name_tr          = EXCLUDED.name_tr, "
+                "      name_en          = EXCLUDED.name_en, "
+                "      parent_sector_id = EXCLUDED.parent_sector_id, "
+                "      actor_id         = EXCLUDED.actor_id, "
+                "      actor_kind       = EXCLUDED.actor_kind, "
+                "      client_ip        = EXCLUDED.client_ip, "
+                "      user_agent       = EXCLUDED.user_agent, "
+                "      request_id       = EXCLUDED.request_id"
             ),
             {
                 "sid": sector_id,
@@ -432,7 +771,36 @@ class EntityRegistryClient:
                 "ntr": name_tr,
                 "nen": name_en,
                 "pid": parent_sector_id,
+                **ac,
             },
+        )
+
+        before_snap = (
+            None
+            if existing is None
+            else {
+                "sector_id": sector_id,
+                "taxonomy": existing.taxonomy,
+                "code": existing.code,
+                "name_tr": existing.name_tr,
+                "name_en": existing.name_en,
+                "parent_sector_id": existing.parent_sector_id,
+            }
+        )
+        after_snap = {
+            "sector_id": sector_id,
+            "taxonomy": taxonomy,
+            "code": code,
+            "name_tr": name_tr,
+            "name_en": name_en,
+            "parent_sector_id": parent_sector_id,
+        }
+        await self._emit_audit(
+            operation="sector.upsert",
+            target_table="sector",
+            target_pk={"sector_id": sector_id},
+            before=before_snap,
+            after=after_snap,
         )
 
     async def assign_sector(
@@ -443,17 +811,72 @@ class EntityRegistryClient:
         valid_from: date | None = None,
         valid_to: date | None = None,
     ) -> None:
-        """Idempotent on (entity_id, sector_id, valid_from)."""
+        """Idempotent on (entity_id, sector_id, valid_from).
+
+        Idempotent-hit (codex F1): a call with the same is_primary +
+        valid_to as the existing row is a true no-op — the row's audit
+        columns stay frozen on the original assigner. A call that
+        actually mutates a field is a fresh write and last-writer-wins
+        on audit cols.
+        """
+        assert_actor_or_strict_raise()
+        vf = valid_from or date(1900, 1, 1)
+        vt = valid_to or date(9999, 12, 31)
+        # Pre-SELECT to detect idempotent-hit vs fresh-write.
+        existing = (
+            await self._s.execute(
+                text(
+                    "SELECT is_primary, valid_to FROM ref.entity_sector "
+                    "WHERE entity_id = :eid AND sector_id = :sid "
+                    "  AND valid_from = :vf"
+                ),
+                {"eid": entity_id, "sid": sector_id, "vf": vf},
+            )
+        ).one_or_none()
+
+        if existing is not None:
+            same = existing.is_primary == is_primary and existing.valid_to == vt
+            if same:
+                snap = {
+                    "entity_id": str(entity_id),
+                    "sector_id": sector_id,
+                    "is_primary": existing.is_primary,
+                    "valid_from": str(vf),
+                    "valid_to": str(existing.valid_to),
+                }
+                await self._emit_audit(
+                    operation="entity_sector.idempotent_hit",
+                    target_table="entity_sector",
+                    target_pk={
+                        "entity_id": str(entity_id),
+                        "sector_id": sector_id,
+                        "valid_from": str(vf),
+                    },
+                    before=snap,
+                    after=snap,
+                    metadata={"returned_existing": True},
+                )
+                return
+
+        ac = _audit_cols()
         await self._s.execute(
             text(
                 "INSERT INTO ref.entity_sector "
-                "  (entity_id, sector_id, is_primary, valid_from, valid_to) "
+                "  (entity_id, sector_id, is_primary, valid_from, valid_to, "
+                "   actor_id, actor_kind, client_ip, user_agent, request_id) "
                 "VALUES (:eid, :sid, :prim, "
                 "        COALESCE(:vf, DATE '1900-01-01'), "
-                "        COALESCE(:vt, DATE '9999-12-31')) "
+                "        COALESCE(:vt, DATE '9999-12-31'), "
+                "        :actor_id, :actor_kind, :client_ip, "
+                "        :user_agent, :request_id) "
                 "ON CONFLICT (entity_id, sector_id, valid_from) "
                 "  DO UPDATE SET is_primary = EXCLUDED.is_primary, "
-                "                valid_to   = EXCLUDED.valid_to"
+                "                valid_to   = EXCLUDED.valid_to, "
+                "                actor_id   = EXCLUDED.actor_id, "
+                "                actor_kind = EXCLUDED.actor_kind, "
+                "                client_ip  = EXCLUDED.client_ip, "
+                "                user_agent = EXCLUDED.user_agent, "
+                "                request_id = EXCLUDED.request_id"
             ),
             {
                 "eid": entity_id,
@@ -461,7 +884,38 @@ class EntityRegistryClient:
                 "prim": is_primary,
                 "vf": valid_from,
                 "vt": valid_to,
+                **ac,
             },
+        )
+
+        before_snap = (
+            None
+            if existing is None
+            else {
+                "entity_id": str(entity_id),
+                "sector_id": sector_id,
+                "is_primary": existing.is_primary,
+                "valid_from": str(vf),
+                "valid_to": str(existing.valid_to),
+            }
+        )
+        after_snap = {
+            "entity_id": str(entity_id),
+            "sector_id": sector_id,
+            "is_primary": is_primary,
+            "valid_from": str(vf),
+            "valid_to": str(vt),
+        }
+        await self._emit_audit(
+            operation="entity_sector.upsert",
+            target_table="entity_sector",
+            target_pk={
+                "entity_id": str(entity_id),
+                "sector_id": sector_id,
+                "valid_from": str(vf),
+            },
+            before=before_snap,
+            after=after_snap,
         )
 
     # ─── helpers ───
@@ -486,6 +940,36 @@ class EntityRegistryClient:
             updated_at=row.updated_at,
         )
 
+    async def _emit_audit(
+        self,
+        *,
+        operation: str,
+        target_table: str,
+        target_pk: dict[str, Any],
+        before: dict[str, Any] | None,
+        after: dict[str, Any] | None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Emit one audit event scoped to the registry (target_schema='ref').
+
+        Centralised so every registry mutation writes events the same way
+        and so the schema/run_id binding is not duplicated at every call
+        site.
+        """
+        await audit_record(
+            self._s,
+            record=AuditRecord(
+                operation=operation,
+                target_schema="ref",
+                target_table=target_table,
+                target_pk=target_pk,
+                before=before,
+                after=after,
+                metadata=metadata or {},
+                ingestion_run_id=self._run_id,
+            ),
+        )
+
     async def _source_id(self) -> str:
         if self._source_id_cache is None:
             sid: str | None = await self._s.scalar(
@@ -504,3 +988,31 @@ def _jsonb(d: dict[str, Any] | None) -> str | None:
     if d is None:
         return None
     return json.dumps(d)
+
+
+def _audit_cols() -> dict[str, Any]:
+    """Build the actor_id/actor_kind/client_ip/user_agent/request_id bind
+    params for the current ContextVar actor.
+
+    When no actor is set, returns NULLs — the actual strict-mode raise
+    happens inside ``audit.record()``. This helper is for *stamping the
+    row's denormalised audit columns* at INSERT time so we never need a
+    post-write UPDATE (which would let an idempotent retry rewrite the
+    original creator's attribution per codex F1).
+    """
+    a = current_actor()
+    if a is None:
+        return {
+            "actor_id": None,
+            "actor_kind": None,
+            "client_ip": None,
+            "user_agent": None,
+            "request_id": None,
+        }
+    return {
+        "actor_id": a.actor_id,
+        "actor_kind": a.actor_kind,
+        "client_ip": a.client_ip,
+        "user_agent": a.user_agent,
+        "request_id": a.request_id,
+    }

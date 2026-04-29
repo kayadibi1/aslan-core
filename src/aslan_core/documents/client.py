@@ -10,8 +10,15 @@ import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from aslan_core.audit import (
+    AuditRecord,
+    assert_actor_or_strict_raise,
+    current_actor,
+)
+from aslan_core.audit import record as audit_record
 from aslan_core.documents.object_storage import ObjectStorageClient
 from aslan_core.errors import DocumentDBError, DocumentNotFound, ObjectStoreError
+from aslan_core.observability import metrics
 from aslan_core.schemas.filing import AttachmentIn, Filing, PutFilingResult
 
 _log = structlog.get_logger(__name__)
@@ -200,7 +207,17 @@ class DocumentStore:
         so the caller can pass it to ``release()`` on outer-transaction
         rollback. ``release()`` MUST NOT depend on ``doc.filing_attachment``
         rows, which may be invisible/gone post-rollback.
+
+        Strict-mode early check (codex F3): raises AuditMissingActor
+        BEFORE any blob upload or DB INSERT when audit_strict=True and
+        no actor is set. This is the procurement-grade gate — strict
+        mode is meaningful only if it catches missing actors before
+        any side effect runs.
         """
+        # Strict-mode early check fires before validation so a missing
+        # actor takes precedence over arg-validation errors (the
+        # caller learns about the contract violation first).
+        assert_actor_or_strict_raise()
         # I3: validate xbrl argument consistency before any I/O.
         if has_xbrl and (xbrl_bytes is None or xbrl_filename is None):
             raise ValueError(
@@ -334,7 +351,41 @@ class DocumentStore:
                     content_type="application/xml",
                 )
 
+            # Step 3b (audit, codex F1+F7): capture the pre-state of any
+            # canonical row that ON CONFLICT would touch. Three reasons:
+            #   1) Distinguish case A (pure rerun → no-op, audit cols
+            #      MUST stay frozen on the original creator) from case B
+            #      (republished_as alias add → row IS mutated, audit
+            #      cols last-writer-win on this call's actor).
+            #   2) Build the case-B audit event's `before` snapshot so
+            #      the alias-add event is self-contained for forensics
+            #      even if the original filing.put event is pruned by
+            #      retention later (codex F7).
+            #   3) Skip the case-A no-op write entirely so audit cols
+            #      never rewrite on a same-bytes same-source-ref retry.
+            pre = (
+                await self._s.execute(
+                    text(
+                        "SELECT filing_id, source_filing_ref, metadata, "
+                        "       actor_id, actor_kind, client_ip, "
+                        "       user_agent, request_id "
+                        "FROM doc.filing "
+                        "WHERE source_id = :src AND primary_sha256 = :sha "
+                        "FOR UPDATE"
+                    ),
+                    {"src": source_id, "sha": sha256},
+                )
+            ).one_or_none()
+            ac = _audit_cols()
+
             # Step 4: atomic upsert with revision_no advancement.
+            # The DO UPDATE branch's audit-col SET is wrapped in the
+            # same CASE as `metadata`: case A and the
+            # already-in-republished_as branch keep doc.filing.actor_id;
+            # case B (alias add) overwrites with EXCLUDED.actor_id so
+            # the row's denormalised audit cols reflect the alias-adder
+            # (last-writer-wins per spec §"row audit cols = last
+            # writer").
             result_row = (
                 await self._s.execute(
                     text(
@@ -349,13 +400,15 @@ class DocumentStore:
                         "    period_start, period_end, source_url, is_amendment, "
                         "    previous_filing_id, primary_object_key, primary_mime, "
                         "    primary_sha256, primary_bytes, has_xbrl, xbrl_object_key, "
-                        "    metadata, ingestion_run_id, revision_no"
+                        "    metadata, ingestion_run_id, revision_no, "
+                        "    actor_id, actor_kind, client_ip, user_agent, request_id"
                         ") "
                         "VALUES ("
                         "    :fid, :src, :ref, :eid, :kind, :subkind, :title, :lang, :pub, "
                         "    :ps, :pe, :url, :amend, :prev, :ok, :mime, :sha, :bytes, "
                         "    :hx, :xkey, COALESCE(:md, '{}')::jsonb, :run, "
-                        "    (SELECT rn FROM next_rev)"
+                        "    (SELECT rn FROM next_rev), "
+                        "    :actor_id, :actor_kind, :client_ip, :user_agent, :request_id"
                         ") "
                         "ON CONFLICT (source_id, primary_sha256) DO UPDATE "
                         "SET metadata = CASE "
@@ -384,6 +437,65 @@ class DocumentStore:
                         "        ) || to_jsonb(EXCLUDED.source_filing_ref), "
                         "        true"
                         "    ) "
+                        "END, "
+                        # Audit cols mirror the metadata CASE: only case B
+                        # (alias add) is a real mutation; case A and
+                        # already-aliased calls preserve the canonical
+                        # row's audit cols.
+                        "actor_id = CASE "
+                        "    WHEN doc.filing.source_filing_ref "
+                        "         = EXCLUDED.source_filing_ref "
+                        "    THEN doc.filing.actor_id "
+                        "    WHEN COALESCE("
+                        "             doc.filing.metadata->'republished_as', "
+                        "             '[]'::jsonb"
+                        "         ) @> to_jsonb(ARRAY[EXCLUDED.source_filing_ref]) "
+                        "    THEN doc.filing.actor_id "
+                        "    ELSE EXCLUDED.actor_id "
+                        "END, "
+                        "actor_kind = CASE "
+                        "    WHEN doc.filing.source_filing_ref "
+                        "         = EXCLUDED.source_filing_ref "
+                        "    THEN doc.filing.actor_kind "
+                        "    WHEN COALESCE("
+                        "             doc.filing.metadata->'republished_as', "
+                        "             '[]'::jsonb"
+                        "         ) @> to_jsonb(ARRAY[EXCLUDED.source_filing_ref]) "
+                        "    THEN doc.filing.actor_kind "
+                        "    ELSE EXCLUDED.actor_kind "
+                        "END, "
+                        "client_ip = CASE "
+                        "    WHEN doc.filing.source_filing_ref "
+                        "         = EXCLUDED.source_filing_ref "
+                        "    THEN doc.filing.client_ip "
+                        "    WHEN COALESCE("
+                        "             doc.filing.metadata->'republished_as', "
+                        "             '[]'::jsonb"
+                        "         ) @> to_jsonb(ARRAY[EXCLUDED.source_filing_ref]) "
+                        "    THEN doc.filing.client_ip "
+                        "    ELSE EXCLUDED.client_ip "
+                        "END, "
+                        "user_agent = CASE "
+                        "    WHEN doc.filing.source_filing_ref "
+                        "         = EXCLUDED.source_filing_ref "
+                        "    THEN doc.filing.user_agent "
+                        "    WHEN COALESCE("
+                        "             doc.filing.metadata->'republished_as', "
+                        "             '[]'::jsonb"
+                        "         ) @> to_jsonb(ARRAY[EXCLUDED.source_filing_ref]) "
+                        "    THEN doc.filing.user_agent "
+                        "    ELSE EXCLUDED.user_agent "
+                        "END, "
+                        "request_id = CASE "
+                        "    WHEN doc.filing.source_filing_ref "
+                        "         = EXCLUDED.source_filing_ref "
+                        "    THEN doc.filing.request_id "
+                        "    WHEN COALESCE("
+                        "             doc.filing.metadata->'republished_as', "
+                        "             '[]'::jsonb"
+                        "         ) @> to_jsonb(ARRAY[EXCLUDED.source_filing_ref]) "
+                        "    THEN doc.filing.request_id "
+                        "    ELSE EXCLUDED.request_id "
                         "END "
                         "RETURNING filing_id, revision_no, (xmax = 0) AS created"
                     ),
@@ -410,6 +522,7 @@ class DocumentStore:
                         "xkey": xbrl_key,
                         "md": _json_metadata(metadata),
                         "run": self._run_id,
+                        **ac,
                     },
                 )
             ).one()
@@ -460,6 +573,96 @@ class DocumentStore:
                 )
 
             filing = await self.get_filing(actual_filing_id)
+
+            # Step 7 (audit): emit the appropriate event based on which
+            # SQL CASE branch fired. Event categories per spec §5.4 +
+            # codex Batch 2 F2 (2026-04-29):
+            #
+            #   - created=True                                → filing.put
+            #     Fresh INSERT, may be revision_no > 1 case C chain advance.
+            #   - created=False, pre.ref == new ref           → filing.dedup_hit
+            #     Case A pure rerun: same source_filing_ref, same bytes.
+            #     The SQL CASE preserved metadata + audit cols.
+            #   - created=False, pre.ref != new ref AND       → filing.idempotent_hit
+            #     republished_as ALREADY contains new ref
+            #     The new ref was already aliased on a prior call. The SQL
+            #     CASE preserved metadata + audit cols. Without this branch,
+            #     a repeated alias-add would be misclassified as
+            #     filing.republished_alias_added even though no row
+            #     mutation occurred (codex Batch 2 F2).
+            #   - created=False, otherwise                    → filing.republished_alias_added
+            #     Case B alias add: the new ref is appended to
+            #     metadata.republished_as; row's audit cols overwritten
+            #     by this actor (last-writer-wins).
+            after_audit = _filing_audit_payload(filing)
+            after_audit["attachments"] = [
+                {"sequence": a.sequence, "filename": a.filename, "bytes": len(a.bytes)}
+                for a in (attachments or [])
+            ]
+            if created:
+                op = "filing.put"
+                before_audit: dict[str, Any] | None = None
+            else:
+                # pre is non-None on the not-created path: a hash-dedup
+                # hit means an existing canonical row matched.
+                assert pre is not None
+                pre_metadata: dict[str, Any] = pre.metadata or {}
+                before_audit = {
+                    "filing_id": str(pre.filing_id),
+                    "source_filing_ref": pre.source_filing_ref,
+                    "metadata": pre_metadata,
+                    "actor_id": pre.actor_id,
+                    "actor_kind": pre.actor_kind,
+                }
+                if pre.source_filing_ref == source_filing_ref:
+                    op = "filing.dedup_hit"
+                elif source_filing_ref in pre_metadata.get("republished_as", []):
+                    # Codex Batch 2 F2: alias already present from a
+                    # prior alias-add — the SQL CASE no-oped the row.
+                    # Emit idempotent_hit, NOT republished_alias_added.
+                    # `after_audit` is built from the post-call SELECT
+                    # of the canonical row, which equals pre_metadata
+                    # for this branch (no mutation), so before/after
+                    # are naturally symmetric — caller-visible diff
+                    # is zero.
+                    op = "filing.idempotent_hit"
+                else:
+                    op = "filing.republished_alias_added"
+            await audit_record(
+                self._s,
+                record=AuditRecord(
+                    operation=op,
+                    target_schema="doc",
+                    target_table="filing",
+                    target_pk={"filing_id": str(actual_filing_id)},
+                    before=before_audit,
+                    after=after_audit,
+                    metadata={
+                        "revision_no": revision_no,
+                        "primary_sha256": sha256,
+                        "primary_size_bytes": len(primary_bytes),
+                        "returned_existing": not created,
+                    },
+                    ingestion_run_id=self._run_id,
+                ),
+            )
+
+            # Prometheus: count put_filing calls labelled by
+            # (source_id, kind, created). created="true"|"false"
+            # distinguishes fresh inserts from hash-dedup hits — the
+            # case-distribution telemetry the spec calls for.
+            #
+            # ``kind`` is normalized against the closed allow-list to
+            # bound metric cardinality (codex Batch 4) — a crawler
+            # passing per-feed values would otherwise create one time
+            # series per mutation. The DB column keeps the raw kind;
+            # only the metric label is collapsed.
+            metrics.filing_puts.labels(
+                source_id=source_id,
+                kind=metrics._normalize_metric_label(kind, metrics._KNOWN_FILING_KINDS),
+                created="true" if created else "false",
+            ).inc()
+
             return PutFilingResult(
                 filing=filing,
                 created=created,
@@ -577,12 +780,50 @@ class DocumentStore:
 
         Best-effort per key; logs orphans on individual delete failure but
         does NOT raise.
+
+        Emits a ``filing.release`` audit event BEFORE the blob deletes so
+        the manifest is preserved as the forensic snapshot. If the
+        caller's outer transaction is rolled back the event rolls back
+        with it (consistent with the doc.filing row's lifecycle); if
+        the caller has already committed, the audit event is durable.
         """
+        assert_actor_or_strict_raise()
+        # Emit audit event first so the manifest is durable in the
+        # session before any side-effecting blob delete runs.
+        await audit_record(
+            self._s,
+            record=AuditRecord(
+                operation="filing.release",
+                target_schema="doc",
+                target_table="filing",
+                target_pk={"filing_id": str(result.filing.filing_id)},
+                before={
+                    "filing_id": str(result.filing.filing_id),
+                    "bucket": result.bucket,
+                    "object_keys": list(result.object_keys),
+                    "primary_sha256": result.filing.primary_sha256,
+                },
+                after=None,
+                metadata={"key_count": len(result.object_keys)},
+                ingestion_run_id=self._run_id,
+            ),
+        )
+        all_deleted = True
         for key in result.object_keys:
             try:
                 await self._oc.delete_object(bucket=result.bucket, key=key)
             except Exception as e:
+                all_deleted = False
                 _log_orphan_cleanup_failed(result.bucket, key, e)
+        # Prometheus: count release calls by (source_id, success).
+        # success="true" iff every blob delete succeeded; orphans are
+        # tracked separately via aslan_object_storage_orphans_total
+        # so dashboards can quantify "release with orphans" vs
+        # "release with no failures".
+        metrics.filing_releases.labels(
+            source_id=result.filing.source_id,
+            success="true" if all_deleted else "false",
+        ).inc()
 
     async def attach_extracted_text(
         self, filing_id: UUID, text_body: str, *, lang: str = "tr"
@@ -591,17 +832,57 @@ class DocumentStore:
 
         ON CONFLICT (filing_id) DO UPDATE — latest extraction wins.
         Touches doc.filing_body.extracted_at on every call.
+
+        Each call is a fresh write of body content (extraction
+        algorithms improve over time → re-running is meaningful), so
+        last-writer-wins on the row's audit cols and a fresh
+        filing_body.create / filing_body.update audit event is emitted
+        per call. The ``after`` snapshot records body length only — not
+        the body text itself — so audit rows stay compact.
         """
-        await self._s.execute(
-            text(
-                "INSERT INTO doc.filing_body (filing_id, body_text, body_lang, extracted_at) "
-                "VALUES (:fid, :body, :lang, now()) "
-                "ON CONFLICT (filing_id) DO UPDATE "
-                "  SET body_text = EXCLUDED.body_text, "
-                "      body_lang = EXCLUDED.body_lang, "
-                "      extracted_at = now()"
+        assert_actor_or_strict_raise()
+        ac = _audit_cols()
+        result = (
+            await self._s.execute(
+                text(
+                    "INSERT INTO doc.filing_body "
+                    "  (filing_id, body_text, body_lang, extracted_at, "
+                    "   actor_id, actor_kind, client_ip, user_agent, request_id) "
+                    "VALUES (:fid, :body, :lang, now(), "
+                    "        :actor_id, :actor_kind, :client_ip, "
+                    "        :user_agent, :request_id) "
+                    "ON CONFLICT (filing_id) DO UPDATE "
+                    "  SET body_text    = EXCLUDED.body_text, "
+                    "      body_lang    = EXCLUDED.body_lang, "
+                    "      extracted_at = now(), "
+                    "      actor_id     = EXCLUDED.actor_id, "
+                    "      actor_kind   = EXCLUDED.actor_kind, "
+                    "      client_ip    = EXCLUDED.client_ip, "
+                    "      user_agent   = EXCLUDED.user_agent, "
+                    "      request_id   = EXCLUDED.request_id "
+                    "RETURNING (xmax = 0) AS created"
+                ),
+                {"fid": filing_id, "body": text_body, "lang": lang, **ac},
+            )
+        ).one()
+        created = bool(result.created)
+        op = "filing_body.create" if created else "filing_body.update"
+        await audit_record(
+            self._s,
+            record=AuditRecord(
+                operation=op,
+                target_schema="doc",
+                target_table="filing_body",
+                target_pk={"filing_id": str(filing_id)},
+                before=None,
+                after={
+                    "filing_id": str(filing_id),
+                    "body_lang": lang,
+                    "body_size_chars": len(text_body),
+                },
+                metadata={"returned_existing": False},
+                ingestion_run_id=self._run_id,
             ),
-            {"fid": filing_id, "body": text_body, "lang": lang},
         )
 
 
@@ -643,8 +924,70 @@ def _json_metadata(d: dict[str, Any] | None) -> str | None:
     return json.dumps(d)
 
 
+def _audit_cols() -> dict[str, Any]:
+    """Build actor_id/actor_kind/client_ip/user_agent/request_id bind
+    params for the current ContextVar actor (None-safe).
+
+    Same pattern as ``aslan_core.registry.client._audit_cols``: stamps
+    audit cols inside the row INSERT/UPDATE so we never need a
+    post-write second statement (codex F1).
+    """
+    a = current_actor()
+    if a is None:
+        return {
+            "actor_id": None,
+            "actor_kind": None,
+            "client_ip": None,
+            "user_agent": None,
+            "request_id": None,
+        }
+    return {
+        "actor_id": a.actor_id,
+        "actor_kind": a.actor_kind,
+        "client_ip": a.client_ip,
+        "user_agent": a.user_agent,
+        "request_id": a.request_id,
+    }
+
+
+def _filing_audit_payload(f: Filing) -> dict[str, Any]:
+    """Subset of the Filing row safe to embed in audit.events.after.
+
+    Excludes ``primary_bytes`` / large blobs by definition (Filing
+    schema only carries the size int, not the body) — keeps audit
+    rows compact and avoids duplicating filing payloads in the audit
+    log.
+    """
+    return {
+        "filing_id": str(f.filing_id),
+        "source_id": f.source_id,
+        "source_filing_ref": f.source_filing_ref,
+        "entity_id": str(f.entity_id) if f.entity_id else None,
+        "kind": f.kind,
+        "subkind": f.subkind,
+        "title": f.title,
+        "language": f.language,
+        "published_at": f.published_at.isoformat(),
+        "primary_object_key": f.primary_object_key,
+        "primary_mime": f.primary_mime,
+        "primary_sha256": f.primary_sha256,
+        "primary_size_bytes": f.primary_bytes,
+        "has_xbrl": f.has_xbrl,
+        "xbrl_object_key": f.xbrl_object_key,
+        "metadata": f.metadata or {},
+        "revision_no": f.revision_no,
+        "is_amendment": f.is_amendment,
+        "previous_filing_id": str(f.previous_filing_id) if f.previous_filing_id else None,
+    }
+
+
 def _log_orphan_cleanup_failed(bucket: str, key: str, exc: Exception) -> None:
-    """Structured-log helper for orphan cleanup failures."""
+    """Structured-log helper for orphan cleanup failures.
+
+    Also increments :data:`aslan_observability.metrics.object_storage_orphans`
+    so SREs see orphan-blob alerts in Prometheus rather than only in
+    structured logs.
+    """
     _log.warning(
         "orphan_cleanup_failed",
         bucket=bucket,
@@ -652,6 +995,7 @@ def _log_orphan_cleanup_failed(bucket: str, key: str, exc: Exception) -> None:
         error=str(exc),
         error_type=type(exc).__name__,
     )
+    metrics.object_storage_orphans.labels(bucket=bucket).inc()
 
 
 def _row_to_filing(row: Any) -> Filing:

@@ -6,6 +6,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from aslan_core.audit import Actor, set_actor
 from aslan_core.errors import EntityNotFound, IdentifierConflict
 from aslan_core.registry.client import EntityRegistryClient
 
@@ -14,6 +15,7 @@ pytestmark = pytest.mark.integration
 
 async def _wipe(session: AsyncSession) -> None:
     for stmt in [
+        "DELETE FROM audit.events",
         "DELETE FROM ref.entity_sector",
         "DELETE FROM ref.entity_relationship",
         "DELETE FROM ref.identifier",
@@ -153,3 +155,106 @@ async def test_identifier_transfer_ticker_rename(session: AsyncSession) -> None:
     assert await client.resolve("bist_ticker", "X", as_of=rename_dt) == b.entity_id
     # After the rename: NewCo.
     assert await client.resolve("bist_ticker", "X", as_of=date(2026, 4, 28)) == b.entity_id
+
+
+# ─── codex F1 regression tests for Task 7 ─────────────────────────────
+
+
+async def test_add_identifier_idempotent_hit_preserves_original_attribution(
+    session: AsyncSession,
+) -> None:
+    """Codex F1, 2026-04-29: a second actor calling add_identifier with
+    the same (namespace, value, valid_from) already pointing at the
+    target entity must NOT rewrite the row's audit columns. The retry
+    emits identifier.idempotent_hit; the row's actor_id stays frozen on
+    the first writer."""
+    await _wipe(session)
+    run = await _new_run(session)
+    set_actor(Actor(actor_id="user:first", actor_kind="user"))
+    client = EntityRegistryClient(session, ingestion_run_id=run)
+    e = await client.create_entity(
+        type="company", legal_name="X", identifiers={"kap_entity_code": "1"}
+    )
+    await session.commit()
+
+    set_actor(Actor(actor_id="user:second", actor_kind="user"))
+    await client.add_identifier(e.entity_id, "bist_ticker", "X")
+    await session.commit()
+    set_actor(Actor(actor_id="user:retrier", actor_kind="user"))
+    await client.add_identifier(e.entity_id, "bist_ticker", "X")  # idempotent retry
+    await session.commit()
+
+    # Row's denormalised audit cols reflect the FIRST writer (user:second).
+    row = (
+        await session.execute(
+            text(
+                "SELECT actor_id FROM ref.identifier "
+                "WHERE namespace = 'bist_ticker' AND value = 'X'"
+            )
+        )
+    ).one()
+    assert row.actor_id == "user:second"
+
+    bist_events = (
+        await session.execute(
+            text(
+                "SELECT operation, actor_id FROM audit.events e "
+                "WHERE e.target_table = 'identifier' "
+                "  AND (e.before->>'value' = 'X' OR e.after->>'value' = 'X') "
+                "ORDER BY occurred_at"
+            )
+        )
+    ).all()
+    assert [r.operation for r in bist_events] == [
+        "identifier.add",
+        "identifier.idempotent_hit",
+    ]
+    assert bist_events[0].actor_id == "user:second"
+    assert bist_events[1].actor_id == "user:retrier"
+
+    set_actor(None)
+
+
+async def test_update_entity_writes_audit_with_before_and_after(
+    session: AsyncSession,
+) -> None:
+    """update_entity is always a fresh write — last-writer-wins on the
+    row's audit cols and a single entity.update event with both
+    before/after snapshots."""
+    await _wipe(session)
+    run = await _new_run(session)
+    set_actor(Actor(actor_id="user:creator", actor_kind="user"))
+    client = EntityRegistryClient(session, ingestion_run_id=run)
+    e = await client.create_entity(
+        type="company", legal_name="X", identifiers={"kap_entity_code": "1"}
+    )
+    await session.commit()
+
+    set_actor(Actor(actor_id="user:updater", actor_kind="user"))
+    await client.update_entity(e.entity_id, short_name="Xco")
+    await session.commit()
+
+    # Last-writer-wins on the row's audit cols.
+    row = (
+        await session.execute(
+            text("SELECT actor_id FROM ref.entity WHERE entity_id = :eid"),
+            {"eid": e.entity_id},
+        )
+    ).one()
+    assert row.actor_id == "user:updater"
+
+    events = (
+        await session.execute(
+            text(
+                "SELECT operation, actor_id, before, after FROM audit.events "
+                "WHERE target_table = 'entity' AND operation = 'entity.update'"
+            )
+        )
+    ).all()
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.actor_id == "user:updater"
+    assert ev.before["short_name"] is None
+    assert ev.after["short_name"] == "Xco"
+
+    set_actor(None)

@@ -35,8 +35,8 @@ def _default_object_client() -> ObjectStorageClient:
     s = Settings()
     return Aioboto3ObjectStorageClient(
         endpoint_url=s.s3_endpoint,
-        access_key=s.s3_access_key,
-        secret_key=s.s3_secret_key,
+        access_key=s.s3_access_key.get_secret_value(),
+        secret_key=s.s3_secret_key.get_secret_value(),
         region=s.s3_region,
     )
 

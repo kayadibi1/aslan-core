@@ -118,3 +118,14 @@ class StreamReadError(StreamError):
 
 class StreamDeserializeError(StreamError):
     """Payload didn't match the registered Pydantic event model."""
+
+
+class AuditError(AslanCoreError):
+    """Base for audit-subsystem failures."""
+
+
+class AuditMissingActor(AuditError):
+    """Raised when a mutation runs without an actor set in the
+    ContextVar AND ``Settings.audit_strict`` is True. In non-strict mode
+    a warning is logged and the mutation proceeds with
+    ``actor_id='system:unknown'``."""

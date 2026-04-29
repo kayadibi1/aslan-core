@@ -1,6 +1,6 @@
 [project]
 name = "aslan-core"
-version = "0.2.0"
+version = "0.3.0"
 description = "Shared Python package for the Aslan Terminal data-plane services."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -17,6 +17,26 @@ dependencies = [
     "pyyaml>=6.0",
     "structlog>=24.4",
     "aioboto3>=13.0",
+]
+
+[project.optional-dependencies]
+# v0.3.0 observability extra. Consumers that want Sentry error
+# capture, OpenTelemetry tracing (with SQLAlchemy + asyncpg
+# auto-instrumentation), and Prometheus metrics scraping install
+# ``aslan-core[obs]``. The base install runs without these — the
+# observability modules use lazy imports so a missing dep raises
+# ImportError only when ``setup_sentry("dsn")`` or
+# ``setup_tracing("endpoint")`` is actually called with a non-None
+# argument; ``setup_*(None)`` is always a no-op and never imports
+# the SDK.
+obs = [
+    "sentry-sdk>=2.18",
+    "opentelemetry-api>=1.27",
+    "opentelemetry-sdk>=1.27",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.27",
+    "opentelemetry-instrumentation-sqlalchemy>=0.48b0",
+    "opentelemetry-instrumentation-asyncpg>=0.48b0",
+    "prometheus-client>=0.21",
 ]
 
 [dependency-groups]
@@ -76,6 +96,29 @@ plugins = ["pydantic.mypy"]
 [[tool.mypy.overrides]]
 module = ["asyncpg.*", "alembic.*", "testcontainers.*", "aioboto3.*", "botocore.*"]
 ignore_missing_imports = true
+
+# v0.3.0 [obs] extra — sentry-sdk, opentelemetry, prometheus_client are
+# optional install deps. The observability modules use lazy imports so
+# the base install runs without them; mypy on a base venv must not
+# fail for the missing imports inside those lazy bodies.
+[[tool.mypy.overrides]]
+module = [
+    "sentry_sdk.*",
+    "opentelemetry.*",
+    "prometheus_client.*",
+]
+ignore_missing_imports = true
+
+# opentelemetry-instrumentation-* ships untyped __init__ args
+# (capture_parameters=False without a type annotation), so calling
+# their constructors from strict-mypy code triggers no-untyped-call.
+# Relax this in the modules that touch the instrumentation API.
+[[tool.mypy.overrides]]
+module = [
+    "aslan_core.observability.tracing",
+    "tests.integration.test_observability_smoke",
+]
+disallow_untyped_calls = false
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

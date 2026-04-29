@@ -124,6 +124,56 @@ async def test_identifiers_command_lists_namespaces(
     assert ids == {"kap_entity_code": "42", "bist_ticker": "PROBE"}
 
 
+async def test_cli_create_entity_audit_row_has_cli_actor(
+    pg_dsn: str,
+    session: AsyncSession,
+) -> None:
+    """The root cli() group sets the actor from getpass.getuser() +
+    socket.gethostname() so manual operations don't need a flag.
+
+    Task 18, v0.3.0: every audit row written by the CLI subprocess
+    should carry an actor_id starting with ``cli:`` — proving the
+    callback ran and populated the ContextVar before any mutation.
+    Note: the autouse ``_default_test_actor`` fixture in this test
+    process sets ``user:pytest`` but that does NOT cross subprocess
+    boundaries, so the CLI's own actor-set is what lands on the row.
+    """
+    await _wipe(session)
+    await session.execute(text("DELETE FROM audit.events"))
+    await session.commit()
+    await _seed_manual_source(session)
+
+    proc = _run(
+        [
+            "registry",
+            "create-entity",
+            "--type",
+            "company",
+            "--name",
+            "Actor Probe A.Ş.",
+            "--identifier",
+            "kap_entity_code=77777",
+        ],
+        {"ASLAN_PG_DSN": pg_dsn},
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    rows = (
+        await session.execute(
+            text(
+                "SELECT actor_id, actor_kind FROM audit.events "
+                "WHERE target_schema = 'ref' AND target_table = 'entity' "
+                "ORDER BY occurred_at DESC LIMIT 1"
+            )
+        )
+    ).all()
+    assert len(rows) == 1, "expected one audit row from the CLI mutation"
+    assert rows[0].actor_id.startswith("cli:"), (
+        f"audit row actor_id should start with 'cli:'; got {rows[0].actor_id!r}"
+    )
+    assert rows[0].actor_kind == "user"
+
+
 async def test_search_returns_results(pg_dsn: str, session: AsyncSession) -> None:
     await _wipe(session)
     await _seed_manual_source(session)

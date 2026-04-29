@@ -4,6 +4,8 @@ from pydantic import BaseModel, ValidationError
 from aslan_core.errors import (
     AslanCoreError,
     AslanCoreValidationError,
+    AuditError,
+    AuditMissingActor,
     ConcurrencyError,
     ConfigError,
     ConstraintViolation,
@@ -56,6 +58,8 @@ from aslan_core.errors import (
         StreamPublishError,
         StreamReadError,
         StreamDeserializeError,
+        AuditError,
+        AuditMissingActor,
     ],
 )
 def test_all_errors_inherit_aslan_core_error(cls: type[Exception]) -> None:
