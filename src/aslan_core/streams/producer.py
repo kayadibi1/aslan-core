@@ -38,8 +38,10 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
+from uuid import UUID
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -191,6 +193,116 @@ class StreamProducer:
             source_id=stamped.source_id,
         ).inc()
         return outbox_id
+
+    @traced("StreamProducer.publish_many")
+    async def publish_many(
+        self,
+        events: Iterable[StreamEvent],
+        *,
+        stream: str | None = None,
+    ) -> list[int]:
+        """Bulk variant of :meth:`publish`. Returns the list of outbox row ids.
+
+        Codex spec §5 + critical-contract items 1, 4:
+
+        * **Phase 0 in-memory dedup** — walks the input list once
+          collecting ``event_id`` → seen-set; if a second event with the
+          same id appears, raises :class:`StreamEventIdConflict` BEFORE
+          any DB I/O (spy-asserted via ``session.execute`` /
+          ``session.flush`` mocks in the test).
+        * **ONE audit event per call** — emits a single
+          ``stream.publish`` audit row whose ``metadata`` carries
+          ``event_count`` (full count) + ``event_ids[]`` (truncated to
+          first 100 for forensic chunking) + ``streams[]`` (sorted unique
+          stream names, truncated to first 20).
+        * **Strict-mode actor check** — same contract as :meth:`publish`;
+          fires BEFORE any DB I/O.
+        * **Atomic batch** — the producer flushes per row (so any
+          UNIQUE conflict raises immediately) but does NOT commit; the
+          caller decides whether to commit or roll back the entire
+          batch. A cross-batch UNIQUE conflict raises
+          :class:`StreamEventIdConflict` and the caller's outer
+          transaction is responsible for the rollback.
+
+        :param events: Iterable of :class:`StreamEvent` instances.
+            Empty iterable is a no-op (returns ``[]`` and emits no
+            audit row).
+        :param stream: Optional explicit stream-name override that
+            applies to EVERY event. If absent, each event's stream is
+            resolved individually from
+            :data:`STREAM_FOR_EVENT_KIND`.
+        :returns: The list of inserted ``outbox_id``s in the order the
+            events were received.
+        :raises StreamEventIdConflict: Phase 0 detected an intra-batch
+            duplicate ``event_id`` (no DB I/O ran), OR a cross-batch
+            UNIQUE-constraint conflict during flush.
+        :raises UnknownEventKind: An event has no ``kind`` registered
+            in :data:`STREAM_FOR_EVENT_KIND` and no ``stream`` kwarg
+            was supplied.
+        :raises AuditMissingActor: ``Settings.audit_strict=True`` and
+            no actor is set in the ContextVar.
+        """
+        events_list: list[StreamEvent] = list(events)
+        if not events_list:
+            return []
+
+        # PHASE 0: intra-batch dedup BEFORE any DB I/O.
+        seen: set[UUID] = set()
+        for event in events_list:
+            if event.event_id in seen:
+                raise StreamEventIdConflict(
+                    event_id=event.event_id,
+                    stream_name=stream or "<resolve-per-event>",
+                )
+            seen.add(event.event_id)
+
+        # Strict-mode actor check (also BEFORE any DB I/O).
+        assert_actor_or_strict_raise(settings=self._settings)
+        actor = current_actor()
+
+        # Resolve + stamp per-event (still pre-DB).
+        resolved_streams = [self._resolve_stream(e, stream) for e in events_list]
+        stamped_events = [self._stamp(e, actor=actor) for e in events_list]
+
+        # Per-row INSERT + per-row metric increment. The audit row is
+        # emitted ONCE after all rows land (codex critical-contract
+        # item 4 + spec §8 — bulk audits carry batch-level metadata
+        # only, never per-row).
+        outbox_ids: list[int] = []
+        for s, ev in zip(resolved_streams, stamped_events, strict=True):
+            outbox_id = await self._insert_outbox(ev, s)
+            outbox_ids.append(outbox_id)
+            prom_stream = _normalize_metric_label(
+                normalize_bist_ticks_label(s),
+                _KNOWN_STREAMS,
+            )
+            aslan_stream_publishes_total.labels(
+                stream=prom_stream,
+                source_id=ev.source_id,
+            ).inc()
+
+        # ONE audit event per call. Truncate event_ids to the first 100
+        # for forensic chunking; the full count lives in event_count.
+        event_ids_truncated = [str(e.event_id) for e in stamped_events[:100]]
+        unique_streams_truncated = sorted(set(resolved_streams))[:20]
+        await audit_record(
+            self.session,
+            record=AuditRecord(
+                operation="stream.publish",
+                target_schema="streams",
+                target_table="outbox",
+                target_pk={"batch_first_outbox_id": outbox_ids[0]},
+                before=None,
+                after=None,
+                metadata={
+                    "event_count": len(stamped_events),
+                    "event_ids": event_ids_truncated,
+                    "streams": unique_streams_truncated,
+                },
+                ingestion_run_id=self.ingestion_run_id,
+            ),
+        )
+        return outbox_ids
 
     # ── internals ─────────────────────────────────────────────────────
 
