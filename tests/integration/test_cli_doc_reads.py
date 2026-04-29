@@ -202,3 +202,103 @@ async def test_doc_chain_returns_list_of_revisions(
     assert len(payload) == 1
     assert payload[0]["filing_id"] == filing_id
     assert payload[0]["revision_no"] == 1
+
+
+# ─── Task 28: list / stats ────────────────────────────────────────────────
+
+
+async def _seed_two_filings(session: AsyncSession, fake: InMemoryFake) -> tuple[str, str]:
+    """Seed two distinct filings: one kap/news, one kap/material_event."""
+    a = await _seed_one_filing(
+        session,
+        fake,
+        source_ref="LIST-A",
+        body=b"alpha-bytes",
+        kind="news",
+        title="Alpha title",
+    )
+    b = await _seed_one_filing(
+        session,
+        fake,
+        source_ref="LIST-B",
+        body=b"bravo-bytes",
+        kind="material_event",
+        title="Bravo title",
+    )
+    return a, b
+
+
+async def test_doc_list_returns_all_rows(
+    session: AsyncSession,
+    object_storage_fake: InMemoryFake,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aslan_core.cli.main import cli
+
+    await _seed_kap_source(session)
+    a, b = await _seed_two_filings(session, object_storage_fake)
+    _patch_factory(monkeypatch, object_storage_fake)
+
+    result = await _invoke(cli, ["doc", "list", "--json"])
+    assert result.exit_code == 0, f"output={result.output}\nexc={result.exception!r}"
+    payload = json.loads(result.output)
+    assert isinstance(payload, list)
+    ids = {row["filing_id"] for row in payload}
+    assert {a, b} <= ids
+
+
+async def test_doc_list_filters_by_kind(
+    session: AsyncSession,
+    object_storage_fake: InMemoryFake,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aslan_core.cli.main import cli
+
+    await _seed_kap_source(session)
+    a, b = await _seed_two_filings(session, object_storage_fake)
+    _patch_factory(monkeypatch, object_storage_fake)
+
+    result = await _invoke(cli, ["doc", "list", "--kind", "news", "--json"])
+    assert result.exit_code == 0, f"output={result.output}\nexc={result.exception!r}"
+    payload = json.loads(result.output)
+    ids = {row["filing_id"] for row in payload}
+    assert a in ids
+    assert b not in ids
+
+
+async def test_doc_list_respects_limit(
+    session: AsyncSession,
+    object_storage_fake: InMemoryFake,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aslan_core.cli.main import cli
+
+    await _seed_kap_source(session)
+    await _seed_two_filings(session, object_storage_fake)
+    _patch_factory(monkeypatch, object_storage_fake)
+
+    result = await _invoke(cli, ["doc", "list", "--limit", "1", "--json"])
+    assert result.exit_code == 0, f"output={result.output}\nexc={result.exception!r}"
+    payload = json.loads(result.output)
+    assert len(payload) == 1
+
+
+async def test_doc_stats_groups_by_source_and_kind(
+    session: AsyncSession,
+    object_storage_fake: InMemoryFake,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aslan_core.cli.main import cli
+
+    await _seed_kap_source(session)
+    await _seed_two_filings(session, object_storage_fake)
+    _patch_factory(monkeypatch, object_storage_fake)
+
+    result = await _invoke(cli, ["doc", "stats", "--json"])
+    assert result.exit_code == 0, f"output={result.output}\nexc={result.exception!r}"
+    payload = json.loads(result.output)
+    assert isinstance(payload, list)
+    # Two rows: kap/news=1 + kap/material_event=1
+    by_kind = {row["kind"]: row for row in payload if row["source_id"] == "kap"}
+    assert by_kind["news"]["count"] == 1
+    assert by_kind["material_event"]["count"] == 1
