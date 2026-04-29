@@ -168,22 +168,42 @@ class DocumentStore:
                 "set has_xbrl=True or omit the xbrl arguments"
             )
 
-        # Codex 2026-04-29: object keys are disambiguated by
+        # Codex 2026-04-29 (F3): object keys are disambiguated by
         # `attachments/{sequence:03d}/{filename}`, so two attachments
         # collide only when they share BOTH sequence AND filename. Reject
         # at the API boundary — silent overwrite would otherwise leave
         # one DB row's bytes stored under another row's key.
+        #
+        # Codex 2026-04-29 (F5): also reject duplicate-content
+        # attachments (same sha256). The DB UNIQUE on (filing_id,
+        # sha256) makes the second INSERT a DO NOTHING, but the
+        # attachment was already uploaded under its disambiguated key,
+        # leaving an orphan blob with no DB pointer. Cleanup paths
+        # that reconstruct keys from doc.filing_attachment cannot find
+        # it after a normal commit. Caller should dedup the list.
         if attachments:
-            seen: set[tuple[int, str]] = set()
+            seen_pairs: set[tuple[int, str]] = set()
+            seen_hashes: set[str] = set()
             for att in attachments:
                 pair = (att.sequence, att.filename)
-                if pair in seen:
+                if pair in seen_pairs:
                     raise ValueError(
                         "duplicate attachment sequence+filename: "
                         f"sequence={att.sequence}, filename={att.filename!r}. "
                         "Each attachment must have a unique (sequence, filename)."
                     )
-                seen.add(pair)
+                seen_pairs.add(pair)
+                att_hash = hashlib.sha256(att.bytes).hexdigest()
+                if att_hash in seen_hashes:
+                    raise ValueError(
+                        "duplicate attachment content (same sha256) within "
+                        f"one filing: filename={att.filename!r}, "
+                        f"sequence={att.sequence}. Two attachments with "
+                        "identical bytes leave one upload orphaned by the "
+                        "DB UNIQUE (filing_id, sha256) constraint. Dedup "
+                        "the attachment list before passing."
+                    )
+                seen_hashes.add(att_hash)
 
         bucket = self._bucket_for.get(source_id, "aslan-filings")
         sha256 = hashlib.sha256(primary_bytes).hexdigest()

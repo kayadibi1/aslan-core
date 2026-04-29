@@ -1196,3 +1196,69 @@ async def test_put_filing_rejects_duplicate_attachment_sequence_filename(
         text("SELECT COUNT(*) FROM doc.filing WHERE source_filing_ref = 'DUP-REJECT'")
     )
     assert n == 0
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_put_filing_rejects_duplicate_attachment_content_hash(
+    session: AsyncSession,
+    object_storage_fake: object,
+) -> None:
+    """Codex 2026-04-29 (F5): two attachments with identical bytes but
+    different (sequence, filename) get distinct disambiguated keys, so
+    BOTH blobs upload — but the DB UNIQUE (filing_id, sha256) means the
+    second INSERT is a no-op. The second blob is left orphaned with no
+    DB pointer; CLI release reconstructs from doc.filing_attachment so
+    the orphan is unreachable.
+
+    Reject duplicate-content attachments at the API boundary BEFORE
+    any I/O, mirroring F3's reject for duplicate (sequence, filename).
+    """
+    from aslan_core.documents.client import DocumentStore
+    from aslan_core.schemas.filing import AttachmentIn
+
+    run_id = await _seed(session)
+    store = DocumentStore(
+        session,
+        object_client=object_storage_fake,  # type: ignore[arg-type]
+        ingestion_run_id=run_id,
+    )
+
+    same_bytes = b"identical attachment payload"
+    bad = [
+        AttachmentIn(
+            bytes=same_bytes,
+            mime="application/pdf",
+            filename="exhibit_a.pdf",
+            role="exhibit",
+            sequence=1,
+        ),
+        AttachmentIn(
+            bytes=same_bytes,  # SAME bytes
+            mime="application/pdf",
+            filename="exhibit_b.pdf",  # different filename
+            role="exhibit",
+            sequence=2,  # different sequence
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="duplicate attachment content"):
+        await store.put_filing(
+            source_id="kap",
+            source_filing_ref="DUP-HASH",
+            entity_id=None,
+            kind="news",
+            title="t",
+            published_at=datetime(2026, 4, 28, tzinfo=UTC),
+            primary_bytes=b"<html>main</html>",
+            primary_mime="text/html",
+            primary_filename="main.html",
+            attachments=bad,
+        )
+
+    # No I/O: bucket empty, no row inserted.
+    assert object_storage_fake.all_keys() == set()  # type: ignore[attr-defined]
+    await session.rollback()
+    n = await session.scalar(
+        text("SELECT COUNT(*) FROM doc.filing WHERE source_filing_ref = 'DUP-HASH'")
+    )
+    assert n == 0
