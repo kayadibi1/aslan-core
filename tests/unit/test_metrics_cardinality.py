@@ -218,6 +218,68 @@ def test_known_audit_operations_contains_v04_timeseries_ops() -> None:
     )
 
 
+def test_known_audit_operations_set_pinned_exactly() -> None:
+    """Codex 2026-04-29: prevent silent cardinality drift. The
+    allow-list IS the cardinality boundary — every entry becomes a
+    real Prometheus label value, not a wildcard. Any addition must be
+    accompanied by an update here so the change is visible in code
+    review.
+
+    To add a new operation: add it to `_KNOWN_AUDIT_OPERATIONS` AND
+    to the expected set below. The test catches both directions:
+    additions to the allow-list without updating expected, and
+    additions to expected without updating the allow-list.
+    """
+    from aslan_core.observability.metrics import _KNOWN_AUDIT_OPERATIONS
+
+    expected_full = {
+        # v0.1-v0.3 baseline (registry, identifier, sector, relationship,
+        # entity, filing, filing_body, watermark, ingestion_run)
+        "entity.create",
+        "entity.idempotent_hit",
+        "entity.update",
+        "identifier.add",
+        "identifier.idempotent_hit",
+        "identifier.expire",
+        "entity_sector.upsert",
+        "entity_sector.idempotent_hit",
+        "entity_relationship.link",
+        "entity_relationship.idempotent_hit",
+        "sector.upsert",
+        "sector.idempotent_hit",
+        "filing.put",
+        "filing.dedup_hit",
+        "filing.idempotent_hit",
+        "filing.republished_alias_added",
+        "filing_body.create",
+        "filing_body.update",
+        "filing.release",
+        "watermark.set",
+        "watermark.idempotent_hit",
+        "watermark.advance",
+        "watermark.force_set",
+        "ingestion_run.start",
+        "ingestion_run.complete",
+        "ingestion_run.set_metadata",
+        "ingestion_run.increment_rows",
+        # v0.4 timeseries (writer + deletion runtime / PII tripwires)
+        "series.upsert",
+        "series.idempotent_hit",
+        "series.update",
+        "observation.write_batch",
+        "series.subject_erased",
+        "series.metadata_pii_scrubbed",
+        "series.metadata_bypass_detected",
+        "observation.metadata_pii_scrubbed",
+        "observation.metadata_bypass_detected",
+    }
+    assert expected_full == _KNOWN_AUDIT_OPERATIONS, (
+        f"allow-list drift detected. "
+        f"unexpected additions: {sorted(_KNOWN_AUDIT_OPERATIONS - expected_full)} | "
+        f"missing entries: {sorted(expected_full - _KNOWN_AUDIT_OPERATIONS)}"
+    )
+
+
 def test_known_frequencies_matches_spec_literal() -> None:
     """v0.4.0 Task 25: ``_KNOWN_FREQUENCIES`` MUST contain exactly the
     13 strings that the ``Frequency`` Pydantic literal accepts. Bounds
