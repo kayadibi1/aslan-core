@@ -15,3 +15,4 @@ class Base(DeclarativeBase):
 
 
 from aslan_core.models import doc as _doc  # noqa: F401, E402  (registers tables on Base.metadata)
+from aslan_core.models import ts as _ts  # noqa: F401, E402  (registers tables on Base.metadata)
