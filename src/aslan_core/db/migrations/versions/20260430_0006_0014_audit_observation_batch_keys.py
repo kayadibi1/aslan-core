@@ -15,9 +15,13 @@ Lifecycle is enforced by:
   - same-transaction atomicity inside ``ObservationWriter.write`` —
     the audit.events row and its matching observation_batch_keys
     rows commit together or roll back together
-  - join key ``(event_id, occurred_at)`` rather than a Postgres FK
-    (FKs on Timescale composite-PK hypertables are awkward and the
-    chunk-interval + same-tx atomicity already enforce the contract)
+  - constraint trigger ``batch_keys_parent_check`` (codex Batch 1 F2)
+    rejects orphan rows and rows whose ``occurred_at`` doesn't match
+    the parent event's; cascade trigger ``events_cascade_keys`` deletes
+    matching keys when a parent event is deleted. Native composite-PK
+    FKs to a Timescale hypertable were attempted first and rejected
+    by Timescale ("hypertables cannot be used as foreign key references
+    of hypertables"), so the trigger pair is the documented fallback.
 
 CHECK constraints:
 
@@ -62,6 +66,56 @@ def upgrade() -> None:
     )
     op.execute("CREATE INDEX obkeys_event ON audit.observation_batch_keys(event_id)")
 
+    # codex Batch 1 F2 — Timescale rejects native FKs across hypertables
+    # ("hypertables cannot be used as foreign key references of
+    # hypertables"), so we enforce parent-row presence with a constraint
+    # trigger and cascade-on-delete with a regular trigger on
+    # audit.events. Both stay inside the same transaction as the writer's
+    # INSERTs so a missing parent or mismatched occurred_at rolls back
+    # the whole batch.
+    op.execute("""
+        CREATE OR REPLACE FUNCTION audit.observation_batch_keys_check_parent()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM audit.events
+                WHERE event_id = NEW.event_id AND occurred_at = NEW.occurred_at
+            ) THEN
+                RAISE EXCEPTION
+                    'audit.observation_batch_keys row references missing audit.events '
+                    '(event_id=%, occurred_at=%)',
+                    NEW.event_id, NEW.occurred_at
+                    USING ERRCODE = 'foreign_key_violation';
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+    """)
+    op.execute("""
+        CREATE CONSTRAINT TRIGGER batch_keys_parent_check
+        AFTER INSERT OR UPDATE ON audit.observation_batch_keys
+        DEFERRABLE INITIALLY DEFERRED
+        FOR EACH ROW EXECUTE FUNCTION audit.observation_batch_keys_check_parent();
+    """)
+    op.execute("""
+        CREATE OR REPLACE FUNCTION audit.events_cascade_to_batch_keys()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            DELETE FROM audit.observation_batch_keys
+            WHERE event_id = OLD.event_id AND occurred_at = OLD.occurred_at;
+            RETURN OLD;
+        END;
+        $$ LANGUAGE plpgsql;
+    """)
+    op.execute("""
+        CREATE TRIGGER events_cascade_keys
+        AFTER DELETE ON audit.events
+        FOR EACH ROW EXECUTE FUNCTION audit.events_cascade_to_batch_keys();
+    """)
+
 
 def downgrade() -> None:
+    op.execute("DROP TRIGGER IF EXISTS events_cascade_keys ON audit.events")
+    op.execute("DROP FUNCTION IF EXISTS audit.events_cascade_to_batch_keys()")
     op.execute("DROP TABLE IF EXISTS audit.observation_batch_keys")
+    op.execute("DROP FUNCTION IF EXISTS audit.observation_batch_keys_check_parent()")
