@@ -33,6 +33,7 @@ from aslan_core.errors import (
     IdentifyingSeriesPiiInClearText,
     MetadataSchemaViolation,
     ObservationConflict,
+    ObservationValidationError,
     SeriesCodeConflict,
 )
 from aslan_core.observability import metrics
@@ -731,17 +732,44 @@ class ObservationWriter:
         obs_list = list(observations)
         attempted = len(obs_list)
 
-        # Phase 0 — in-memory dedup + pre-flight validation BEFORE
+        # Phase 0a — re-validate at write boundary (codex Batch 3 F3,
+        # 2026-04-29). ``ObservationIn`` Pydantic validators enforce
+        # tz-aware ts/as_of and value/value_text exactly-one at
+        # construction, but ``model_construct`` (and equivalent
+        # non-validating bypasses) skip those validators. ``write()``
+        # is the authoritative validation boundary — re-check every
+        # row regardless of how the ObservationIn was built so a
+        # future caller can't sneak invalid rows into the DB by
+        # bypassing Pydantic.
+        #
+        # Runs BEFORE Phase 0b (dedup + numeric-string-key check) so
+        # the F14 zero-DB-I/O contract still holds: any structural
+        # invalidity raises before advisory-lock acquisition or
+        # source_id lookup.
+        for i, o in enumerate(obs_list):
+            if o.ts.utcoffset() is None:
+                raise ObservationValidationError(
+                    f"observations[{i}].ts is naive (no timezone); UTC tz required"
+                )
+            if o.as_of.utcoffset() is None:
+                raise ObservationValidationError(
+                    f"observations[{i}].as_of is naive (no timezone); UTC tz required"
+                )
+            if (o.value is None) == (o.value_text is None):
+                raise ObservationValidationError(
+                    f"observations[{i}] must have exactly one of value or "
+                    f"value_text (got value={o.value!r}, value_text={o.value_text!r})"
+                )
+
+        # Phase 0b — in-memory dedup + pre-flight validation BEFORE
         # any DB I/O (codex F5 + F14 + F25, 2026-04-29).
         #
-        # tz-aware enforcement and value/value_text exactly-one are
-        # already enforced at ObservationIn construction by the
-        # Pydantic validators. The numeric-string-key check on
-        # observation metadata runs HERE because metadata is a
-        # free-form dict that bypasses Pydantic value-level validation.
-        # The forbidden-key contract (codex F24) applies uniformly to
-        # BOTH ts.series_catalog.metadata AND ts.observation.metadata —
-        # the Art. 17 deletion runtime walks both.
+        # The numeric-string-key check on observation metadata runs
+        # HERE because metadata is a free-form dict that bypasses
+        # Pydantic value-level validation. The forbidden-key contract
+        # (codex F24) applies uniformly to BOTH
+        # ts.series_catalog.metadata AND ts.observation.metadata — the
+        # Art. 17 deletion runtime walks both.
         seen: dict[tuple[int, datetime, datetime], str] = {}
         deduped: list[ObservationIn] = []
         for o in obs_list:
