@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from datetime import UTC, datetime
 from typing import Any
@@ -1260,5 +1261,207 @@ async def test_put_filing_rejects_duplicate_attachment_content_hash(
     await session.rollback()
     n = await session.scalar(
         text("SELECT COUNT(*) FROM doc.filing WHERE source_filing_ref = 'DUP-HASH'")
+    )
+    assert n == 0
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_find_by_source_ref_resolves_republished_aliases(
+    session: AsyncSession,
+    object_storage_fake: object,
+) -> None:
+    """Codex 2026-04-29 (F6): after a §5.4 case B dedup hit (identical
+    bytes under a NEW source_filing_ref), the new ref lives only in
+    metadata.republished_as. find_by_source_ref must resolve aliases
+    so the documented lookup path returns the canonical row.
+
+    Direct-ref matches outrank alias matches: if a separate filing
+    happens to use the alias as its own canonical source_filing_ref,
+    that direct match wins.
+    """
+    from aslan_core.documents.client import DocumentStore
+
+    run_id = await _seed(session)
+    store = DocumentStore(
+        session,
+        object_client=object_storage_fake,  # type: ignore[arg-type]
+        ingestion_run_id=run_id,
+    )
+
+    body = b"<html>shared bytes for ALIAS test</html>"
+
+    # Put under canonical ref A.
+    r_a = await store.put_filing(
+        source_id="kap",
+        source_filing_ref="ALIAS-A",
+        entity_id=None,
+        kind="news",
+        title="t",
+        published_at=datetime(2026, 4, 28, tzinfo=UTC),
+        primary_bytes=body,
+        primary_mime="text/html",
+        primary_filename="main.html",
+    )
+    await session.commit()
+    assert r_a.created is True
+    canonical_id = r_a.filing.filing_id
+
+    # Republish under ref B (case B): new ref appended into
+    # metadata.republished_as on the canonical row.
+    r_b = await store.put_filing(
+        source_id="kap",
+        source_filing_ref="ALIAS-B",
+        entity_id=None,
+        kind="news",
+        title="t",
+        published_at=datetime(2026, 4, 28, tzinfo=UTC),
+        primary_bytes=body,
+        primary_mime="text/html",
+        primary_filename="main.html",
+    )
+    await session.commit()
+    assert r_b.created is False
+    assert r_b.filing.filing_id == canonical_id
+
+    # find_by_source_ref(B) must resolve the alias to the canonical row.
+    via_alias = await store.find_by_source_ref(source_id="kap", source_filing_ref="ALIAS-B")
+    assert via_alias is not None
+    assert via_alias.filing_id == canonical_id
+    assert via_alias.source_filing_ref == "ALIAS-A"
+
+    # The canonical lookup still works and returns the same row.
+    via_canonical = await store.find_by_source_ref(source_id="kap", source_filing_ref="ALIAS-A")
+    assert via_canonical is not None
+    assert via_canonical.filing_id == canonical_id
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_find_by_source_ref_prefers_direct_match_over_alias(
+    session: AsyncSession,
+    object_storage_fake: object,
+) -> None:
+    """If ref X is a republished alias on filing-A AND a separate filing-C
+    legitimately has source_filing_ref=X (different bytes), the direct
+    match wins. This guards against accidental shadowing where an alias
+    leaks into a real ref namespace.
+    """
+    from aslan_core.documents.client import DocumentStore
+
+    run_id = await _seed(session)
+    store = DocumentStore(
+        session,
+        object_client=object_storage_fake,  # type: ignore[arg-type]
+        ingestion_run_id=run_id,
+    )
+
+    # filing-A: canonical ref A, republished as X.
+    body_a = b"<html>filing A canonical</html>"
+    r_a = await store.put_filing(
+        source_id="kap",
+        source_filing_ref="A-CANON",
+        entity_id=None,
+        kind="news",
+        title="t",
+        published_at=datetime(2026, 4, 28, tzinfo=UTC),
+        primary_bytes=body_a,
+        primary_mime="text/html",
+        primary_filename="main.html",
+    )
+    await store.put_filing(
+        source_id="kap",
+        source_filing_ref="X-ALIAS",
+        entity_id=None,
+        kind="news",
+        title="t",
+        published_at=datetime(2026, 4, 28, tzinfo=UTC),
+        primary_bytes=body_a,  # same bytes → case B → X-ALIAS goes into republished_as
+        primary_mime="text/html",
+        primary_filename="main.html",
+    )
+    await session.commit()
+
+    # filing-C: separate filing with source_filing_ref="X-ALIAS" (different bytes).
+    r_c = await store.put_filing(
+        source_id="kap",
+        source_filing_ref="X-ALIAS",  # collides with the alias above
+        entity_id=None,
+        kind="news",
+        title="t",
+        published_at=datetime(2026, 4, 28, tzinfo=UTC),
+        primary_bytes=b"<html>filing C -- different bytes</html>",
+        primary_mime="text/html",
+        primary_filename="main.html",
+    )
+    await session.commit()
+    assert r_c.created is True
+    assert r_c.filing.filing_id != r_a.filing.filing_id
+
+    # find_by_source_ref(X-ALIAS) → the DIRECT match (filing-C) wins.
+    found = await store.find_by_source_ref(source_id="kap", source_filing_ref="X-ALIAS")
+    assert found is not None
+    assert found.filing_id == r_c.filing.filing_id
+    assert found.source_filing_ref == "X-ALIAS"
+
+
+class _FakeRaisesCancelOnDelete(InMemoryFake):
+    """Test helper: raise asyncio.CancelledError on the first put_object
+    so put_filing's outer except handler is forced to deal with it.
+    Without F7's BaseException catch, the handler would skip cleanup.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancel_on_substring: str | None = None
+
+    async def put_object(self, *, bucket: str, key: str, body: bytes, content_type: str) -> None:
+        # Always store first so the manifest tracking is exercised.
+        await super().put_object(bucket=bucket, key=key, body=body, content_type=content_type)
+        # Then optionally simulate a cancellation while the request was
+        # waiting (e.g., worker shutdown signal arrived after the upload
+        # ack). put_filing should treat this exactly like any other
+        # post-upload failure: clean up tracked keys, re-raise.
+        if self.cancel_on_substring and self.cancel_on_substring in key:
+            raise asyncio.CancelledError("simulated cancellation post-upload")
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_put_filing_cleans_up_blobs_on_cancellation(
+    session: AsyncSession,
+) -> None:
+    """Codex 2026-04-29 (F7): asyncio.CancelledError (BaseException
+    subclass in 3.11+) must trigger the same outer cleanup path as any
+    Exception. Otherwise a worker shutdown / request timeout that
+    cancels a put_filing in-flight would leave orphaned blobs in the
+    bucket with no manifest returned to the caller.
+
+    Verifies: simulated cancellation after primary upload re-raises
+    CancelledError unchanged AND deletes the orphaned blob.
+    """
+    from aslan_core.documents.client import DocumentStore
+
+    fake = _FakeRaisesCancelOnDelete()
+    fake.cancel_on_substring = "primary"
+    run_id = await _seed(session)
+    store = DocumentStore(session, object_client=fake, ingestion_run_id=run_id)
+
+    with pytest.raises(asyncio.CancelledError):
+        await store.put_filing(
+            source_id="kap",
+            source_filing_ref="CANCEL-ME",
+            entity_id=None,
+            kind="news",
+            title="t",
+            published_at=datetime(2026, 4, 28, tzinfo=UTC),
+            primary_bytes=b"<html>cancelled</html>",
+            primary_mime="text/html",
+            primary_filename="main.html",
+        )
+
+    # Cleanup ran: bucket is empty.
+    assert fake.all_keys() == set()
+    # No row was inserted (transaction rolled back implicitly).
+    await session.rollback()
+    n = await session.scalar(
+        text("SELECT COUNT(*) FROM doc.filing WHERE source_filing_ref = 'CANCEL-ME'")
     )
     assert n == 0

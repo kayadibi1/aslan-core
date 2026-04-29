@@ -70,7 +70,51 @@ class DocumentStore:
 
     async def find_by_source_ref(self, *, source_id: str, source_filing_ref: str) -> Filing | None:
         """Return the latest revision (highest revision_no) for the given
-        (source_id, source_filing_ref). None if no revision exists."""
+        (source_id, source_filing_ref) — including filings where the ref
+        appears as an alias in ``metadata.republished_as``.
+
+        Codex 2026-04-29 (F6): when put_filing hits primary-hash dedup
+        with a new source_filing_ref (spec §5.4 case B), the new ref is
+        merged into the original row's ``metadata.republished_as`` array
+        rather than creating a new row. Without alias resolution, a
+        caller looking up by the new ref would get None — the filing
+        becomes invisible via the documented lookup path. Resolve
+        aliases here so source_ref idempotency holds end-to-end.
+
+        Direct-ref matches outrank alias matches in the ORDER BY, so a
+        ref that is BOTH a canonical source_filing_ref on one row AND
+        an alias on another still resolves to the canonical row.
+        """
+        row = (
+            await self._s.execute(
+                text(
+                    "SELECT filing_id, source_id, source_filing_ref, entity_id, "
+                    "       kind, subkind, title, language, published_at, "
+                    "       period_start, period_end, source_url, is_amendment, "
+                    "       previous_filing_id, primary_object_key, primary_mime, "
+                    "       primary_sha256, primary_bytes, has_xbrl, xbrl_object_key, "
+                    "       metadata, discovered_at, revision_no "
+                    "FROM doc.filing "
+                    "WHERE source_id = :sid AND ("
+                    "       source_filing_ref = :ref "
+                    "    OR metadata->'republished_as' @> to_jsonb(CAST(:ref AS TEXT))"
+                    ") "
+                    "ORDER BY (source_filing_ref = :ref) DESC, revision_no DESC LIMIT 1"
+                ),
+                {"sid": source_id, "ref": source_filing_ref},
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+        return _row_to_filing(row)
+
+    async def _find_canonical_by_ref(
+        self, *, source_id: str, source_filing_ref: str
+    ) -> Filing | None:
+        """Internal helper: latest revision with EXACT ``source_filing_ref``,
+        ignoring republished aliases. Used by put_filing for the §5.4 case
+        C auto-link — a republished alias should not chain a new revision
+        across content boundaries."""
         row = (
             await self._s.execute(
                 text(
@@ -219,22 +263,27 @@ class DocumentStore:
 
         _uploaded_keys: list[str] = []
 
-        # Step 2: primary upload (failure here = no DB write attempted,
-        # no cleanup needed; raise ObjectStoreError directly).
+        # Steps 2-6 wrapped in ONE try block. Codex 2026-04-29 (F7):
+        # the primary upload now lives INSIDE this try too, and the
+        # key is appended to `_uploaded_keys` BEFORE the upload —
+        # otherwise a cancellation that arrives between put_object's
+        # bytes-stored ack and `.append()` (worker shutdown,
+        # asyncio.CancelledError, etc.) would orphan the blob with
+        # no manifest entry. delete_object is S3-idempotent so a key
+        # tracked-but-not-uploaded is a harmless no-op delete on
+        # cleanup.
         try:
-            await self._oc.put_object(
-                bucket=bucket,
-                key=primary_key,
-                body=primary_bytes,
-                content_type=primary_mime,
-            )
-        except Exception as e:
-            raise ObjectStoreError(f"put_object failed: {e}") from e
-        _uploaded_keys.append(primary_key)
-
-        # Steps 3-6 wrapped in ONE try block: any failure deletes EVERY
-        # uploaded key before re-raising.
-        try:
+            # Step 2: primary upload.
+            _uploaded_keys.append(primary_key)
+            try:
+                await self._oc.put_object(
+                    bucket=bucket,
+                    key=primary_key,
+                    body=primary_bytes,
+                    content_type=primary_mime,
+                )
+            except Exception as e:
+                raise ObjectStoreError(f"put_object failed: {e}") from e
             # Step 3: advisory lock — serializes amendment writers per
             # source_ref.
             await self._s.execute(
@@ -248,7 +297,13 @@ class DocumentStore:
             # an explicit non-default value is honored unchanged. If the new
             # bytes match a prior row's hash, ON CONFLICT (source_id,
             # primary_sha256) fires and these values are discarded.
-            prior = await self.find_by_source_ref(
+            #
+            # Use the canonical (direct-only) lookup, NOT the alias-resolving
+            # public find_by_source_ref. A republished alias is content-
+            # equivalent to its canonical row; new bytes under the alias
+            # describe a different document and must not chain to the
+            # canonical row's content history.
+            prior = await self._find_canonical_by_ref(
                 source_id=source_id, source_filing_ref=source_filing_ref
             )
             if prior is not None and prior.primary_sha256 != sha256:
@@ -270,13 +325,14 @@ class DocumentStore:
                     role="xbrl",
                     filename=xbrl_filename,
                 )
+                # Track BEFORE upload (codex F7 cancellation-resilience).
+                _uploaded_keys.append(xbrl_key)
                 await self._oc.put_object(
                     bucket=bucket,
                     key=xbrl_key,
                     body=xbrl_bytes,
                     content_type="application/xml",
                 )
-                _uploaded_keys.append(xbrl_key)
 
             # Step 4: atomic upsert with revision_no advancement.
             result_row = (
@@ -413,16 +469,25 @@ class DocumentStore:
                 object_keys=list(_uploaded_keys),
             )
 
-        except Exception as e:
-            # Any failure in steps 3-6: delete every uploaded key.
+        except BaseException as e:
+            # Codex 2026-04-29 (F7): catch BaseException, not Exception,
+            # so asyncio.CancelledError (3.11+ inherits BaseException),
+            # KeyboardInterrupt, and SystemExit also trigger blob cleanup.
+            # Worker shutdowns and request timeouts cancel pending tasks;
+            # without this, every cancelled put_filing past the primary
+            # upload leaves orphaned blobs with no manifest returned.
             for k in _uploaded_keys:
                 try:
                     await self._oc.delete_object(bucket=bucket, key=k)
                 except Exception as cleanup_err:
                     _log_orphan_cleanup_failed(bucket, k, cleanup_err)
-            # I5: Re-raise typed per spec §5.5. ObjectStoreError (e.g. from
-            # the inner XBRL upload) passes through as a storage error; any
-            # other exception is wrapped as DocumentDBError ("DB phase fail").
+            # I5 + F7: re-raise typed per spec §5.5. CancelledError /
+            # KeyboardInterrupt / SystemExit propagate unchanged — they
+            # are control-flow signals, not "DB phase fail" conditions.
+            # ObjectStoreError passes through as a storage error.
+            # Anything else (Exception subclass) wraps as DocumentDBError.
+            if isinstance(e, BaseException) and not isinstance(e, Exception):
+                raise
             if isinstance(e, ObjectStoreError):
                 raise
             raise DocumentDBError(f"DocumentStore.put_filing failed during DB phase: {e}") from e
@@ -459,16 +524,17 @@ class DocumentStore:
                 role=f"attachments/{att.sequence:03d}",
                 filename=att.filename,
             )
-            # Upload first; track in manifest BEFORE the INSERT so the outer
-            # cleanup knows about every uploaded blob even if the subsequent
-            # INSERT raises.
+            # Track in manifest BEFORE upload (codex F7 cancellation-
+            # resilience) AND before the INSERT so the outer cleanup
+            # knows about every uploaded blob even if put_object cancels
+            # mid-flight or the subsequent INSERT raises.
+            _uploaded_keys.append(att_key)
             await self._oc.put_object(
                 bucket=bucket,
                 key=att_key,
                 body=att.bytes,
                 content_type=att.mime,
             )
-            _uploaded_keys.append(att_key)
 
             await self._s.execute(
                 text(
