@@ -11,7 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aslan_core.documents.object_storage import ObjectStorageClient
-from aslan_core.errors import DocumentNotFound, ObjectStoreError
+from aslan_core.errors import DocumentDBError, DocumentNotFound, ObjectStoreError
 from aslan_core.schemas.filing import AttachmentIn, Filing, PutFilingResult
 
 _log = structlog.get_logger(__name__)
@@ -157,6 +157,17 @@ class DocumentStore:
         rollback. ``release()`` MUST NOT depend on ``doc.filing_attachment``
         rows, which may be invisible/gone post-rollback.
         """
+        # I3: validate xbrl argument consistency before any I/O.
+        if has_xbrl and (xbrl_bytes is None or xbrl_filename is None):
+            raise ValueError(
+                "has_xbrl=True requires both xbrl_bytes and xbrl_filename to be provided"
+            )
+        if (xbrl_bytes is not None or xbrl_filename is not None) and not has_xbrl:
+            raise ValueError(
+                "xbrl_bytes/xbrl_filename provided but has_xbrl=False — "
+                "set has_xbrl=True or omit the xbrl arguments"
+            )
+
         bucket = self._bucket_for.get(source_id, "aslan-filings")
         sha256 = hashlib.sha256(primary_bytes).hexdigest()
         filing_id = uuid4()
@@ -270,7 +281,9 @@ class DocumentStore:
             actual_filing_id: UUID = result_row.filing_id
             revision_no: int = result_row.revision_no
             created: bool = bool(result_row.created)
-            is_revision: bool = not created and revision_no > 1
+            # I4: is_revision=True only when a NEW row was inserted (created)
+            # AND it's not the first revision. Dedup hits → False regardless.
+            is_revision: bool = created and revision_no > 1
 
             # Step 5: hash-dedup hit — delete just-uploaded primary AND
             # xbrl blobs (they're duplicates of the existing row's).
@@ -298,14 +311,19 @@ class DocumentStore:
                 object_keys=list(_uploaded_keys),
             )
 
-        except Exception:
+        except Exception as e:
             # Any failure in steps 3-6: delete every uploaded key.
             for k in _uploaded_keys:
                 try:
                     await self._oc.delete_object(bucket=bucket, key=k)
                 except Exception as cleanup_err:
                     _log_orphan_cleanup_failed(bucket, k, cleanup_err)
-            raise
+            # I5: Re-raise typed per spec §5.5. ObjectStoreError (e.g. from
+            # the inner XBRL upload) passes through as a storage error; any
+            # other exception is wrapped as DocumentDBError ("DB phase fail").
+            if isinstance(e, ObjectStoreError):
+                raise
+            raise DocumentDBError(f"DocumentStore.put_filing failed during DB phase: {e}") from e
 
 
 # ─── Module-private helpers ────────────────────────────────────────────

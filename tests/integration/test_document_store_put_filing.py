@@ -130,3 +130,38 @@ async def test_put_filing_with_xbrl_uploads_xbrl_blob_and_sets_xbrl_object_key(
     # The bytes match
     bucket = result.bucket
     assert object_storage_fake.get_body(bucket, xbrl_key_row) == xbrl  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_put_filing_rejects_inconsistent_xbrl_args(
+    session: AsyncSession,
+    object_storage_fake: object,
+) -> None:
+    """I3: has_xbrl=True with no bytes/filename, or bytes with has_xbrl=False,
+    must raise ValueError before any I/O."""
+    from aslan_core.documents.client import DocumentStore
+
+    run_id = await _seed(session)
+    store = DocumentStore(
+        session,
+        object_client=object_storage_fake,  # type: ignore[arg-type]
+        ingestion_run_id=run_id,
+    )
+
+    base_kwargs: dict[str, object] = {
+        "source_id": "kap",
+        "source_filing_ref": "XBRL-BAD",
+        "entity_id": None,
+        "kind": "financial_report",
+        "title": "t",
+        "published_at": datetime(2026, 4, 28, tzinfo=UTC),
+        "primary_bytes": b"x",
+        "primary_mime": "text/html",
+        "primary_filename": "m.html",
+    }
+    # has_xbrl=True with no bytes/filename
+    with pytest.raises(ValueError, match="requires both"):
+        await store.put_filing(**base_kwargs, has_xbrl=True)  # type: ignore[arg-type]
+    # bytes provided with has_xbrl=False (default)
+    with pytest.raises(ValueError, match="omit the xbrl"):
+        await store.put_filing(**base_kwargs, xbrl_bytes=b"x", xbrl_filename="x.xbrl")  # type: ignore[arg-type]
