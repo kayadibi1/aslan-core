@@ -85,8 +85,7 @@ async def test_filing_lookup_index_exists(session: AsyncSession) -> None:
     rows = (
         await session.execute(
             text(
-                "SELECT indexname FROM pg_indexes "
-                "WHERE schemaname = 'doc' AND tablename = 'filing'"
+                "SELECT indexname FROM pg_indexes WHERE schemaname = 'doc' AND tablename = 'filing'"
             )
         )
     ).all()
