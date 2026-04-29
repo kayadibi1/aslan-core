@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import hashlib
+import json
+from datetime import date, datetime
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
+import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aslan_core.documents.object_storage import ObjectStorageClient
-from aslan_core.errors import DocumentNotFound
-from aslan_core.schemas.filing import Filing
+from aslan_core.errors import DocumentNotFound, ObjectStoreError
+from aslan_core.schemas.filing import AttachmentIn, Filing, PutFilingResult
+
+_log = structlog.get_logger(__name__)
 
 _DEFAULT_BUCKETS: dict[str, str] = {
     "kap": "aslan-filings",
@@ -110,6 +116,232 @@ class DocumentStore:
         if not rows:
             raise DocumentNotFound(str(filing_id))
         return [_row_to_filing(r) for r in rows]
+
+    # ─── writes ────────────────────────────────────────────────────────
+
+    async def put_filing(
+        self,
+        *,
+        source_id: str,
+        source_filing_ref: str,
+        entity_id: UUID | None,
+        kind: str,
+        title: str,
+        published_at: datetime,
+        primary_bytes: bytes,
+        primary_mime: str,
+        primary_filename: str,
+        attachments: list[AttachmentIn] | None = None,
+        period_start: date | None = None,
+        period_end: date | None = None,
+        subkind: str | None = None,
+        source_url: str | None = None,
+        is_amendment: bool = False,
+        previous_filing_id: UUID | None = None,
+        has_xbrl: bool = False,
+        xbrl_bytes: bytes | None = None,
+        xbrl_filename: str | None = None,
+        language: str = "tr",
+        metadata: dict[str, Any] | None = None,
+    ) -> PutFilingResult:
+        """Atomic upsert on (source_id, primary_sha256) per spec §5.4 + §5.5,
+        gated by a per-(source_id, source_filing_ref) advisory lock so
+        concurrent amendment writers cannot fork the chain.
+
+        Cleanup contract (codex 2026-04-28 review): every uploaded bucket
+        key is recorded in ``_uploaded_keys`` (primary + xbrl + every
+        attachment, once Task 15 lands). On ANY exception inside steps
+        3-6, all tracked keys are best-effort deleted before re-raising.
+        The returned ``PutFilingResult.object_keys`` exposes the manifest
+        so the caller can pass it to ``release()`` on outer-transaction
+        rollback. ``release()`` MUST NOT depend on ``doc.filing_attachment``
+        rows, which may be invisible/gone post-rollback.
+        """
+        bucket = self._bucket_for.get(source_id, "aslan-filings")
+        sha256 = hashlib.sha256(primary_bytes).hexdigest()
+        filing_id = uuid4()
+        primary_key = _format_object_key(
+            source_id=source_id,
+            entity_id=entity_id,
+            published_at=published_at,
+            filing_id=filing_id,
+            filename=primary_filename,
+        )
+
+        _uploaded_keys: list[str] = []
+
+        # Step 2: primary upload (failure here = no DB write attempted,
+        # no cleanup needed; raise ObjectStoreError directly).
+        try:
+            await self._oc.put_object(
+                bucket=bucket,
+                key=primary_key,
+                body=primary_bytes,
+                content_type=primary_mime,
+            )
+        except Exception as e:
+            raise ObjectStoreError(f"put_object failed: {e}") from e
+        _uploaded_keys.append(primary_key)
+
+        # Steps 3-6 wrapped in ONE try block: any failure deletes EVERY
+        # uploaded key before re-raising.
+        try:
+            # Step 3: advisory lock — serializes amendment writers per
+            # source_ref.
+            await self._s.execute(
+                text("SELECT pg_advisory_xact_lock(  hashtextextended(:src || ':' || :ref, 0))"),
+                {"src": source_id, "ref": source_filing_ref},
+            )
+
+            # Step 3.5: optional XBRL upload (must happen BEFORE the
+            # upsert so its key is bound to xbrl_object_key in the
+            # INSERT). Tracked in _uploaded_keys for cleanup on failure.
+            xbrl_key: str | None = None
+            if has_xbrl and xbrl_bytes is not None and xbrl_filename is not None:
+                xbrl_key = _format_object_key(
+                    source_id=source_id,
+                    entity_id=entity_id,
+                    published_at=published_at,
+                    filing_id=filing_id,
+                    filename=xbrl_filename,
+                )
+                await self._oc.put_object(
+                    bucket=bucket,
+                    key=xbrl_key,
+                    body=xbrl_bytes,
+                    content_type="application/xml",
+                )
+                _uploaded_keys.append(xbrl_key)
+
+            # Step 4: atomic upsert with revision_no advancement.
+            result_row = (
+                await self._s.execute(
+                    text(
+                        "WITH next_rev AS ("
+                        "    SELECT COALESCE(MAX(revision_no), 0) + 1 AS rn "
+                        "    FROM doc.filing "
+                        "    WHERE source_id = :src AND source_filing_ref = :ref"
+                        ") "
+                        "INSERT INTO doc.filing ("
+                        "    filing_id, source_id, source_filing_ref, entity_id, "
+                        "    kind, subkind, title, language, published_at, "
+                        "    period_start, period_end, source_url, is_amendment, "
+                        "    previous_filing_id, primary_object_key, primary_mime, "
+                        "    primary_sha256, primary_bytes, has_xbrl, xbrl_object_key, "
+                        "    metadata, ingestion_run_id, revision_no"
+                        ") "
+                        "VALUES ("
+                        "    :fid, :src, :ref, :eid, :kind, :subkind, :title, :lang, :pub, "
+                        "    :ps, :pe, :url, :amend, :prev, :ok, :mime, :sha, :bytes, "
+                        "    :hx, :xkey, COALESCE(:md, '{}')::jsonb, :run, "
+                        "    (SELECT rn FROM next_rev)"
+                        ") "
+                        "ON CONFLICT (source_id, primary_sha256) DO UPDATE "
+                        "SET metadata = doc.filing.metadata "
+                        "RETURNING filing_id, revision_no, (xmax = 0) AS created"
+                    ),
+                    {
+                        "fid": filing_id,
+                        "src": source_id,
+                        "ref": source_filing_ref,
+                        "eid": entity_id,
+                        "kind": kind,
+                        "subkind": subkind,
+                        "title": title,
+                        "lang": language,
+                        "pub": published_at,
+                        "ps": period_start,
+                        "pe": period_end,
+                        "url": source_url,
+                        "amend": is_amendment,
+                        "prev": previous_filing_id,
+                        "ok": primary_key,
+                        "mime": primary_mime,
+                        "sha": sha256,
+                        "bytes": len(primary_bytes),
+                        "hx": has_xbrl,
+                        "xkey": xbrl_key,
+                        "md": _json_metadata(metadata),
+                        "run": self._run_id,
+                    },
+                )
+            ).one()
+
+            actual_filing_id: UUID = result_row.filing_id
+            revision_no: int = result_row.revision_no
+            created: bool = bool(result_row.created)
+            is_revision: bool = not created and revision_no > 1
+
+            # Step 5: hash-dedup hit — delete just-uploaded primary AND
+            # xbrl blobs (they're duplicates of the existing row's).
+            # Tracked keys are removed from the manifest.
+            if not created:
+                for k in list(_uploaded_keys):
+                    try:
+                        await self._oc.delete_object(bucket=bucket, key=k)
+                    except Exception as e:
+                        _log_orphan_cleanup_failed(bucket, k, e)
+                    _uploaded_keys.remove(k)
+
+            # Step 6: attachments — Task 15 will add this. Skip for
+            # Task 14.
+            if attachments:
+                raise NotImplementedError("attachments handling lands in Task 15")
+
+            filing = await self.get_filing(actual_filing_id)
+            return PutFilingResult(
+                filing=filing,
+                created=created,
+                is_revision=is_revision,
+                revision_no=revision_no,
+                bucket=bucket,
+                object_keys=list(_uploaded_keys),
+            )
+
+        except Exception:
+            # Any failure in steps 3-6: delete every uploaded key.
+            for k in _uploaded_keys:
+                try:
+                    await self._oc.delete_object(bucket=bucket, key=k)
+                except Exception as cleanup_err:
+                    _log_orphan_cleanup_failed(bucket, k, cleanup_err)
+            raise
+
+
+# ─── Module-private helpers ────────────────────────────────────────────
+
+
+def _format_object_key(
+    *,
+    source_id: str,
+    entity_id: UUID | None,
+    published_at: datetime,
+    filing_id: UUID,
+    filename: str,
+) -> str:
+    eid = str(entity_id) if entity_id else "_unresolved"
+    return (
+        f"{source_id}/{eid}/"
+        f"{published_at.year:04d}/{published_at.month:02d}/{published_at.day:02d}/"
+        f"{filing_id}/{filename}"
+    )
+
+
+def _json_metadata(d: dict[str, Any] | None) -> str | None:
+    if d is None:
+        return None
+    return json.dumps(d)
+
+
+def _log_orphan_cleanup_failed(bucket: str, key: str, exc: Exception) -> None:
+    """Structured-log helper for orphan cleanup failures."""
+    _log.warning(
+        "orphan_cleanup_failed",
+        bucket=bucket,
+        key=key,
+        error=str(exc),
+        error_type=type(exc).__name__,
+    )
 
 
 def _row_to_filing(row: Any) -> Filing:
