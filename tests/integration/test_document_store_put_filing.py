@@ -774,6 +774,104 @@ async def test_put_filing_auto_sets_previous_filing_id_for_new_bytes_same_ref(
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_put_filing_republished_as_merges_new_source_ref_on_hash_dedup(
+    session: AsyncSession,
+    object_storage_fake: object,
+) -> None:
+    """Spec §5.4 case B: identical bytes, NEW source_filing_ref → the new
+    ref is appended to the existing row's metadata.republished_as array.
+    The function returns created=False with the ORIGINAL row.
+
+    Idempotency: re-calling with the same new ref does not duplicate it.
+    """
+    from aslan_core.documents.client import DocumentStore
+
+    run_id = await _seed(session)
+    store = DocumentStore(
+        session,
+        object_client=object_storage_fake,  # type: ignore[arg-type]
+        ingestion_run_id=run_id,
+    )
+
+    body = b"<html>same bytes, multiple refs</html>"
+
+    # First insert with source_ref=A and metadata={"foo": 1}.
+    r_a = await store.put_filing(
+        source_id="kap",
+        source_filing_ref="A",
+        entity_id=None,
+        kind="news",
+        title="t",
+        published_at=datetime(2026, 4, 28, tzinfo=UTC),
+        primary_bytes=body,
+        primary_mime="text/html",
+        primary_filename="main.html",
+        metadata={"foo": 1},
+    )
+    await session.commit()
+    assert r_a.created is True
+    filing_id_a = r_a.filing.filing_id
+
+    # Same bytes, NEW source_ref=B and a different metadata payload.
+    # Hash dedup → ON CONFLICT branch fires → returned filing is the
+    # ORIGINAL row (source_filing_ref=A), but metadata.republished_as
+    # gains "B".
+    r_b = await store.put_filing(
+        source_id="kap",
+        source_filing_ref="B",
+        entity_id=None,
+        kind="news",
+        title="t",
+        published_at=datetime(2026, 4, 28, tzinfo=UTC),
+        primary_bytes=body,
+        primary_mime="text/html",
+        primary_filename="main.html",
+        metadata={"bar": 2},
+    )
+    await session.commit()
+
+    assert r_b.created is False
+    assert r_b.filing.filing_id == filing_id_a
+    assert r_b.filing.source_filing_ref == "A"
+    # Original metadata preserved; republished_as appended.
+    assert r_b.filing.metadata.get("foo") == 1
+    assert r_b.filing.metadata.get("republished_as") == ["B"]
+
+    # Idempotency: a second call with source_ref=B must NOT duplicate "B".
+    r_b2 = await store.put_filing(
+        source_id="kap",
+        source_filing_ref="B",
+        entity_id=None,
+        kind="news",
+        title="t",
+        published_at=datetime(2026, 4, 28, tzinfo=UTC),
+        primary_bytes=body,
+        primary_mime="text/html",
+        primary_filename="main.html",
+        metadata={"bar": 2},
+    )
+    await session.commit()
+    assert r_b2.created is False
+    assert r_b2.filing.metadata.get("republished_as") == ["B"]
+
+    # A third source_ref=C extends the array.
+    r_c = await store.put_filing(
+        source_id="kap",
+        source_filing_ref="C",
+        entity_id=None,
+        kind="news",
+        title="t",
+        published_at=datetime(2026, 4, 28, tzinfo=UTC),
+        primary_bytes=body,
+        primary_mime="text/html",
+        primary_filename="main.html",
+    )
+    await session.commit()
+    assert r_c.created is False
+    assert r_c.filing.metadata.get("republished_as") == ["B", "C"]
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_caller_rollback_without_release_leaves_orphans(
     session: AsyncSession,
     object_storage_fake: object,

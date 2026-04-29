@@ -263,7 +263,33 @@ class DocumentStore:
                         "    (SELECT rn FROM next_rev)"
                         ") "
                         "ON CONFLICT (source_id, primary_sha256) DO UPDATE "
-                        "SET metadata = doc.filing.metadata "
+                        "SET metadata = CASE "
+                        # Pure rerun (case A): same source_filing_ref, same
+                        # bytes — no-op merge.
+                        "    WHEN doc.filing.source_filing_ref "
+                        "         = EXCLUDED.source_filing_ref "
+                        "    THEN doc.filing.metadata "
+                        # Idempotency: the new ref is already recorded in
+                        # republished_as → no-op.
+                        "    WHEN COALESCE("
+                        "             doc.filing.metadata->'republished_as', "
+                        "             '[]'::jsonb"
+                        "         ) @> to_jsonb(ARRAY[EXCLUDED.source_filing_ref]) "
+                        "    THEN doc.filing.metadata "
+                        # Case B: identical bytes, NEW source_filing_ref —
+                        # append into republished_as. Original metadata
+                        # preserved (jsonb_set with create_missing=true only
+                        # sets the one key).
+                        "    ELSE jsonb_set("
+                        "        doc.filing.metadata, "
+                        "        '{republished_as}', "
+                        "        COALESCE("
+                        "            doc.filing.metadata->'republished_as', "
+                        "            '[]'::jsonb"
+                        "        ) || to_jsonb(EXCLUDED.source_filing_ref), "
+                        "        true"
+                        "    ) "
+                        "END "
                         "RETURNING filing_id, revision_no, (xmax = 0) AS created"
                     ),
                     {
