@@ -85,6 +85,32 @@ class DocumentStore:
             return None
         return _row_to_filing(row)
 
+    async def amendment_chain(self, filing_id: UUID) -> list[Filing]:
+        """Return all revisions for the filing's source_ref, oldest first.
+        Works regardless of which member of the chain is passed in."""
+        rows = (
+            await self._s.execute(
+                text(
+                    "SELECT filing_id, source_id, source_filing_ref, entity_id, "
+                    "       kind, subkind, title, language, published_at, "
+                    "       period_start, period_end, source_url, is_amendment, "
+                    "       previous_filing_id, primary_object_key, primary_mime, "
+                    "       primary_sha256, primary_bytes, has_xbrl, xbrl_object_key, "
+                    "       metadata, discovered_at, revision_no "
+                    "FROM doc.filing "
+                    "WHERE (source_id, source_filing_ref) = ("
+                    "    SELECT source_id, source_filing_ref "
+                    "    FROM doc.filing WHERE filing_id = :fid"
+                    ") "
+                    "ORDER BY revision_no ASC"
+                ),
+                {"fid": filing_id},
+            )
+        ).all()
+        if not rows:
+            raise DocumentNotFound(str(filing_id))
+        return [_row_to_filing(r) for r in rows]
+
 
 def _row_to_filing(row: Any) -> Filing:
     return Filing(
