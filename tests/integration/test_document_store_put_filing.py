@@ -575,3 +575,81 @@ async def test_atomicity_hash_dedup_deletes_just_uploaded_blob(
 
     # Manifest is empty (no committed objects from the dedup-hit call)
     assert r2.object_keys == []
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_atomicity_attachment_insert_fail_outer_cleanup_deletes_everything(
+    session: AsyncSession,
+) -> None:
+    """Spec §5.5 + codex 2026-04-28: per-attachment INSERT failure trips
+    put_filing's outer cleanup which deletes EVERY uploaded blob (primary
+    + every attachment). No per-attachment retention — all the rows are
+    in the same uncommitted transaction and roll back together."""
+    from unittest.mock import patch
+
+    from aslan_core.documents.client import DocumentStore
+    from aslan_core.errors import DocumentDBError
+    from aslan_core.schemas.filing import AttachmentIn
+
+    run_id = await _seed(session)
+
+    fake = _FakeWithControlledFailure()
+    store = DocumentStore(session, object_client=fake, ingestion_run_id=run_id)
+
+    # Monkey-patch so the SECOND attachment's INSERT raises (first one
+    # succeeds-then-rolls-back, second one's INSERT raises).
+    real_execute = session.execute
+    insert_attachment_count = 0
+
+    async def _failing_execute(stmt: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal insert_attachment_count
+        sql = str(stmt)
+        if "INSERT INTO doc.filing_attachment" in sql:
+            insert_attachment_count += 1
+            if insert_attachment_count == 2:
+                raise RuntimeError("simulated DB failure on 2nd attachment INSERT")
+        return await real_execute(stmt, *args, **kwargs)
+
+    primary = b"<html>main</html>"
+    attachments = [
+        AttachmentIn(
+            bytes=b"first", mime="application/pdf", filename="a1.pdf", role="exhibit", sequence=1
+        ),
+        AttachmentIn(
+            bytes=b"second", mime="application/pdf", filename="a2.pdf", role="exhibit", sequence=2
+        ),
+        AttachmentIn(
+            bytes=b"third", mime="application/pdf", filename="a3.pdf", role="exhibit", sequence=3
+        ),
+    ]
+
+    with (
+        patch.object(session, "execute", side_effect=_failing_execute),
+        pytest.raises(DocumentDBError),
+    ):
+        await store.put_filing(
+            source_id="kap",
+            source_filing_ref="ATT-FAIL",
+            entity_id=None,
+            kind="material_event",
+            title="t",
+            published_at=datetime(2026, 4, 28, tzinfo=UTC),
+            primary_bytes=primary,
+            primary_mime="text/html",
+            primary_filename="main.html",
+            attachments=attachments,
+        )
+
+    # After the failure, the outer cleanup deletes EVERY uploaded blob:
+    # primary + first attachment + second attachment (uploaded before its
+    # INSERT failed). Third attachment was never uploaded.
+    assert fake.all_keys() == set(), f"expected all blobs cleaned up; got {fake.all_keys()}"
+
+    # No doc.filing rows — the failed INSERT and the prior failing INSERTs
+    # all share the same transaction; SQLAlchemy's session is now in an
+    # error state. Roll back before querying.
+    await session.rollback()
+    n_filings = await session.scalar(
+        text("SELECT COUNT(*) FROM doc.filing WHERE source_filing_ref = 'ATT-FAIL'")
+    )
+    assert n_filings == 0
