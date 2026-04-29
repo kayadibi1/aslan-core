@@ -3,11 +3,27 @@ deadletter_xadd_intent (v0.5.0 Task 5)."""
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+
 import pytest
+import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 pytestmark = pytest.mark.integration
+
+
+@pytest_asyncio.fixture(autouse=True, loop_scope="session")
+async def _wipe_deadletter(session: AsyncSession) -> AsyncIterator[None]:
+    """Clean up rows in streams.deadletter_* after each test."""
+    yield
+    for stmt in [
+        "DELETE FROM streams.deadletter_xadd_intent",
+        "DELETE FROM streams.deadletter_redis_index",
+        "DELETE FROM streams.deadletter_log",
+    ]:
+        await session.execute(text(stmt))
+    await session.commit()
 
 
 @pytest.mark.asyncio(loop_scope="session")

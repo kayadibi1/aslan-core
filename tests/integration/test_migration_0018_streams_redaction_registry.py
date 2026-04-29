@@ -3,12 +3,14 @@ SECURITY DEFINER function (v0.5.0 Task 5b)."""
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from uuid import uuid4
 
 import asyncpg
 import pytest
+import pytest_asyncio
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 pytestmark = pytest.mark.integration
 
@@ -16,6 +18,14 @@ pytestmark = pytest.mark.integration
 def _async_dsn_to_asyncpg(dsn: str) -> str:
     """Strip the ``+asyncpg`` driver suffix so ``asyncpg.connect`` accepts it."""
     return dsn.replace("postgresql+asyncpg://", "postgresql://", 1)
+
+
+@pytest_asyncio.fixture(autouse=True, loop_scope="session")
+async def _wipe_redaction(session: AsyncSession) -> AsyncIterator[None]:
+    """Clean up streams.redaction_registry rows after each test."""
+    yield
+    await session.execute(text("DELETE FROM streams.redaction_registry"))
+    await session.commit()
 
 
 @pytest.mark.asyncio(loop_scope="session")

@@ -13,6 +13,16 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 pytestmark = pytest.mark.integration
 
 
+@pytest_asyncio.fixture(autouse=True, loop_scope="session")
+async def _wipe_outbox(session: AsyncSession) -> AsyncIterator[None]:
+    """Clean up streams.outbox rows after each test so other modules'
+    _wipe() helpers can DELETE FROM src.ingestion_run without tripping
+    the outbox->ingestion_run FK."""
+    yield
+    await session.execute(text("DELETE FROM streams.outbox"))
+    await session.commit()
+
+
 @pytest_asyncio.fixture(loop_scope="session")
 async def _seed_test_ingestion_run(session: AsyncSession) -> AsyncIterator[None]:
     """Ensures at least one ``src.ingestion_run`` row exists for FK
