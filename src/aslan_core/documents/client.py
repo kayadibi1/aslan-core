@@ -10,7 +10,11 @@ import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from aslan_core.audit import AuditRecord, current_actor
+from aslan_core.audit import (
+    AuditRecord,
+    assert_actor_or_strict_raise,
+    current_actor,
+)
 from aslan_core.audit import record as audit_record
 from aslan_core.documents.object_storage import ObjectStorageClient
 from aslan_core.errors import DocumentDBError, DocumentNotFound, ObjectStoreError
@@ -202,7 +206,17 @@ class DocumentStore:
         so the caller can pass it to ``release()`` on outer-transaction
         rollback. ``release()`` MUST NOT depend on ``doc.filing_attachment``
         rows, which may be invisible/gone post-rollback.
+
+        Strict-mode early check (codex F3): raises AuditMissingActor
+        BEFORE any blob upload or DB INSERT when audit_strict=True and
+        no actor is set. This is the procurement-grade gate — strict
+        mode is meaningful only if it catches missing actors before
+        any side effect runs.
         """
+        # Strict-mode early check fires before validation so a missing
+        # actor takes precedence over arg-validation errors (the
+        # caller learns about the contract violation first).
+        assert_actor_or_strict_raise()
         # I3: validate xbrl argument consistency before any I/O.
         if has_xbrl and (xbrl_bytes is None or xbrl_filename is None):
             raise ValueError(
@@ -737,6 +751,7 @@ class DocumentStore:
         with it (consistent with the doc.filing row's lifecycle); if
         the caller has already committed, the audit event is durable.
         """
+        assert_actor_or_strict_raise()
         # Emit audit event first so the manifest is durable in the
         # session before any side-effecting blob delete runs.
         await audit_record(
@@ -778,6 +793,7 @@ class DocumentStore:
         per call. The ``after`` snapshot records body length only — not
         the body text itself — so audit rows stay compact.
         """
+        assert_actor_or_strict_raise()
         ac = _audit_cols()
         result = (
             await self._s.execute(

@@ -74,6 +74,33 @@ _INSERT_SQL = text(
 )
 
 
+def assert_actor_or_strict_raise(*, settings: Settings | None = None) -> None:
+    """Strict-mode early-check helper called at the top of every public
+    mutation method.
+
+    If no actor is set in the ContextVar AND ``Settings.audit_strict``
+    is True, raises :class:`AuditMissingActor` BEFORE any mutation I/O.
+    In lenient mode, returns silently — :func:`record` will log the
+    warning and write ``system:unknown`` later.
+
+    The procurement-grade contract for v0.3.0 customer-facing service
+    profiles depends on this raising before any DB INSERT or blob
+    upload — without it, strict mode would only catch missing actors
+    AFTER side effects ran (codex F3, 2026-04-29).
+    """
+    settings = settings if settings is not None else Settings()
+    if not settings.audit_strict:
+        return
+    if current_actor() is None:
+        raise AuditMissingActor(
+            "strict mode: mutation invoked with no actor set in ContextVar; "
+            "either call aslan_core.audit.set_actor(...) at the request/job "
+            "boundary, pass actor= to ingestion_run(...), or run with "
+            "audit_strict=False (non-strict mode is the v0.3 default but is "
+            "scheduled for removal in v1.1)"
+        )
+
+
 async def record(
     session: AsyncSession,
     *,

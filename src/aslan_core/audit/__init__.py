@@ -14,12 +14,17 @@ from aslan_core.audit.context import (
     require_actor,
     set_actor,
 )
-from aslan_core.audit.recorder import AuditRecord, record
+from aslan_core.audit.recorder import (
+    AuditRecord,
+    assert_actor_or_strict_raise,
+    record,
+)
 
 __all__ = [
     "Actor",
     "ActorKind",
     "AuditRecord",
+    "assert_actor_or_strict_raise",
     "current_actor",
     "pop_actor",
     "push_actor",

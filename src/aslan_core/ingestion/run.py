@@ -11,7 +11,14 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from aslan_core.audit import Actor, AuditRecord, current_actor, pop_actor, push_actor
+from aslan_core.audit import (
+    Actor,
+    AuditRecord,
+    assert_actor_or_strict_raise,
+    current_actor,
+    pop_actor,
+    push_actor,
+)
 from aslan_core.audit import record as audit_record
 from aslan_core.errors import UnknownSource
 
@@ -142,6 +149,10 @@ async def ingestion_run(
         actor_token = push_actor(actor)
 
     try:
+        # Strict-mode early check (codex F3): if audit_strict=True and
+        # no actor is set at scope entry (caller passed actor=None or
+        # didn't push one), raise BEFORE inserting the run row.
+        assert_actor_or_strict_raise()
         async with engine.connect() as conn:
             exists = await conn.scalar(
                 text("SELECT 1 FROM src.source WHERE source_id = :sid"),

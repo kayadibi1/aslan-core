@@ -11,7 +11,11 @@ from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.types import Text
 
-from aslan_core.audit import AuditRecord, current_actor
+from aslan_core.audit import (
+    AuditRecord,
+    assert_actor_or_strict_raise,
+    current_actor,
+)
 from aslan_core.audit import record as audit_record
 from aslan_core.errors import (
     EntityMergeRequired,
@@ -159,6 +163,10 @@ class EntityRegistryClient:
         parent_entity_id: UUID | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> Entity:
+        # Strict-mode early check (codex F3): raise BEFORE any I/O if
+        # audit_strict=True and no actor is set. Lenient mode falls
+        # through and audit.record() writes system:unknown later.
+        assert_actor_or_strict_raise()
         my_source = await self._source_id()
 
         # Look up existing identifier matches for any of the input pairs.
@@ -289,6 +297,7 @@ class EntityRegistryClient:
     ) -> None:
         """Idempotent on (namespace, value, valid_from). Collision with a
         different entity_id raises IdentifierConflict."""
+        assert_actor_or_strict_raise()
         my_source = await self._source_id()
         existing = (
             await self._s.execute(
@@ -399,6 +408,7 @@ class EntityRegistryClient:
         writer" invariant, the row's denormalised audit cols are stamped
         with the current actor on every successful UPDATE.
         """
+        assert_actor_or_strict_raise()
         # Capture pre-update snapshot for the audit event's `before`.
         before_entity = await self.get(entity_id)
 
@@ -454,6 +464,7 @@ class EntityRegistryClient:
         single round-trip and emits one identifier.expire event with
         before/after capturing the valid_to flip.
         """
+        assert_actor_or_strict_raise()
         ac = _audit_cols()
         # Use a CTE-style "before snapshot + UPDATE" to capture the
         # pre-update valid_to atomically. Returns one row when the WHERE
@@ -532,6 +543,7 @@ class EntityRegistryClient:
         field (different weight, valid_to, or metadata) is a fresh
         write and last-writer-wins on audit cols.
         """
+        assert_actor_or_strict_raise()
         my_source = await self._source_id()
         vf = valid_from or date(1900, 1, 1)
         vt = valid_to or date(9999, 12, 31)
@@ -708,6 +720,7 @@ class EntityRegistryClient:
         actually mutates a field is a fresh write and last-writer-wins
         on audit cols.
         """
+        assert_actor_or_strict_raise()
         vf = valid_from or date(1900, 1, 1)
         vt = valid_to or date(9999, 12, 31)
         # Pre-SELECT to detect idempotent-hit vs fresh-write.

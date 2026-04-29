@@ -5,7 +5,11 @@ from typing import Any, cast
 from sqlalchemy import CursorResult, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from aslan_core.audit import AuditRecord, current_actor
+from aslan_core.audit import (
+    AuditRecord,
+    assert_actor_or_strict_raise,
+    current_actor,
+)
 from aslan_core.audit import record as audit_record
 
 
@@ -55,6 +59,7 @@ class WatermarkStore:
           - success → watermark.advance event with before/after
           - CAS miss → no audit event (no mutation occurred)
         """
+        assert_actor_or_strict_raise()
         ac = _audit_cols()
         if expected_cursor is None:
             res = cast(
@@ -176,6 +181,7 @@ class WatermarkStore:
         UPDATE so the row's audit cols stay frozen on the original
         writer (codex F1).
         """
+        assert_actor_or_strict_raise()
         existing = (
             await self._s.execute(
                 text(
