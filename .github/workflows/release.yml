@@ -1,0 +1,40 @@
+# .github/workflows/release.yml
+# Release-time concerns (SBOM generation, GitHub Release asset upload)
+# triggered ONLY on tag pushes (v*). Operationally distinct from ci.yml's
+# branch / PR gates: a tag push does not fire ci.yml's triggers, so SBOM
+# generation lives here. SBOM is built from the project's locked
+# requirements (same export pip-audit consumes) — NOT the tool env.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+      - name: Sync project (with obs extras)
+        run: uv sync --extra obs
+      - name: Export locked requirements
+        run: uv export --extra obs --format requirements-txt --no-hashes --output-file requirements-locked.txt
+      - name: Generate SBOM (CycloneDX JSON)
+        run: |
+          uv tool install cyclonedx-bom
+          uv tool run cyclonedx-py requirements requirements-locked.txt --output-file sbom.cyclonedx.json
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom.cyclonedx.json
+      - name: Attach SBOM to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: sbom.cyclonedx.json
