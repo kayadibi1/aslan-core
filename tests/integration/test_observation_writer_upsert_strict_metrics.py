@@ -113,11 +113,15 @@ async def test_strict_mode_upsert_raises_without_actor(
 async def test_upsert_series_increments_prometheus_counter(
     session: AsyncSession,
 ) -> None:
+    pytest.importorskip("prometheus_client")
+
     set_actor(Actor(actor_id="user:metric", actor_kind="user"))
     rid = await _new_run(session)
     w = ObservationWriter(session, ingestion_run_id=rid)
 
-    before = series_upserts.labels(source_id="kap", frequency="1d")._value.get()
+    impl = series_upserts._ensure_impl()
+    assert impl is not None
+    before = impl.labels(source_id="kap", frequency="1d")._value.get()
     await w.upsert_series(
         series_code="metric.test",
         source_id="kap",
@@ -126,7 +130,7 @@ async def test_upsert_series_increments_prometheus_counter(
         unit="TRY",
     )
     await session.commit()
-    after = series_upserts.labels(source_id="kap", frequency="1d")._value.get()
+    after = impl.labels(source_id="kap", frequency="1d")._value.get()
     assert after == before + 1
 
 
