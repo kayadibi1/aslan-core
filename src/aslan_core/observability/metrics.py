@@ -117,9 +117,8 @@ _KNOWN_AUDIT_OPERATIONS: frozenset[str] = frozenset(
         "ingestion_run.complete",
         "ingestion_run.set_metadata",
         "ingestion_run.increment_rows",
-        # ``series.*`` operations land in v0.4.0 Tasks 8-13. The full
-        # allow-list extension (including observation.* + the F26/F27
-        # series.metadata_* events) is finalised in Task 25.
+        # ``series.*`` operations from ObservationWriter.upsert_series
+        # (v0.4.0 Tasks 8-13).
         "series.upsert",
         "series.idempotent_hit",
         "series.update",
@@ -127,6 +126,17 @@ _KNOWN_AUDIT_OPERATIONS: frozenset[str] = frozenset(
         # ONE event per write() call carrying bounded forensic
         # metadata; per-key detail lives in audit.observation_batch_keys.
         "observation.write_batch",
+        # v0.4.0 Task 25 — Art. 17 deletion runtime + PII tripwires.
+        # Emitted by the aslan-service deletion runtime (NOT by aslan-core
+        # itself; aslan-core only enforces upsert-time PII rejection).
+        # Listed here so a service-side emitter that lands an audit row
+        # under one of these operations gets a bounded Prometheus label
+        # instead of inflating cardinality.
+        "series.subject_erased",
+        "series.metadata_pii_scrubbed",
+        "series.metadata_bypass_detected",
+        "observation.metadata_pii_scrubbed",
+        "observation.metadata_bypass_detected",
     }
 )
 """Allow-list of every ``operation=`` string emitted by aslan-core's
