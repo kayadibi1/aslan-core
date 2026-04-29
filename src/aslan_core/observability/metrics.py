@@ -94,6 +94,12 @@ _KNOWN_AUDIT_OPERATIONS: frozenset[str] = frozenset(
         "ingestion_run.complete",
         "ingestion_run.set_metadata",
         "ingestion_run.increment_rows",
+        # ``series.*`` operations land in v0.4.0 Tasks 8-13. The full
+        # allow-list extension (including observation.* + the F26/F27
+        # series.metadata_* events) is finalised in Task 25.
+        "series.upsert",
+        "series.idempotent_hit",
+        "series.update",
     }
 )
 """Allow-list of every ``operation=`` string emitted by aslan-core's
