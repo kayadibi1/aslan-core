@@ -43,3 +43,44 @@ jobs:
           ASLAN_S3_REGION: us-east-1
           ASLAN_S3_ACCESS_KEY: x
           ASLAN_S3_SECRET_KEY: x
+
+  # CVE scan + SBOM (Tasks 20-21, v0.3.0).
+  # Runs in parallel with lint/test; isolates security gates from
+  # test flakiness so a fixed-but-unpatchable CVE blocks merge
+  # independently of pytest results.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv sync --all-groups
+
+      - name: pip-audit (CVE scan)
+        run: |
+          uv tool install pip-audit
+          uv tool run pip-audit --strict --format json --output pip-audit.json || true
+          cat pip-audit.json
+
+      - name: Fail on high severity CVEs
+        run: |
+          python - <<'PY'
+          import json, sys
+          data = json.load(open("pip-audit.json"))
+          critical = [
+              v
+              for d in data.get("dependencies", [])
+              for v in d.get("vulns", [])
+              if v.get("severity") in ("CRITICAL", "HIGH")
+          ]
+          if critical:
+              for v in critical:
+                  print(" ", v)
+              sys.exit(1)
+          PY
+
+      - name: Upload pip-audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-audit-report
+          path: pip-audit.json
