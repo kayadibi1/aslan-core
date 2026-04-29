@@ -4,6 +4,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from aslan_core.audit import Actor, set_actor
 from aslan_core.errors import EntityMergeRequired
 from aslan_core.registry.client import EntityRegistryClient
 
@@ -12,6 +13,7 @@ pytestmark = pytest.mark.integration
 
 async def _wipe(session: AsyncSession) -> None:
     for stmt in [
+        "DELETE FROM audit.events",
         "DELETE FROM ref.entity_sector",
         "DELETE FROM ref.entity_relationship",
         "DELETE FROM ref.identifier",
@@ -129,6 +131,115 @@ async def test_create_entity_multi_entity_match_raises(session: AsyncSession) ->
             legal_name="Foo or Bar?",
             identifiers={"bist_ticker": "FOO", "kap_entity_code": "2"},
         )
+
+
+async def test_create_entity_writes_audit_row_and_stamps_row_audit_cols(
+    session: AsyncSession,
+) -> None:
+    """Fresh-create path: one ``entity.create`` event AND the row's own
+    audit columns reflect the actor — both written in the same INSERT
+    (no separate post-write UPDATE)."""
+    await _wipe(session)
+    run = await _new_run(session)
+    set_actor(Actor(actor_id="user:audit-test", actor_kind="user"))
+    client = EntityRegistryClient(session, ingestion_run_id=run)
+
+    e = await client.create_entity(
+        type="company",
+        legal_name="X",
+        identifiers={"kap_entity_code": "1"},
+    )
+    await session.commit()
+
+    rows = (
+        await session.execute(
+            text(
+                "SELECT operation, target_pk, after, actor_id "
+                "FROM audit.events "
+                "WHERE target_schema = 'ref' AND target_table = 'entity' "
+                "ORDER BY occurred_at"
+            )
+        )
+    ).all()
+    assert len(rows) == 1
+    r = rows[0]
+    assert r.operation == "entity.create"
+    assert r.target_pk == {"entity_id": str(e.entity_id)}
+    assert r.after["legal_name"] == "X"
+    assert r.actor_id == "user:audit-test"
+
+    # And the row's own denormalised audit columns reflect the actor.
+    e_row = (
+        await session.execute(
+            text("SELECT actor_id, actor_kind FROM ref.entity WHERE entity_id = :id"),
+            {"id": e.entity_id},
+        )
+    ).one()
+    assert e_row.actor_id == "user:audit-test"
+    assert e_row.actor_kind == "user"
+
+    set_actor(None)
+
+
+async def test_create_entity_idempotent_hit_preserves_original_attribution(
+    session: AsyncSession,
+) -> None:
+    """Codex F1, 2026-04-29: an idempotent retry by a different actor
+    must NOT rewrite the row's audit columns AND must NOT emit
+    ``entity.create``. It emits ``entity.idempotent_hit`` whose event row
+    carries the new actor's identity, while the entity row's denormalised
+    audit columns stay frozen on the original creator."""
+    await _wipe(session)
+    run = await _new_run(session)
+
+    set_actor(Actor(actor_id="user:original-creator", actor_kind="user"))
+    client_a = EntityRegistryClient(session, ingestion_run_id=run)
+    e1 = await client_a.create_entity(
+        type="company",
+        legal_name="X",
+        identifiers={"kap_entity_code": "1"},
+    )
+    await session.commit()
+
+    # Second actor retries the same call — idempotent hit.
+    set_actor(Actor(actor_id="user:retry-actor", actor_kind="user"))
+    client_b = EntityRegistryClient(session, ingestion_run_id=run)
+    e2 = await client_b.create_entity(
+        type="company",
+        legal_name="X",
+        identifiers={"kap_entity_code": "1"},
+    )
+    await session.commit()
+
+    assert e1.entity_id == e2.entity_id
+
+    # The row's actor_id is STILL the original creator, not the retrier.
+    row = (
+        await session.execute(
+            text("SELECT actor_id FROM ref.entity WHERE entity_id = :id"),
+            {"id": e1.entity_id},
+        )
+    ).one()
+    assert row.actor_id == "user:original-creator"
+
+    # Two audit events on ref.entity: one entity.create, one entity.idempotent_hit.
+    events = (
+        await session.execute(
+            text(
+                "SELECT operation, actor_id FROM audit.events "
+                "WHERE target_schema = 'ref' AND target_table = 'entity' "
+                "ORDER BY occurred_at"
+            )
+        )
+    ).all()
+    assert [e.operation for e in events] == [
+        "entity.create",
+        "entity.idempotent_hit",
+    ]
+    assert events[0].actor_id == "user:original-creator"
+    assert events[1].actor_id == "user:retry-actor"
+
+    set_actor(None)
 
 
 async def test_create_entity_laundered_cross_source_match_raises(

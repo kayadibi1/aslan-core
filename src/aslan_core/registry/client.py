@@ -11,6 +11,8 @@ from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.types import Text
 
+from aslan_core.audit import AuditRecord, current_actor
+from aslan_core.audit import record as audit_record
 from aslan_core.errors import (
     EntityMergeRequired,
     EntityNotFound,
@@ -213,18 +215,36 @@ class EntityRegistryClient:
             for ns, val in identifiers.items():
                 if (ns, val) not in existing:
                     await self.add_identifier(target_eid, ns, val)
+            # Codex F1, 2026-04-29: do NOT mutate the existing row's audit
+            # columns on an idempotent hit — the original creator's
+            # attribution is preserved forever. Emit one
+            # `entity.idempotent_hit` event with the current actor in the
+            # event row so forensics still see "user X retried at time Z".
+            await self._emit_audit(
+                operation="entity.idempotent_hit",
+                target_table="entity",
+                target_pk={"entity_id": str(target_entity.entity_id)},
+                before=target_entity.model_dump(mode="json"),
+                after=target_entity.model_dump(mode="json"),
+                metadata={"returned_existing": True},
+            )
             return target_entity
 
-        # Fresh INSERT.
+        # Fresh INSERT — stamp audit columns IN the INSERT (single
+        # round-trip). A separate post-write UPDATE would create a
+        # rewrite-on-retry vulnerability per codex F1.
+        ac = _audit_cols()
         eid: UUID = (
             await self._s.execute(
                 text(
                     "INSERT INTO ref.entity "
                     "  (entity_type, legal_name, short_name, country_code, domicile, "
                     "   incorporation_dt, fiscal_year_end, status, parent_entity_id, "
-                    "   metadata, source_id, ingestion_run_id) "
+                    "   metadata, source_id, ingestion_run_id, "
+                    "   actor_id, actor_kind, client_ip, user_agent, request_id) "
                     "VALUES (:type, :ln, :sn, :cc, :dom, :inc, :fye, :status, :pid, "
-                    "        COALESCE(:md, '{}')::jsonb, :sid, :run) "
+                    "        COALESCE(:md, '{}')::jsonb, :sid, :run, "
+                    "        :actor_id, :actor_kind, :client_ip, :user_agent, :request_id) "
                     "RETURNING entity_id"
                 ),
                 {
@@ -240,6 +260,7 @@ class EntityRegistryClient:
                     "md": _jsonb(metadata),
                     "sid": my_source,
                     "run": self._run_id,
+                    **ac,
                 },
             )
         ).scalar_one()
@@ -247,7 +268,15 @@ class EntityRegistryClient:
         for ns, val in identifiers.items():
             await self.add_identifier(eid, ns, val, is_primary=False)
 
-        return await self.get(eid)
+        new_entity = await self.get(eid)
+        await self._emit_audit(
+            operation="entity.create",
+            target_table="entity",
+            target_pk={"entity_id": str(new_entity.entity_id)},
+            before=None,
+            after=new_entity.model_dump(mode="json"),
+        )
+        return new_entity
 
     async def add_identifier(
         self,
@@ -486,6 +515,36 @@ class EntityRegistryClient:
             updated_at=row.updated_at,
         )
 
+    async def _emit_audit(
+        self,
+        *,
+        operation: str,
+        target_table: str,
+        target_pk: dict[str, Any],
+        before: dict[str, Any] | None,
+        after: dict[str, Any] | None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Emit one audit event scoped to the registry (target_schema='ref').
+
+        Centralised so every registry mutation writes events the same way
+        and so the schema/run_id binding is not duplicated at every call
+        site.
+        """
+        await audit_record(
+            self._s,
+            record=AuditRecord(
+                operation=operation,
+                target_schema="ref",
+                target_table=target_table,
+                target_pk=target_pk,
+                before=before,
+                after=after,
+                metadata=metadata or {},
+                ingestion_run_id=self._run_id,
+            ),
+        )
+
     async def _source_id(self) -> str:
         if self._source_id_cache is None:
             sid: str | None = await self._s.scalar(
@@ -504,3 +563,31 @@ def _jsonb(d: dict[str, Any] | None) -> str | None:
     if d is None:
         return None
     return json.dumps(d)
+
+
+def _audit_cols() -> dict[str, Any]:
+    """Build the actor_id/actor_kind/client_ip/user_agent/request_id bind
+    params for the current ContextVar actor.
+
+    When no actor is set, returns NULLs — the actual strict-mode raise
+    happens inside ``audit.record()``. This helper is for *stamping the
+    row's denormalised audit columns* at INSERT time so we never need a
+    post-write UPDATE (which would let an idempotent retry rewrite the
+    original creator's attribution per codex F1).
+    """
+    a = current_actor()
+    if a is None:
+        return {
+            "actor_id": None,
+            "actor_kind": None,
+            "client_ip": None,
+            "user_agent": None,
+            "request_id": None,
+        }
+    return {
+        "actor_id": a.actor_id,
+        "actor_kind": a.actor_kind,
+        "client_ip": a.client_ip,
+        "user_agent": a.user_agent,
+        "request_id": a.request_id,
+    }
