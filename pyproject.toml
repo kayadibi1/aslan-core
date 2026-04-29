@@ -131,7 +131,15 @@ asyncio_default_test_loop_scope = "session"
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = ["-ra", "--strict-markers", "--strict-config", "-m", "not integration"]
-filterwarnings = ["error"]
+filterwarnings = [
+    "error",
+    # testcontainers' RedisContainer module triggers a DeprecationWarning
+    # at IMPORT time about the deprecated `@wait_container_is_ready`
+    # decorator (their internal API). We don't own this warning; suppress
+    # so ``from testcontainers.redis import RedisContainer`` does not
+    # promote to an ImportError under our ``error`` warning policy.
+    "ignore:The @wait_container_is_ready decorator is deprecated:DeprecationWarning",
+]
 markers = [
     "integration: requires the testcontainers Postgres+Timescale stack",
 ]

@@ -23,6 +23,7 @@ from aslan_core.streams.names import (
     STREAMS,
     normalize_bist_ticks_label,
 )
+from aslan_core.streams.outbox_drainer import drain_outbox
 from aslan_core.streams.producer import StreamProducer
 
 __all__ = [
@@ -37,5 +38,6 @@ __all__ = [
     "StreamEntryRedactedEvent",
     "StreamEvent",
     "StreamProducer",
+    "drain_outbox",
     "normalize_bist_ticks_label",
 ]
