@@ -168,6 +168,23 @@ class DocumentStore:
                 "set has_xbrl=True or omit the xbrl arguments"
             )
 
+        # Codex 2026-04-29: object keys are disambiguated by
+        # `attachments/{sequence:03d}/{filename}`, so two attachments
+        # collide only when they share BOTH sequence AND filename. Reject
+        # at the API boundary — silent overwrite would otherwise leave
+        # one DB row's bytes stored under another row's key.
+        if attachments:
+            seen: set[tuple[int, str]] = set()
+            for att in attachments:
+                pair = (att.sequence, att.filename)
+                if pair in seen:
+                    raise ValueError(
+                        "duplicate attachment sequence+filename: "
+                        f"sequence={att.sequence}, filename={att.filename!r}. "
+                        "Each attachment must have a unique (sequence, filename)."
+                    )
+                seen.add(pair)
+
         bucket = self._bucket_for.get(source_id, "aslan-filings")
         sha256 = hashlib.sha256(primary_bytes).hexdigest()
         filing_id = uuid4()
@@ -176,6 +193,7 @@ class DocumentStore:
             entity_id=entity_id,
             published_at=published_at,
             filing_id=filing_id,
+            role="primary",
             filename=primary_filename,
         )
 
@@ -229,6 +247,7 @@ class DocumentStore:
                     entity_id=entity_id,
                     published_at=published_at,
                     filing_id=filing_id,
+                    role="xbrl",
                     filename=xbrl_filename,
                 )
                 await self._oc.put_object(
@@ -417,6 +436,7 @@ class DocumentStore:
                 entity_id=entity_id,
                 published_at=published_at,
                 filing_id=filing_id,
+                role=f"attachments/{att.sequence:03d}",
                 filename=att.filename,
             )
             # Upload first; track in manifest BEFORE the INSERT so the outer
@@ -508,13 +528,26 @@ def _format_object_key(
     entity_id: UUID | None,
     published_at: datetime,
     filing_id: UUID,
+    role: str,
     filename: str,
 ) -> str:
+    """Build the bucket object key for a filing component.
+
+    The ``role`` segment disambiguates primary / xbrl / per-attachment
+    blobs that share a filename. Without it, an attachment named
+    ``main.html`` would overwrite the primary ``main.html`` blob,
+    leaving DB metadata pointing at the wrong bytes (codex 2026-04-29).
+
+    Use ``role="primary"`` / ``role="xbrl"`` for those phases. For
+    attachments, embed the sequence so two attachments with the same
+    filename but different sequences do not collide:
+    ``role=f"attachments/{att.sequence:03d}"``.
+    """
     eid = str(entity_id) if entity_id else "_unresolved"
     return (
         f"{source_id}/{eid}/"
         f"{published_at.year:04d}/{published_at.month:02d}/{published_at.day:02d}/"
-        f"{filing_id}/{filename}"
+        f"{filing_id}/{role}/{filename}"
     )
 
 

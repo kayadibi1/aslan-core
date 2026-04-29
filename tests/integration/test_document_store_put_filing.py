@@ -1024,3 +1024,175 @@ async def test_dedup_hit_skips_attachments_and_returns_empty_manifest(
     await store.release(r2)
     bucket_state_post_release = dict(object_storage_fake._bodies)  # type: ignore[attr-defined]
     assert bucket_state_post_release == bucket_state_before
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_object_keys_disambiguated_when_attachment_filename_matches_primary(
+    session: AsyncSession,
+    object_storage_fake: object,
+) -> None:
+    """Codex 2026-04-29: an attachment whose filename matches the primary
+    filename must NOT overwrite the primary blob. The role segment in
+    `_format_object_key` (primary/, attachments/<seq:03d>/) makes the
+    keys distinct so each blob lands at its own path.
+    """
+    from aslan_core.documents.client import DocumentStore
+    from aslan_core.schemas.filing import AttachmentIn
+
+    run_id = await _seed(session)
+    store = DocumentStore(
+        session,
+        object_client=object_storage_fake,  # type: ignore[arg-type]
+        ingestion_run_id=run_id,
+    )
+
+    primary = b"<html>primary main.html</html>"
+    attachment = b"<html>attachment named main.html -- DIFFERENT bytes</html>"
+
+    r = await store.put_filing(
+        source_id="kap",
+        source_filing_ref="ROLE-COLLIDE",
+        entity_id=None,
+        kind="news",
+        title="t",
+        published_at=datetime(2026, 4, 28, tzinfo=UTC),
+        primary_bytes=primary,
+        primary_mime="text/html",
+        primary_filename="main.html",  # collides with attachment filename
+        attachments=[
+            AttachmentIn(
+                bytes=attachment,
+                mime="text/html",
+                filename="main.html",  # SAME filename as primary
+                role="exhibit",
+                sequence=1,
+            ),
+        ],
+    )
+    await session.commit()
+
+    assert r.created is True
+    # Two distinct keys, two distinct blobs, both intact.
+    assert len(object_storage_fake.all_keys()) == 2  # type: ignore[attr-defined]
+    assert object_storage_fake.get_body(r.bucket, r.filing.primary_object_key) == primary  # type: ignore[attr-defined]
+    [att_key] = [k for k in r.object_keys if k != r.filing.primary_object_key]
+    assert object_storage_fake.get_body(r.bucket, att_key) == attachment  # type: ignore[attr-defined]
+    # Sanity: the primary key contains 'primary/' and the attachment key
+    # contains 'attachments/' — proving the role segment is doing the work.
+    assert "/primary/" in r.filing.primary_object_key
+    assert "/attachments/" in att_key
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_object_keys_disambiguate_two_attachments_with_same_filename_different_seq(
+    session: AsyncSession,
+    object_storage_fake: object,
+) -> None:
+    """Two attachments sharing a filename but with different sequences
+    land at different paths thanks to the `attachments/{seq:03d}/`
+    prefix. Both blobs persist; neither overwrites the other.
+    """
+    from aslan_core.documents.client import DocumentStore
+    from aslan_core.schemas.filing import AttachmentIn
+
+    run_id = await _seed(session)
+    store = DocumentStore(
+        session,
+        object_client=object_storage_fake,  # type: ignore[arg-type]
+        ingestion_run_id=run_id,
+    )
+
+    a1_bytes = b"attachment 1 bytes"
+    a2_bytes = b"attachment 2 DIFFERENT bytes"
+
+    r = await store.put_filing(
+        source_id="kap",
+        source_filing_ref="DUP-FILENAME",
+        entity_id=None,
+        kind="news",
+        title="t",
+        published_at=datetime(2026, 4, 28, tzinfo=UTC),
+        primary_bytes=b"<html>main</html>",
+        primary_mime="text/html",
+        primary_filename="main.html",
+        attachments=[
+            AttachmentIn(
+                bytes=a1_bytes,
+                mime="application/pdf",
+                filename="exhibit.pdf",
+                role="exhibit",
+                sequence=1,
+            ),
+            AttachmentIn(
+                bytes=a2_bytes,
+                mime="application/pdf",
+                filename="exhibit.pdf",  # same filename
+                role="exhibit",
+                sequence=2,  # different sequence
+            ),
+        ],
+    )
+    await session.commit()
+
+    assert r.created is True
+    # 3 blobs total: primary + two attachments at distinct sequenced paths.
+    assert len(object_storage_fake.all_keys()) == 3  # type: ignore[attr-defined]
+    att_keys = [k for k in r.object_keys if k != r.filing.primary_object_key]
+    assert len(att_keys) == 2
+    assert "attachments/001/" in att_keys[0]
+    assert "attachments/002/" in att_keys[1]
+    # Both attachment blobs intact, neither overwritten.
+    assert object_storage_fake.get_body(r.bucket, att_keys[0]) == a1_bytes  # type: ignore[attr-defined]
+    assert object_storage_fake.get_body(r.bucket, att_keys[1]) == a2_bytes  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_put_filing_rejects_duplicate_attachment_sequence_filename(
+    session: AsyncSession,
+    object_storage_fake: object,
+) -> None:
+    """Two attachments sharing BOTH sequence and filename would collide
+    on the disambiguated key — put_filing rejects the call at the API
+    boundary BEFORE any I/O happens. Defense in depth so a caller
+    mistake never silently overwrites a committed blob.
+    """
+    from aslan_core.documents.client import DocumentStore
+    from aslan_core.schemas.filing import AttachmentIn
+
+    run_id = await _seed(session)
+    store = DocumentStore(
+        session,
+        object_client=object_storage_fake,  # type: ignore[arg-type]
+        ingestion_run_id=run_id,
+    )
+
+    bad = [
+        AttachmentIn(
+            bytes=b"a", mime="application/pdf", filename="dup.pdf", role="exhibit", sequence=1
+        ),
+        AttachmentIn(
+            bytes=b"b", mime="application/pdf", filename="dup.pdf", role="exhibit", sequence=1
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="duplicate attachment sequence"):
+        await store.put_filing(
+            source_id="kap",
+            source_filing_ref="DUP-REJECT",
+            entity_id=None,
+            kind="news",
+            title="t",
+            published_at=datetime(2026, 4, 28, tzinfo=UTC),
+            primary_bytes=b"<html>main</html>",
+            primary_mime="text/html",
+            primary_filename="main.html",
+            attachments=bad,
+        )
+
+    # No I/O happened: bucket empty, no row inserted.
+    assert object_storage_fake.all_keys() == set()  # type: ignore[attr-defined]
+    await session.rollback()
+    n = await session.scalar(
+        text("SELECT COUNT(*) FROM doc.filing WHERE source_filing_ref = 'DUP-REJECT'")
+    )
+    assert n == 0
