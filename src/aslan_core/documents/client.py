@@ -206,18 +206,18 @@ class DocumentStore:
 
             # Step 3a (spec §5.4 case C): auto-detect prior latest revision
             # AFTER taking the advisory lock so the read is serialized with
-            # concurrent writers. If a prior row exists for this source_ref
-            # AND the new bytes are different (different sha256), the new
-            # row links to it via previous_filing_id + is_amendment, even
-            # if the caller passed defaults. If the new bytes match a prior
-            # row's hash, the ON CONFLICT (source_id, primary_sha256) branch
-            # fires and these auto-set values are discarded — no harm.
+            # concurrent writers. Fills caller-defaulted chain fields only —
+            # an explicit non-default value is honored unchanged. If the new
+            # bytes match a prior row's hash, ON CONFLICT (source_id,
+            # primary_sha256) fires and these values are discarded.
             prior = await self.find_by_source_ref(
                 source_id=source_id, source_filing_ref=source_filing_ref
             )
             if prior is not None and prior.primary_sha256 != sha256:
-                previous_filing_id = prior.filing_id
-                is_amendment = True
+                if previous_filing_id is None:
+                    previous_filing_id = prior.filing_id
+                if not is_amendment:
+                    is_amendment = True
 
             # Step 3.5: optional XBRL upload (must happen BEFORE the
             # upsert so its key is bound to xbrl_object_key in the
