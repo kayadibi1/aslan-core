@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import struct
 import time
 from collections.abc import Iterable
 from datetime import UTC, datetime
@@ -123,6 +124,46 @@ def _raise_if_pii_in_metadata(metadata: dict[str, Any] | None) -> None:
             f"pattern; PII must live in metadata.subjects/series_subject, "
             f"not free-form metadata. Matched: {f.matched_text!r}"
         )
+
+
+def _compute_batch_hash(series_id: int, deduped: list[ObservationIn]) -> str:
+    """Codex Batch 3 F2, 2026-04-29 — SHA-256 of a length-delimited
+    canonical batch sequence that BINDS payloads to their
+    ``(series_id, ts, as_of)`` keys.
+
+    Previous shape sorted only ``payload_hash`` values; two batches
+    that swapped payloads across keys produced the same digest, which
+    is a forensic-commitment hole (the audit hash was supposed to
+    detect tampering but couldn't see a key/payload swap).
+
+    Includes ``(series_id, ts_iso, as_of_iso, payload_hash_hex)`` per
+    row, sorted by ``(ts, as_of)`` so a swap across keys produces a
+    different hash. Length prefixes prevent boundary-confusion attacks
+    where a forger could shift bytes between fields without changing
+    the concatenation.
+    """
+    h = hashlib.sha256()
+    # 8 bytes BE for series_id binds the digest to the series — two
+    # series with identical observations no longer collide.
+    h.update(struct.pack(">Q", series_id))
+    sorted_items = sorted(
+        ((o.ts, o.as_of, o.payload_hash()) for o in deduped),
+        key=lambda t: (t[0], t[1]),
+    )
+    for ts, as_of, ph in sorted_items:
+        ts_bytes = ts.isoformat().encode("utf-8")
+        as_of_bytes = as_of.isoformat().encode("utf-8")
+        h.update(struct.pack(">I", len(ts_bytes)))
+        h.update(ts_bytes)
+        h.update(struct.pack(">I", len(as_of_bytes)))
+        h.update(as_of_bytes)
+        # ``payload_hash`` is a 64-char hex string — bind it as ASCII
+        # bytes (compact + unambiguous; decoding to raw bytes would
+        # also work but adds no security and obscures forensic
+        # readability when debugging digests).
+        h.update(struct.pack(">I", len(ph)))
+        h.update(ph.encode("ascii"))
+    return h.hexdigest()
 
 
 class ObservationWriter:
@@ -956,12 +997,12 @@ class ObservationWriter:
         ts_min, ts_max = min(ts_values), max(ts_values)
         as_of_min, as_of_max = min(as_of_values), max(as_of_values)
 
-        # Deterministic batch hash: sha256 of sorted-by-key
-        # concatenation of per-row payload_hash bytes — independent of
-        # input ordering. Same caller replaying the same batch
-        # produces the same value.
-        sorted_hashes = sorted(seen.values())
-        batch_payload_hash = hashlib.sha256("".join(sorted_hashes).encode("ascii")).hexdigest()
+        # Codex Batch 3 F2, 2026-04-29: deterministic batch hash that
+        # BINDS payloads to their (series_id, ts, as_of) keys. Sort by
+        # (ts, as_of) so input ordering is irrelevant; include
+        # series_id + per-row keys with length-delimiters so a
+        # cross-key payload swap produces a different digest.
+        batch_payload_hash = _compute_batch_hash(series_id, deduped)
 
         # Mirror occurred_at into both audit.events and
         # audit.observation_batch_keys so investigators can join on
