@@ -346,3 +346,93 @@ async def test_doc_put_infers_mime_when_not_passed(
         {"fid": filing_id},
     )
     assert mime == "application/pdf"
+
+
+class _FlakyFake(InMemoryFake):
+    """Test helper: fail delete_object on any key matching `fail_substring`."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_substring: str | None = None
+
+    async def delete_object(self, *, bucket: str, key: str) -> None:
+        if self.fail_substring and self.fail_substring in key:
+            raise RuntimeError(f"simulated S3 delete failure for {key}")
+        await super().delete_object(bucket=bucket, key=key)
+
+
+async def test_doc_release_aborts_db_delete_when_blob_delete_fails(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Codex 2026-04-29 (F4): if any blob delete fails, the DB row and
+    attachment manifest must remain in place so the operator can rerun.
+
+    Without this: row + manifest gone, orphan blobs unrecoverable from
+    the operator's side. With this: rerun once the storage error
+    clears — delete_object is S3-idempotent, already-deleted blobs
+    no-op on retry, then the DB delete proceeds.
+    """
+    from aslan_core.cli.main import cli
+
+    flaky = _FlakyFake()
+    await _seed_sources(session)
+    _patch_factory(monkeypatch, flaky)
+
+    primary = tmp_path / "manual.html"
+    primary.write_bytes(b"<html>flaky-release</html>")
+
+    put_result = await _invoke(
+        cli,
+        [
+            "doc",
+            "put",
+            "--source-id",
+            "manual",
+            "--source-ref",
+            "FLAKY",
+            "--kind",
+            "news",
+            "--title",
+            "Flaky release",
+            "--published-at",
+            "2026-04-28T12:00:00Z",
+            "--primary-file",
+            str(primary),
+            "--json",
+        ],
+    )
+    assert put_result.exit_code == 0, f"put failed: {put_result.output}"
+    filing_id = json.loads(put_result.output)["filing_id"]
+    assert len(flaky.all_keys()) == 1
+
+    # First release attempt — blob delete will fail.
+    flaky.fail_substring = "primary"
+    release_fail = await _invoke(cli, ["doc", "release", filing_id])
+    assert release_fail.exit_code != 0
+    assert "blob delete" in release_fail.output
+
+    # The blob is still there; the DB row is still there. Operator can
+    # rerun release once storage recovers.
+    assert len(flaky.all_keys()) == 1
+    await session.rollback()
+    n_before = await session.scalar(
+        text("SELECT COUNT(*) FROM doc.filing WHERE filing_id = :fid"),
+        {"fid": UUID(filing_id)},
+    )
+    assert n_before == 1
+
+    # Storage recovers — rerun. delete_object is idempotent, blob
+    # delete proceeds, row delete commits.
+    flaky.fail_substring = None
+    release_ok = await _invoke(cli, ["doc", "release", filing_id])
+    assert release_ok.exit_code == 0, f"retry failed: {release_ok.output}"
+
+    assert flaky.all_keys() == set()
+    await session.rollback()
+    n_after = await session.scalar(
+        text("SELECT COUNT(*) FROM doc.filing WHERE filing_id = :fid"),
+        {"fid": UUID(filing_id)},
+    )
+    assert n_after == 0

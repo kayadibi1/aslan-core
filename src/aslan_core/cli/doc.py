@@ -502,12 +502,12 @@ async def _release_impl(filing_id: UUID, keep_row: bool) -> None:
             keys.extend(r.object_key for r in att_rows)
 
             if not keep_row:
-                # Codex 2026-04-29: preflight the chain-FK before any
-                # bucket mutation. doc.filing.previous_filing_id has no
-                # ON DELETE CASCADE, so a release that orphans a
+                # Codex 2026-04-29 (F2): preflight the chain-FK before
+                # any destructive op. doc.filing.previous_filing_id has
+                # no ON DELETE CASCADE, so a release that orphans a
                 # downstream revision raises IntegrityError on the
-                # final DELETE — which would surface AFTER the blobs
-                # are already gone. Block it here with a clear UX.
+                # row DELETE. Block it here with a clear UX so neither
+                # the bucket nor the row is touched.
                 downstream = await s.scalar(
                     text("SELECT 1 FROM doc.filing WHERE previous_filing_id = :fid LIMIT 1"),
                     {"fid": filing_id},
@@ -521,11 +521,36 @@ async def _release_impl(filing_id: UUID, keep_row: bool) -> None:
                         "up bucket objects."
                     )
 
-                # DB row delete + COMMIT must happen BEFORE any bucket
-                # mutation, so a bucket failure cannot leave us with
-                # live rows pointing at missing blobs. Codex 2026-04-29:
-                # reversed from prior order (was: blobs first, rows
-                # after) which had the inverse failure mode.
+            # Codex 2026-04-29 (F4): blobs first, abort DB delete on
+            # any blob failure. If we deleted the row first and then
+            # a blob delete failed, the row + attachment manifest would
+            # be gone and the orphan blob would be unrecoverable from
+            # the operator's side. Order:
+            #   1. delete blobs (best-effort, track failures)
+            #   2. if any failed → abort DB delete; row + manifest
+            #      stay queryable, operator reruns once storage is
+            #      back. delete_object is S3-idempotent, so the
+            #      already-deleted blobs no-op on retry.
+            #   3. all blobs gone → DELETE rows + COMMIT.
+            failed: list[tuple[str, str]] = []
+            for key in keys:
+                try:
+                    await oc.delete_object(bucket=bucket, key=key)
+                except Exception as e:
+                    failed.append((key, str(e)))
+
+            if failed:
+                # Abort BEFORE touching the DB rows. The session_scope
+                # context manager will rollback cleanly on raise.
+                for key, err in failed:
+                    click.echo(f"warning: failed to delete {key}: {err}", err=True)
+                raise click.ClickException(
+                    f"release {filing_id}: {len(failed)}/{len(keys)} blob delete(s) "
+                    "failed — DB row left intact for retry. Re-run `aslan doc "
+                    "release` once the storage error clears."
+                )
+
+            if not keep_row:
                 await s.execute(
                     text("DELETE FROM doc.filing_body WHERE filing_id = :fid"),
                     {"fid": filing_id},
@@ -534,25 +559,13 @@ async def _release_impl(filing_id: UUID, keep_row: bool) -> None:
                     text("DELETE FROM doc.filing WHERE filing_id = :fid"),
                     {"fid": filing_id},
                 )
+                # session_scope commits at exit; explicit commit here
+                # makes the row delete durable before the success echo.
                 await s.commit()
 
-        # Bucket cleanup AFTER the DB transaction is committed (or after
-        # preflight allowed --keep-row). Best-effort: missing keys on
-        # the fake / real S3 are fine; other errors are surfaced as
-        # warnings without aborting cleanup of the remaining keys.
-        failed: list[tuple[str, str]] = []
-        for key in keys:
-            try:
-                await oc.delete_object(bucket=bucket, key=key)
-            except Exception as e:
-                failed.append((key, str(e)))
-
         click.echo(
-            f"released {filing_id}: deleted "
-            f"{len(keys) - len(failed)}/{len(keys)} object(s)"
+            f"released {filing_id}: deleted {len(keys)} object(s)"
             + (" (DB row kept)" if keep_row else " + DB row")
         )
-        for key, err in failed:
-            click.echo(f"warning: failed to delete {key}: {err}", err=True)
     finally:
         await engine.dispose()
