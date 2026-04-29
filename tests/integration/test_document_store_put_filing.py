@@ -707,6 +707,73 @@ async def test_release_result_deletes_all_manifest_keys(
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_put_filing_auto_sets_previous_filing_id_for_new_bytes_same_ref(
+    session: AsyncSession,
+    object_storage_fake: object,
+) -> None:
+    """Spec §5.4 case C: new bytes for an existing source_filing_ref —
+    put_filing auto-detects the prior latest revision and overrides
+    previous_filing_id + is_amendment in the INSERT, regardless of
+    caller-supplied defaults. The new row's revision_no advances; the
+    chain links v2 → v1."""
+    from aslan_core.documents.client import DocumentStore
+
+    run_id = await _seed(session)
+    store = DocumentStore(
+        session,
+        object_client=object_storage_fake,  # type: ignore[arg-type]
+        ingestion_run_id=run_id,
+    )
+
+    # v1 — first revision; caller passes no previous_filing_id (default None).
+    r1 = await store.put_filing(
+        source_id="kap",
+        source_filing_ref="CHAIN-1",
+        entity_id=None,
+        kind="news",
+        title="t",
+        published_at=datetime(2026, 4, 28, tzinfo=UTC),
+        primary_bytes=b"v1-bytes",
+        primary_mime="text/html",
+        primary_filename="main.html",
+    )
+    await session.commit()
+    assert r1.created is True
+    assert r1.revision_no == 1
+    assert r1.is_revision is False
+    assert r1.filing.previous_filing_id is None
+    assert r1.filing.is_amendment is False
+    v1_id = r1.filing.filing_id
+
+    # v2 — DIFFERENT bytes, SAME source_filing_ref. Caller again leaves
+    # previous_filing_id at the default. put_filing must auto-detect.
+    r2 = await store.put_filing(
+        source_id="kap",
+        source_filing_ref="CHAIN-1",
+        entity_id=None,
+        kind="news",
+        title="t",
+        published_at=datetime(2026, 4, 28, tzinfo=UTC),
+        primary_bytes=b"v2-bytes",
+        primary_mime="text/html",
+        primary_filename="main.html",
+    )
+    await session.commit()
+    assert r2.created is True
+    assert r2.revision_no == 2
+    assert r2.is_revision is True
+    # The chain link is set automatically.
+    assert r2.filing.previous_filing_id == v1_id
+    assert r2.filing.is_amendment is True
+
+    # find_by_source_ref returns the latest revision (v2).
+    latest = await store.find_by_source_ref(source_id="kap", source_filing_ref="CHAIN-1")
+    assert latest is not None
+    assert latest.filing_id == r2.filing.filing_id
+    assert latest.revision_no == 2
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_caller_rollback_without_release_leaves_orphans(
     session: AsyncSession,
     object_storage_fake: object,
