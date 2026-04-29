@@ -490,7 +490,6 @@ async def _release_impl(filing_id: UUID, keep_row: bool) -> None:
             keys: list[str] = [filing.primary_object_key]
             if filing.xbrl_object_key:
                 keys.append(filing.xbrl_object_key)
-
             att_rows = (
                 await s.execute(
                     text(
@@ -502,14 +501,31 @@ async def _release_impl(filing_id: UUID, keep_row: bool) -> None:
             ).all()
             keys.extend(r.object_key for r in att_rows)
 
-            for key in keys:
-                # Idempotent: missing keys on the fake / S3 are fine.
-                await oc.delete_object(bucket=bucket, key=key)
-
             if not keep_row:
-                # ON DELETE CASCADE on doc.filing_attachment.filing_id removes
-                # attachment rows; doc.filing_body uses filing_id as PK so we
-                # delete it explicitly to avoid an orphan body row.
+                # Codex 2026-04-29: preflight the chain-FK before any
+                # bucket mutation. doc.filing.previous_filing_id has no
+                # ON DELETE CASCADE, so a release that orphans a
+                # downstream revision raises IntegrityError on the
+                # final DELETE — which would surface AFTER the blobs
+                # are already gone. Block it here with a clear UX.
+                downstream = await s.scalar(
+                    text("SELECT 1 FROM doc.filing WHERE previous_filing_id = :fid LIMIT 1"),
+                    {"fid": filing_id},
+                )
+                if downstream:
+                    raise click.ClickException(
+                        f"cannot release {filing_id}: a later revision "
+                        "references this filing via previous_filing_id. "
+                        "Release the leaf revision first, or pass "
+                        "--keep-row to keep the DB row and only clean "
+                        "up bucket objects."
+                    )
+
+                # DB row delete + COMMIT must happen BEFORE any bucket
+                # mutation, so a bucket failure cannot leave us with
+                # live rows pointing at missing blobs. Codex 2026-04-29:
+                # reversed from prior order (was: blobs first, rows
+                # after) which had the inverse failure mode.
                 await s.execute(
                     text("DELETE FROM doc.filing_body WHERE filing_id = :fid"),
                     {"fid": filing_id},
@@ -518,10 +534,25 @@ async def _release_impl(filing_id: UUID, keep_row: bool) -> None:
                     text("DELETE FROM doc.filing WHERE filing_id = :fid"),
                     {"fid": filing_id},
                 )
+                await s.commit()
+
+        # Bucket cleanup AFTER the DB transaction is committed (or after
+        # preflight allowed --keep-row). Best-effort: missing keys on
+        # the fake / real S3 are fine; other errors are surfaced as
+        # warnings without aborting cleanup of the remaining keys.
+        failed: list[tuple[str, str]] = []
+        for key in keys:
+            try:
+                await oc.delete_object(bucket=bucket, key=key)
+            except Exception as e:
+                failed.append((key, str(e)))
 
         click.echo(
-            f"released {filing_id}: deleted {len(keys)} object(s)"
+            f"released {filing_id}: deleted "
+            f"{len(keys) - len(failed)}/{len(keys)} object(s)"
             + (" (DB row kept)" if keep_row else " + DB row")
         )
+        for key, err in failed:
+            click.echo(f"warning: failed to delete {key}: {err}", err=True)
     finally:
         await engine.dispose()

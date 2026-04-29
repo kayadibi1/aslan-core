@@ -201,6 +201,105 @@ async def test_doc_release_unknown_filing_id_exits_nonzero(
     assert result.exit_code != 0
 
 
+async def test_doc_release_blocks_mid_chain_with_blobs_intact(
+    session: AsyncSession,
+    object_storage_fake: InMemoryFake,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Codex 2026-04-29: releasing a filing that a later revision
+    references via previous_filing_id must abort BEFORE any bucket
+    object is touched.
+
+    The chain self-FK doc.filing.previous_filing_id has no ON DELETE
+    CASCADE; without preflight, the CLI would delete blobs first, then
+    fail on the row DELETE — leaving live rows pointing at missing
+    blobs. Verifies: clear error message, non-zero exit, both v1 and
+    v2 blobs and rows survive untouched.
+    """
+    from aslan_core.cli.main import cli
+
+    await _seed_sources(session)
+    _patch_factory(monkeypatch, object_storage_fake)
+
+    # v1 — creates the chain head.
+    v1_file = tmp_path / "v1.html"
+    v1_file.write_bytes(b"<html>v1</html>")
+    v1_result = await _invoke(
+        cli,
+        [
+            "doc",
+            "put",
+            "--source-id",
+            "manual",
+            "--source-ref",
+            "CHAIN-MID",
+            "--kind",
+            "news",
+            "--title",
+            "Chain v1",
+            "--published-at",
+            "2026-04-28T12:00:00Z",
+            "--primary-file",
+            str(v1_file),
+            "--json",
+        ],
+    )
+    assert v1_result.exit_code == 0, f"v1 put failed: {v1_result.output}"
+    v1_id = UUID(json.loads(v1_result.output)["filing_id"])
+
+    # v2 — different bytes, same source_ref → put_filing auto-detects v1
+    # and links via previous_filing_id (spec §5.4 case C).
+    v2_file = tmp_path / "v2.html"
+    v2_file.write_bytes(b"<html>v2 different</html>")
+    v2_result = await _invoke(
+        cli,
+        [
+            "doc",
+            "put",
+            "--source-id",
+            "manual",
+            "--source-ref",
+            "CHAIN-MID",
+            "--kind",
+            "news",
+            "--title",
+            "Chain v2",
+            "--published-at",
+            "2026-04-28T13:00:00Z",
+            "--primary-file",
+            str(v2_file),
+            "--json",
+        ],
+    )
+    assert v2_result.exit_code == 0, f"v2 put failed: {v2_result.output}"
+
+    # Sanity: 2 filing rows + 2 blobs.
+    keys_before = set(object_storage_fake.all_keys())
+    assert len(keys_before) == 2
+    await session.rollback()
+    n_rows_before = await session.scalar(
+        text("SELECT COUNT(*) FROM doc.filing WHERE source_filing_ref = 'CHAIN-MID'")
+    )
+    assert n_rows_before == 2
+
+    # Try to release v1 (the mid-chain row). Must fail BEFORE touching
+    # any blob.
+    release_result = await _invoke(cli, ["doc", "release", str(v1_id)])
+    assert release_result.exit_code != 0
+    assert "previous_filing_id" in release_result.output
+
+    # Both blobs still in the bucket.
+    assert set(object_storage_fake.all_keys()) == keys_before
+
+    # Both rows still in the DB.
+    await session.rollback()
+    n_rows_after = await session.scalar(
+        text("SELECT COUNT(*) FROM doc.filing WHERE source_filing_ref = 'CHAIN-MID'")
+    )
+    assert n_rows_after == 2
+
+
 async def test_doc_put_infers_mime_when_not_passed(
     session: AsyncSession,
     object_storage_fake: InMemoryFake,
