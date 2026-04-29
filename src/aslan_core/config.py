@@ -15,12 +15,16 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    postgres_dsn: str = Field(validation_alias="ASLAN_PG_DSN")
+    # Credential-bearing fields are wrapped in ``SecretStr`` so that
+    # ``repr(Settings)`` and accidental ``logger.info(s)`` calls do not
+    # leak passwords. Unwrap with ``.get_secret_value()`` at the call
+    # site (engine DSN construction, S3 client config, Sentry init).
+    postgres_dsn: SecretStr = Field(validation_alias="ASLAN_PG_DSN")
     redis_url: str = Field(validation_alias="ASLAN_REDIS_URL")
     s3_endpoint: str = Field(validation_alias="ASLAN_S3_ENDPOINT")
     s3_region: str = Field(validation_alias="ASLAN_S3_REGION")
-    s3_access_key: str = Field(validation_alias="ASLAN_S3_ACCESS_KEY")
-    s3_secret_key: str = Field(validation_alias="ASLAN_S3_SECRET_KEY")
+    s3_access_key: SecretStr = Field(validation_alias="ASLAN_S3_ACCESS_KEY")
+    s3_secret_key: SecretStr = Field(validation_alias="ASLAN_S3_SECRET_KEY")
 
     # ── Audit (v0.3.0) ────────────────────────────────────────────────
     # If True, audit.record() raises AuditMissingActor when no actor is
@@ -89,7 +93,7 @@ class _DbConfig(BaseSettings):
         case_sensitive=False,
     )
 
-    postgres_dsn: str = Field(validation_alias="ASLAN_PG_DSN")
+    postgres_dsn: SecretStr = Field(validation_alias="ASLAN_PG_DSN")
 
     def __init__(self, **kw: Any) -> None:
         try:
@@ -103,5 +107,9 @@ def postgres_dsn_from_env() -> str:
 
     Use from DB-only entry points (CLI seed/registry/migrate) so a missing
     Redis or S3 env var doesn't mask a Postgres failure.
+
+    Returns the unwrapped DSN string (callers like SQLAlchemy/Alembic need
+    a plain ``str``). Inside the ``Settings`` object itself the DSN stays
+    wrapped in ``SecretStr`` so ``repr`` cannot leak it.
     """
-    return _DbConfig().postgres_dsn
+    return _DbConfig().postgres_dsn.get_secret_value()
