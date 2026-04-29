@@ -75,6 +75,14 @@ class ObservationConstraintViolation(ObservationError):
     pass
 
 
+class ObservationValidationError(ObservationError):
+    """Raised when an ObservationIn fails canonicalisation (e.g., NaN
+    or Inf in metadata, both ``value`` and ``value_text`` set, naive
+    datetime). Distinct from a Pydantic ValidationError so callers can
+    catch validation failures discovered during hashing without also
+    catching shape errors."""
+
+
 class DocumentError(AslanCoreError):
     pass
 
