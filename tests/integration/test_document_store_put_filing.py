@@ -706,3 +706,49 @@ async def test_release_result_deletes_all_manifest_keys(
 
     # All blobs gone
     assert object_storage_fake.all_keys() == set()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_caller_rollback_without_release_leaves_orphans(
+    session: AsyncSession,
+    object_storage_fake: object,
+) -> None:
+    """Spec §5.5 row 4: caller's outer-transaction rollback WITHOUT
+    calling release(result) leaves orphan blobs in the bucket. This is
+    the documented intentional behavior — out-of-band sweep eventually
+    reconciles primary by hash; result.object_keys is still in caller's
+    hands for deferred cleanup."""
+    from aslan_core.documents.client import DocumentStore
+    from aslan_core.schemas.filing import AttachmentIn
+
+    run_id = await _seed(session)
+    store = DocumentStore(session, object_client=object_storage_fake, ingestion_run_id=run_id)  # type: ignore[arg-type]
+
+    primary = b"<html>orphan-test</html>"
+    attachments = [
+        AttachmentIn(
+            bytes=b"att", mime="application/pdf", filename="att.pdf", role="exhibit", sequence=1
+        ),
+    ]
+
+    result = await store.put_filing(
+        source_id="kap",
+        source_filing_ref="ORPHAN-NO-RELEASE",
+        entity_id=None,
+        kind="news",
+        title="t",
+        published_at=datetime(2026, 4, 28, tzinfo=UTC),
+        primary_bytes=primary,
+        primary_mime="text/html",
+        primary_filename="main.html",
+        attachments=attachments,
+    )
+    # Caller does NOT call session.commit() — and does NOT call store.release()
+    await session.rollback()  # simulating caller-rollback
+
+    # Bucket still has the blobs — primary + att = 2 — orphans
+    assert len(object_storage_fake.all_keys()) == 2  # type: ignore[attr-defined]
+
+    # The manifest is still in caller's hands for deferred cleanup
+    assert len(result.object_keys) == 2
+    assert result.bucket == "aslan-filings"
