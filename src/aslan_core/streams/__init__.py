@@ -23,6 +23,7 @@ from aslan_core.streams.names import (
     STREAMS,
     normalize_bist_ticks_label,
 )
+from aslan_core.streams.producer import StreamProducer
 
 __all__ = [
     "PII_BEARING_STREAMS",
@@ -35,5 +36,6 @@ __all__ = [
     "ObservationBatchEvent",
     "StreamEntryRedactedEvent",
     "StreamEvent",
+    "StreamProducer",
     "normalize_bist_ticks_label",
 ]
