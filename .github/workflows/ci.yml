@@ -84,3 +84,19 @@ jobs:
         with:
           name: pip-audit-report
           path: pip-audit.json
+
+      # SBOM (Task 21, v0.3.0) — gated to tagged releases so we
+      # publish a CycloneDX bill-of-materials per shipped version
+      # without churning artifacts on every push.
+      - name: Generate SBOM
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          uv tool install cyclonedx-bom
+          uv tool run cyclonedx-py environment --output-file sbom.cyclonedx.json
+
+      - name: Upload SBOM
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom.cyclonedx.json
