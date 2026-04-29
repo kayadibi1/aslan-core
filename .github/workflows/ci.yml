@@ -59,7 +59,10 @@ jobs:
       - name: Sync project (with obs extras)
         run: uv sync --extra obs
       - name: Export locked requirements
-        run: uv export --extra obs --format requirements-txt --no-hashes --output-file requirements-locked.txt
+        # --no-emit-project: drop the editable `-e .` self-reference.
+        # pip-audit looks up every line on PyPI; aslan-core isn't there
+        # (and auditing the project against itself is meaningless).
+        run: uv export --extra obs --format requirements-txt --no-hashes --no-emit-project --output-file requirements-locked.txt
       - name: pip-audit (CVE scan)
         run: uv tool run pip-audit --strict --requirement requirements-locked.txt --format json --output pip-audit.json
       - name: Upload pip-audit report
