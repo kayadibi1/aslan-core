@@ -288,22 +288,25 @@ async def test_publish_unknown_stream_collapses_to_other_label(
 async def test_publish_stamps_traceparent_when_event_lacks_one(
     session: AsyncSession,
 ) -> None:
-    """When ``[obs]`` is installed, the producer injects the active OTel
-    span's traceparent header onto the event before INSERT. With no
-    active span, the helper returns None and the event field stays
-    None — both branches are covered by this single round-trip test
-    (the assertion only checks the non-active-span path because the
-    test does not configure a tracer).
+    """When ``[obs]`` is installed and an OTel span is active, the
+    producer injects the W3C ``traceparent`` header onto the event
+    before INSERT. The ``@traced`` decorator on ``StreamProducer.publish``
+    starts a span automatically, so a non-empty ``traceparent`` always
+    lands. With no SDK installed, the helper returns ``None`` and the
+    event payload's ``traceparent`` field stays ``None`` — both branches
+    are exercised inside :func:`_maybe_inject_traceparent`.
     """
     rid = await _seed_run(session)
     producer = StreamProducer(session=session, ingestion_run_id=rid)
     outbox_id = await producer.publish(_make_event())
     await session.commit()
     row = (await session.execute(select(Outbox).where(Outbox.outbox_id == outbox_id))).scalar_one()
-    # The payload's traceparent is whatever inject() emitted; on a base
-    # test environment with no span, that's None.
     assert "traceparent" in row.payload
-    assert row.payload["traceparent"] in (None, "")  # or a valid traceparent header
+    tp = row.payload["traceparent"]
+    # Either (a) [obs] not installed → tp is None, or (b) [obs] is
+    # installed and an OTel span was active during publish → tp is a
+    # well-formed W3C traceparent ("00-<32 hex>-<16 hex>-<2 hex>").
+    assert tp is None or (isinstance(tp, str) and tp.startswith("00-"))
 
 
 @pytest.mark.asyncio(loop_scope="session")
