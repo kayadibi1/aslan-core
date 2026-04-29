@@ -8,8 +8,16 @@ Public methods land per task:
   ``None`` when the row does not exist (callers branch on ``None`` for
   "look first, then write" patterns; :class:`SeriesNotFound` is
   reserved for callers that explicitly assert presence).
-* ``latest`` (Task 21) and ``range`` (Task 22) land in subsequent
-  commits with ``DISTINCT ON (series_id, ts)`` PIT collapse.
+* :meth:`ObservationReader.latest` (Task 21) — latest observation by
+  ``ts`` for a series, with point-in-time (PIT) collapse over ``as_of``.
+* ``range`` (Task 22) lands in a subsequent commit with the same
+  PIT-collapse pattern over a half-open ``[ts_start, ts_end)`` window.
+
+Point-in-time semantics (codex F1, 2026-04-29). :meth:`latest` (and
+:meth:`range`, when it lands) uses ``DISTINCT ON (series_id, ts)`` so
+each ``(series_id, ts)`` collapses to exactly one row: the row with
+the maximum ``as_of <= pit``. Without this, a restated observation
+appears as multiple rows in the result.
 
 Reader is read-only — no audit events, no actor stamping, no
 strict-mode checks. Strict-mode applies only to mutations.
@@ -17,11 +25,13 @@ strict-mode checks. Strict-mode applies only to mutations.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aslan_core.observability.tracing import traced
-from aslan_core.schemas.timeseries import Series, SubjectRef
+from aslan_core.schemas.timeseries import Observation, Series, SubjectRef
 
 
 class ObservationReader:
@@ -89,4 +99,61 @@ class ObservationReader:
             subjects=tuple(SubjectRef(subject_id=r.subject_id, role=r.role) for r in subj_rows),
             created_at=row.created_at,
             updated_at=row.updated_at,
+        )
+
+    @traced("ObservationReader.latest")
+    async def latest(
+        self,
+        series_id: int,
+        *,
+        as_of: datetime | None = None,
+    ) -> Observation | None:
+        """Latest observation by ``ts`` for ``series_id`` with PIT
+        collapse over ``as_of``.
+
+        For each ``(series_id, ts)``, ``DISTINCT ON`` keeps only the
+        row with the maximum ``as_of <= pit`` (or the maximum ``as_of``
+        full-stop when ``pit`` is ``None``). The outer ``LIMIT 1`` then
+        picks the most-recent ``ts``.
+
+        ``ORDER BY series_id ASC, ts DESC, as_of DESC`` is critical
+        (codex F17, 2026-04-29): an OLDER ``ts`` whose restatement
+        carries the globally-largest ``as_of`` must NOT win. ``ts``
+        priority comes BEFORE ``as_of`` priority.
+
+        ``as_of=None`` semantics: returns the latest known fact
+        regardless of recording time — equivalent to ``pit=+inf``. The
+        WHERE clause becomes ``:pit IS NULL OR as_of <= :pit`` which is
+        always true; DISTINCT ON still collapses on ``(series_id, ts)``
+        keeping the highest ``as_of`` per ``ts``.
+        """
+        row = (
+            await self._s.execute(
+                text(
+                    "SELECT * FROM ("
+                    "  SELECT DISTINCT ON (series_id, ts) "
+                    "    series_id, ts, as_of, value, value_text, "
+                    "    quality_flag, ingestion_run_id, metadata "
+                    "  FROM ts.observation "
+                    "  WHERE series_id = :sid "
+                    "    AND (CAST(:pit AS TIMESTAMPTZ) IS NULL "
+                    "         OR as_of <= CAST(:pit AS TIMESTAMPTZ)) "
+                    "  ORDER BY series_id, ts DESC, as_of DESC"
+                    ") sub "
+                    "ORDER BY ts DESC LIMIT 1"
+                ),
+                {"sid": series_id, "pit": as_of},
+            )
+        ).first()
+        if row is None:
+            return None
+        return Observation(
+            series_id=row.series_id,
+            ts=row.ts,
+            as_of=row.as_of,
+            value=row.value,
+            value_text=row.value_text,
+            quality_flag=row.quality_flag,
+            ingestion_run_id=row.ingestion_run_id,
+            metadata=row.metadata if row.metadata is not None else {},
         )
