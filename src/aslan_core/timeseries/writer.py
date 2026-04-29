@@ -105,8 +105,54 @@ class ObservationWriter:
                 actor=actor,
                 subjects=subjects,
             )
-        # Idempotent / field-change paths land in Tasks 9 + 10.
-        raise NotImplementedError("Tasks 9 + 10 land idempotent + field-change paths")
+
+        # Compare every relevant field. If all match, idempotent path.
+        same = (
+            existing.source_id == source_id
+            and existing.entity_id == entity_id
+            and existing.metric == metric
+            and existing.frequency == frequency
+            and existing.unit == unit
+            and existing.currency_code == currency_code
+            and existing.restatement_basis == restatement_basis
+            and existing.accounting_standard == accounting_standard
+            and existing.consolidation == consolidation
+            and existing.period_type == period_type
+            and existing.description == description
+            and existing.pii_class == pii_class
+            and existing.metadata == meta
+        )
+        if same:
+            existing_payload: dict[str, Any] = {
+                "series_id": existing.series_id,
+                "series_code": series_code,
+                "source_id": existing.source_id,
+                "metric": existing.metric,
+                "frequency": existing.frequency,
+                "unit": existing.unit,
+                "pii_class": existing.pii_class,
+                "restatement_basis": existing.restatement_basis,
+                "metadata": existing.metadata,
+            }
+            # Codex F1: NO row update. Original creator's audit cols are
+            # preserved forever. The event row carries the retrying
+            # actor so forensics still see "user X retried at time Z".
+            await audit_record(
+                self._s,
+                record=AuditRecord(
+                    operation="series.idempotent_hit",
+                    target_schema="ts",
+                    target_table="series_catalog",
+                    target_pk={"series_id": existing.series_id},
+                    before=existing_payload,
+                    after=existing_payload,
+                    ingestion_run_id=self._run_id,
+                    metadata={"returned_existing": True},
+                ),
+            )
+            return SeriesUpsertResult(series_id=int(existing.series_id), created=False)
+        # Field-change path lands in Task 10.
+        raise NotImplementedError("Task 10 — field-change path")
 
     async def _upsert_series_fresh(
         self,
