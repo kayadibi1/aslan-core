@@ -237,6 +237,11 @@ class ObservationWriter:
             and existing.metadata == meta
         )
         if same:
+            # Subjects round-trip even on the idempotent catalog path so
+            # newly-passed subject handles append (the catalog row is
+            # untouched per F1, but ts.series_subject is additive via
+            # ON CONFLICT DO NOTHING).
+            await self._persist_subjects(int(existing.series_id), subjects, actor)
             existing_payload: dict[str, Any] = {
                 "series_id": existing.series_id,
                 "series_code": series_code,
@@ -339,6 +344,7 @@ class ObservationWriter:
                 "rid": actor.request_id if actor else None,
             },
         )
+        await self._persist_subjects(int(existing.series_id), subjects, actor)
         after_payload: dict[str, Any] = {
             **before_payload,
             "source_id": source_id,
@@ -430,6 +436,7 @@ class ObservationWriter:
             },
         )
         sid = int(sid_raw)
+        await self._persist_subjects(sid, subjects, actor)
         after_payload: dict[str, Any] = {
             "series_id": sid,
             "series_code": series_code,
@@ -454,3 +461,43 @@ class ObservationWriter:
             ),
         )
         return SeriesUpsertResult(series_id=sid, created=True)
+
+    async def _persist_subjects(
+        self,
+        series_id: int,
+        subjects: tuple[SubjectRef, ...],
+        actor: Actor | None,
+    ) -> None:
+        """Insert subject handles into ``ts.series_subject`` in the
+        same transaction as the catalog row.
+
+        Idempotent at the ``(series_id, subject_id, role)`` level via
+        ``ON CONFLICT DO NOTHING``: re-passing the same subjects on a
+        subsequent call is a no-op. Removing subjects requires the
+        Art. 17 deletion path (NOT v0.4 — lives in aslan-service).
+
+        If a SubjectRef's role fails the migration-0013 CHECK, the
+        INSERT raises and rolls back the whole upsert via the caller's
+        transaction (codex F4 atomic same-transaction contract).
+        """
+        if not subjects:
+            return
+        await self._s.execute(
+            text(
+                "INSERT INTO ts.series_subject "
+                "(series_id, subject_id, role, actor_id, actor_kind, request_id) "
+                "VALUES (:sid, :subj, :role, :aid, :ak, :rid) "
+                "ON CONFLICT (series_id, subject_id, role) DO NOTHING"
+            ),
+            [
+                {
+                    "sid": series_id,
+                    "subj": s.subject_id,
+                    "role": s.role,
+                    "aid": actor.actor_id if actor else None,
+                    "ak": actor.actor_kind if actor else None,
+                    "rid": actor.request_id if actor else None,
+                }
+                for s in subjects
+            ],
+        )
