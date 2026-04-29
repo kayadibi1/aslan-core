@@ -18,6 +18,7 @@ from aslan_core.audit import (
 from aslan_core.audit import record as audit_record
 from aslan_core.documents.object_storage import ObjectStorageClient
 from aslan_core.errors import DocumentDBError, DocumentNotFound, ObjectStoreError
+from aslan_core.observability import metrics
 from aslan_core.schemas.filing import AttachmentIn, Filing, PutFilingResult
 
 _log = structlog.get_logger(__name__)
@@ -646,6 +647,16 @@ class DocumentStore:
                 ),
             )
 
+            # Prometheus: count put_filing calls labelled by
+            # (source_id, kind, created). created="true"|"false"
+            # distinguishes fresh inserts from hash-dedup hits — the
+            # case-distribution telemetry the spec calls for.
+            metrics.filing_puts.labels(
+                source_id=source_id,
+                kind=kind,
+                created="true" if created else "false",
+            ).inc()
+
             return PutFilingResult(
                 filing=filing,
                 created=created,
@@ -791,11 +802,22 @@ class DocumentStore:
                 ingestion_run_id=self._run_id,
             ),
         )
+        all_deleted = True
         for key in result.object_keys:
             try:
                 await self._oc.delete_object(bucket=result.bucket, key=key)
             except Exception as e:
+                all_deleted = False
                 _log_orphan_cleanup_failed(result.bucket, key, e)
+        # Prometheus: count release calls by (source_id, success).
+        # success="true" iff every blob delete succeeded; orphans are
+        # tracked separately via aslan_object_storage_orphans_total
+        # so dashboards can quantify "release with orphans" vs
+        # "release with no failures".
+        metrics.filing_releases.labels(
+            source_id=result.filing.source_id,
+            success="true" if all_deleted else "false",
+        ).inc()
 
     async def attach_extracted_text(
         self, filing_id: UUID, text_body: str, *, lang: str = "tr"
@@ -954,7 +976,12 @@ def _filing_audit_payload(f: Filing) -> dict[str, Any]:
 
 
 def _log_orphan_cleanup_failed(bucket: str, key: str, exc: Exception) -> None:
-    """Structured-log helper for orphan cleanup failures."""
+    """Structured-log helper for orphan cleanup failures.
+
+    Also increments :data:`aslan_observability.metrics.object_storage_orphans`
+    so SREs see orphan-blob alerts in Prometheus rather than only in
+    structured logs.
+    """
     _log.warning(
         "orphan_cleanup_failed",
         bucket=bucket,
@@ -962,6 +989,7 @@ def _log_orphan_cleanup_failed(bucket: str, key: str, exc: Exception) -> None:
         error=str(exc),
         error_type=type(exc).__name__,
     )
+    metrics.object_storage_orphans.labels(bucket=bucket).inc()
 
 
 def _row_to_filing(row: Any) -> Filing:

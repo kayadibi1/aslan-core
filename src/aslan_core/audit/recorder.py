@@ -176,3 +176,10 @@ async def record(
             "metadata": json.dumps(record.metadata, default=str),
         },
     )
+
+    # Prometheus: count audit events by (operation, actor_kind). The
+    # metric is a no-op when prometheus_client is not installed (the
+    # base venv without [obs] extra) — see metrics module docstring.
+    from aslan_core.observability import metrics
+
+    metrics.audit_events.labels(operation=record.operation, actor_kind=actor_kind).inc()

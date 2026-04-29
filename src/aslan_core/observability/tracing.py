@@ -30,6 +30,7 @@ either no-op or run the wrapped method without the SDK present.
 from __future__ import annotations
 
 import functools
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any, ParamSpec, TypeVar
 
@@ -96,23 +97,40 @@ def traced(
     def deco(fn: Callable[P, Awaitable[T]]) -> Callable[P, Awaitable[T]]:
         @functools.wraps(fn)
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
-            tracer = _get_tracer_or_none()
-            if tracer is None:
-                # No OTel installed — run the coroutine without
-                # instrumentation so base-install consumers still work.
-                return await fn(*args, **kwargs)
             cls_name = type(args[0]).__name__ if args else ""
-            name = operation_name or (f"{cls_name}.{fn.__name__}" if cls_name else fn.__name__)
-            with tracer.start_as_current_span(name) as span:
-                # Lazy import inside the call to avoid a circular
-                # ``tracing → audit → tracing`` chain at module load.
-                from aslan_core.audit import current_actor
+            span_name = operation_name or (f"{cls_name}.{fn.__name__}" if cls_name else fn.__name__)
+            tracer = _get_tracer_or_none()
+            # Always time the call so the histogram increments even
+            # when OTel is not installed (Prometheus + OTel are
+            # independent concerns; histogram timing only needs a
+            # monotonic clock).
+            start = time.perf_counter()
+            try:
+                if tracer is None:
+                    # No OTel installed — run the coroutine without
+                    # span instrumentation so base-install consumers
+                    # still work. The histogram observation below
+                    # still runs (no-op without prometheus_client).
+                    return await fn(*args, **kwargs)
+                with tracer.start_as_current_span(span_name) as span:
+                    # Lazy import inside the call to avoid a circular
+                    # ``tracing → audit → tracing`` chain at module load.
+                    from aslan_core.audit import current_actor
 
-                a = current_actor()
-                if a is not None:
-                    span.set_attribute("actor.id", a.actor_id)
-                    span.set_attribute("actor.kind", a.actor_kind)
-                return await fn(*args, **kwargs)
+                    a = current_actor()
+                    if a is not None:
+                        span.set_attribute("actor.id", a.actor_id)
+                        span.set_attribute("actor.kind", a.actor_kind)
+                    return await fn(*args, **kwargs)
+            finally:
+                # Histogram: per-public-method DB-phase wall clock.
+                # Lazy import to keep ``traced`` itself
+                # circular-import-safe (metrics → nothing observable).
+                from aslan_core.observability import metrics
+
+                metrics.db_query_duration.labels(operation=span_name).observe(
+                    time.perf_counter() - start
+                )
 
         return wrapper
 

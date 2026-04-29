@@ -23,6 +23,7 @@ from aslan_core.errors import (
     IdentifierConflict,
     RegistryConstraintViolation,
 )
+from aslan_core.observability import metrics
 from aslan_core.schemas.entity import Entity, EntityMatch
 
 
@@ -197,6 +198,7 @@ class EntityRegistryClient:
         match_eids = {r.entity_id for r in rows}
 
         if len(match_eids) > 1:
+            metrics.entity_merge_required.labels(source_id=my_source).inc()
             raise EntityMergeRequired(
                 f"identifiers map to {len(match_eids)} distinct entities: {match_eids}",
             )
@@ -209,12 +211,14 @@ class EntityRegistryClient:
             # then "merge" into it on the next create_entity call.
             target_entity = await self.get(target_eid)
             if target_entity.source_id != my_source:
+                metrics.entity_merge_required.labels(source_id=my_source).inc()
                 raise EntityMergeRequired(
                     f"target entity {target_eid} owned by "
                     f"source_id={target_entity.source_id}; current run is {my_source}",
                 )
             for r in rows:
                 if r.source_id != my_source:
+                    metrics.entity_merge_required.labels(source_id=my_source).inc()
                     raise EntityMergeRequired(
                         f"identifier ({r.namespace}={r.value}) was written by "
                         f"source_id={r.source_id}; current run is {my_source}",
@@ -284,6 +288,11 @@ class EntityRegistryClient:
             before=None,
             after=new_entity.model_dump(mode="json"),
         )
+        # Prometheus: count fresh entity creates per source. Idempotent
+        # hits (already-resolved identifiers) are NOT counted here —
+        # those return earlier and emit entity.idempotent_hit, which
+        # is observable via aslan_audit_events_total.
+        metrics.entity_creates.labels(source_id=my_source).inc()
         return new_entity
 
     async def add_identifier(

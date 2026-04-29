@@ -14,10 +14,12 @@ incremented or observed.
 
 from __future__ import annotations
 
+from aslan_core.observability import metrics
 from aslan_core.observability.sentry import setup_sentry
 from aslan_core.observability.tracing import setup_tracing, traced
 
 __all__ = [
+    "metrics",
     "setup_sentry",
     "setup_tracing",
     "traced",
