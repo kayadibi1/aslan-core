@@ -515,3 +515,63 @@ async def test_atomicity_blob_delete_fail_after_db_fail_logs_orphan(
     # The orphan key should be in the log entry for recovery
     assert "main.html" in log_entry.get("key", "")
     assert log_entry.get("bucket") == "aslan-filings"
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_atomicity_hash_dedup_deletes_just_uploaded_blob(
+    session: AsyncSession,
+    object_storage_fake: object,
+) -> None:
+    """Spec §5.5 row 5 + codex 2026-04-28 fix: second put_filing with
+    identical bytes hash-dedup hits, just-uploaded blob is deleted, the
+    existing row's blob is untouched, returns created=False with the
+    existing row's revision_no."""
+    from aslan_core.documents.client import DocumentStore
+
+    run_id = await _seed(session)
+    store = DocumentStore(session, object_client=object_storage_fake, ingestion_run_id=run_id)  # type: ignore[arg-type]
+
+    body = b"<html>same bytes both calls</html>"
+
+    # First call — fresh insert
+    r1 = await store.put_filing(
+        source_id="kap",
+        source_filing_ref="DEDUP-1",
+        entity_id=None,
+        kind="news",
+        title="t",
+        published_at=datetime(2026, 4, 28, tzinfo=UTC),
+        primary_bytes=body,
+        primary_mime="text/html",
+        primary_filename="main.html",
+    )
+    await session.commit()
+    assert r1.created is True
+    assert len(object_storage_fake.all_keys()) == 1  # type: ignore[attr-defined]
+    initial_keys = object_storage_fake.all_keys()  # type: ignore[attr-defined]
+
+    # Second call — same bytes, same source_ref → hash dedup
+    r2 = await store.put_filing(
+        source_id="kap",
+        source_filing_ref="DEDUP-1",
+        entity_id=None,
+        kind="news",
+        title="t",
+        published_at=datetime(2026, 4, 28, tzinfo=UTC),
+        primary_bytes=body,
+        primary_mime="text/html",
+        primary_filename="main.html",
+    )
+    await session.commit()
+
+    # created=False; revision_no matches first call (same row)
+    assert r2.created is False
+    assert r2.revision_no == r1.revision_no
+    assert r2.filing.filing_id == r1.filing.filing_id
+
+    # Bucket still has exactly the original blob (the just-uploaded
+    # blob from the second call was deleted by the codex fix)
+    assert object_storage_fake.all_keys() == initial_keys  # type: ignore[attr-defined]
+
+    # Manifest is empty (no committed objects from the dedup-hit call)
+    assert r2.object_keys == []
