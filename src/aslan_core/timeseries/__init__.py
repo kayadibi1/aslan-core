@@ -20,9 +20,11 @@ from aslan_core.timeseries.pii import (
     path_to_jsonb_set_text_array,
     scrub_in_python,
 )
+from aslan_core.timeseries.reader import ObservationReader
 from aslan_core.timeseries.writer import ObservationWriter
 
 __all__ = [
+    "ObservationReader",
     "ObservationWriter",
     "PiiFinding",
     "find_pii_in_clear_text",
