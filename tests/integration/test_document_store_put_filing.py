@@ -653,3 +653,56 @@ async def test_atomicity_attachment_insert_fail_outer_cleanup_deletes_everything
         text("SELECT COUNT(*) FROM doc.filing WHERE source_filing_ref = 'ATT-FAIL'")
     )
     assert n_filings == 0
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_release_result_deletes_all_manifest_keys(
+    session: AsyncSession,
+    object_storage_fake: object,
+) -> None:
+    """Caller put_filing → release(result) deletes every blob in the
+    manifest (primary + xbrl + attachments). codex 2026-04-28: release()
+    reads from PutFilingResult.object_keys, NOT from doc.filing_attachment."""
+    from aslan_core.documents.client import DocumentStore
+    from aslan_core.schemas.filing import AttachmentIn
+
+    run_id = await _seed(session)
+    store = DocumentStore(session, object_client=object_storage_fake, ingestion_run_id=run_id)  # type: ignore[arg-type]
+
+    primary = b"<html>main</html>"
+    xbrl = b"<xbrl>data</xbrl>"
+    attachments = [
+        AttachmentIn(
+            bytes=b"ex1", mime="application/pdf", filename="ex1.pdf", role="exhibit", sequence=1
+        ),
+        AttachmentIn(
+            bytes=b"ex2", mime="application/pdf", filename="ex2.pdf", role="exhibit", sequence=2
+        ),
+    ]
+
+    result = await store.put_filing(
+        source_id="kap",
+        source_filing_ref="RELEASE-1",
+        entity_id=None,
+        kind="financial_report",
+        title="With everything",
+        published_at=datetime(2026, 4, 28, tzinfo=UTC),
+        primary_bytes=primary,
+        primary_mime="text/html",
+        primary_filename="main.html",
+        attachments=attachments,
+        has_xbrl=True,
+        xbrl_bytes=xbrl,
+        xbrl_filename="report.xbrl",
+    )
+    await session.commit()
+
+    # Bucket has 4 blobs (primary + xbrl + 2 attachments)
+    assert len(object_storage_fake.all_keys()) == 4  # type: ignore[attr-defined]
+    assert len(result.object_keys) == 4
+
+    # Caller decides to roll back. release(result) cleans up the bucket.
+    await store.release(result)
+
+    # All blobs gone
+    assert object_storage_fake.all_keys() == set()  # type: ignore[attr-defined]

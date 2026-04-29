@@ -399,6 +399,34 @@ class DocumentStore:
                 },
             )
 
+    async def release(self, result: PutFilingResult) -> None:
+        """Delete every in-bucket object recorded in the put_filing manifest.
+
+        Caller pattern (outer-transaction rollback):
+
+            result = await store.put_filing(...)
+            try:
+                ...  # caller's outer work that may need to roll back
+            except SomeError:
+                await store.release(result)  # clean up bucket FIRST
+                raise  # ... and let the rollback discard the DB rows
+
+        Why the manifest (codex 2026-04-28): a Filing-based release that
+        queried doc.filing_attachment for keys is unsound, because those
+        rows may be invisible (uncommitted) or gone (already rolled back)
+        at release-time. PutFilingResult.object_keys captures every
+        uploaded key durably during put_filing — works regardless of what
+        the surrounding transaction is doing.
+
+        Best-effort per key; logs orphans on individual delete failure but
+        does NOT raise.
+        """
+        for key in result.object_keys:
+            try:
+                await self._oc.delete_object(bucket=result.bucket, key=key)
+            except Exception as e:
+                _log_orphan_cleanup_failed(result.bucket, key, e)
+
     async def attach_extracted_text(
         self, filing_id: UUID, text_body: str, *, lang: str = "tr"
     ) -> None:
