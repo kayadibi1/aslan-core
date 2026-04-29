@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
 from aslan_core.documents.object_storage import InMemoryFake
 
@@ -451,3 +452,66 @@ async def test_atomicity_db_upsert_fail_after_upload_cleans_up_blob(
     assert (
         fake.all_keys() == set()
     ), "expected primary blob to be deleted by cleanup loop in put_filing's except"
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_atomicity_blob_delete_fail_after_db_fail_logs_orphan(
+    session: AsyncSession,
+) -> None:
+    """Spec §5.5 row 3: blob delete fails after DB failure → original
+    error still propagates AND orphan_cleanup_failed log emitted with
+    the orphan key for recovery."""
+    from unittest.mock import patch
+
+    from aslan_core.documents.client import DocumentStore
+    from aslan_core.errors import DocumentDBError
+
+    run_id = await _seed(session)
+
+    fake = _FakeWithControlledFailure()
+    fake.fail_delete_object_substring = ["main.html"]  # delete fails for the primary
+
+    store = DocumentStore(session, object_client=fake, ingestion_run_id=run_id)
+
+    body = b"<html>db-fail-and-delete-fail</html>"
+
+    # Monkey-patch DB INSERT to raise
+    real_execute = session.execute
+
+    async def _failing_execute(stmt: Any, *args: Any, **kwargs: Any) -> Any:
+        sql = str(stmt)
+        if "INSERT INTO doc.filing " in sql:
+            raise RuntimeError("simulated DB failure")
+        return await real_execute(stmt, *args, **kwargs)
+
+    with (
+        capture_logs() as logs,
+        patch.object(session, "execute", side_effect=_failing_execute),
+        pytest.raises(DocumentDBError),
+    ):
+        await store.put_filing(
+            source_id="kap",
+            source_filing_ref="DOUBLE-FAIL",
+            entity_id=None,
+            kind="news",
+            title="t",
+            published_at=datetime(2026, 4, 28, tzinfo=UTC),
+            primary_bytes=body,
+            primary_mime="text/html",
+            primary_filename="main.html",
+        )
+
+    # The blob is still in the bucket because the cleanup delete failed
+    keys = fake.all_keys()
+    assert any(
+        "main.html" in k for (_, k) in keys
+    ), "expected the blob to remain (delete was forced to fail)"
+
+    # Structured orphan_cleanup_failed log emitted
+    orphan_logs = [log for log in logs if log.get("event") == "orphan_cleanup_failed"]
+    assert len(orphan_logs) >= 1
+    log_entry = orphan_logs[0]
+    assert log_entry.get("log_level") == "warning"
+    # The orphan key should be in the log entry for recovery
+    assert "main.html" in log_entry.get("key", "")
+    assert log_entry.get("bucket") == "aslan-filings"
