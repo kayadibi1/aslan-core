@@ -165,3 +165,174 @@ async def test_put_filing_rejects_inconsistent_xbrl_args(
     # bytes provided with has_xbrl=False (default)
     with pytest.raises(ValueError, match="omit the xbrl"):
         await store.put_filing(**base_kwargs, xbrl_bytes=b"x", xbrl_filename="x.xbrl")  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_put_filing_with_attachments_uploads_each(
+    session: AsyncSession,
+    object_storage_fake: object,
+) -> None:
+    from aslan_core.documents.client import DocumentStore
+    from aslan_core.schemas.filing import AttachmentIn
+
+    run_id = await _seed(session)
+    store = DocumentStore(
+        session,
+        object_client=object_storage_fake,  # type: ignore[arg-type]
+        ingestion_run_id=run_id,
+    )
+
+    primary = b"<html>main</html>"
+    attachments = [
+        AttachmentIn(
+            bytes=b"exhibit1",
+            mime="application/pdf",
+            filename="ex1.pdf",
+            role="exhibit",
+            sequence=1,
+        ),
+        AttachmentIn(
+            bytes=b"exhibit2",
+            mime="application/pdf",
+            filename="ex2.pdf",
+            role="exhibit",
+            sequence=2,
+        ),
+    ]
+    result = await store.put_filing(
+        source_id="kap",
+        source_filing_ref="WITH-ATTS",
+        entity_id=None,
+        kind="material_event",
+        title="With attachments",
+        published_at=datetime(2026, 4, 28, tzinfo=UTC),
+        primary_bytes=primary,
+        primary_mime="text/html",
+        primary_filename="main.html",
+        attachments=attachments,
+    )
+    await session.commit()
+
+    assert result.created is True
+    # Manifest reflects primary + 2 attachments
+    assert len(result.object_keys) == 3
+    # 1 primary + 2 attachments = 3 keys in bucket
+    assert len(object_storage_fake.all_keys()) == 3  # type: ignore[attr-defined]
+    # 2 rows in doc.filing_attachment
+    att_count = await session.scalar(
+        text("SELECT COUNT(*) FROM doc.filing_attachment WHERE filing_id = :fid"),
+        {"fid": result.filing.filing_id},
+    )
+    assert att_count == 2
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_put_filing_attachment_re_upload_idempotent(
+    session: AsyncSession,
+    object_storage_fake: object,
+) -> None:
+    """ON CONFLICT (filing_id, sha256) DO NOTHING — re-uploading same
+    bytes after a partial failure recovers cleanly with no duplicate row."""
+    from aslan_core.documents.client import DocumentStore
+    from aslan_core.schemas.filing import AttachmentIn
+
+    run_id = await _seed(session)
+    store = DocumentStore(
+        session,
+        object_client=object_storage_fake,  # type: ignore[arg-type]
+        ingestion_run_id=run_id,
+    )
+
+    primary = b"<html>main</html>"
+    a1 = AttachmentIn(
+        bytes=b"exhibit1",
+        mime="application/pdf",
+        filename="ex1.pdf",
+        role="exhibit",
+        sequence=1,
+    )
+
+    # Run 1
+    r1 = await store.put_filing(
+        source_id="kap",
+        source_filing_ref="ATT-IDEMPOTENT",
+        entity_id=None,
+        kind="news",
+        title="t",
+        published_at=datetime(2026, 4, 28, tzinfo=UTC),
+        primary_bytes=primary,
+        primary_mime="text/html",
+        primary_filename="main.html",
+        attachments=[a1],
+    )
+    await session.commit()
+
+    # Run 2 — same bytes hash-dedup primary; attachment INSERT idempotent on (filing_id, sha256)
+    r2 = await store.put_filing(
+        source_id="kap",
+        source_filing_ref="ATT-IDEMPOTENT",
+        entity_id=None,
+        kind="news",
+        title="t",
+        published_at=datetime(2026, 4, 28, tzinfo=UTC),
+        primary_bytes=primary,
+        primary_mime="text/html",
+        primary_filename="main.html",
+        attachments=[a1],
+    )
+    await session.commit()
+
+    assert r2.created is False  # hash dedup of the primary
+    # Same filing_id; attachment count unchanged at 1
+    assert r2.filing.filing_id == r1.filing.filing_id
+    att_count = await session.scalar(
+        text("SELECT COUNT(*) FROM doc.filing_attachment WHERE filing_id = :fid"),
+        {"fid": r1.filing.filing_id},
+    )
+    assert att_count == 1
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_attach_extracted_text_inserts_or_updates(
+    session: AsyncSession,
+    object_storage_fake: object,
+) -> None:
+    from aslan_core.documents.client import DocumentStore
+
+    run_id = await _seed(session)
+    store = DocumentStore(
+        session,
+        object_client=object_storage_fake,  # type: ignore[arg-type]
+        ingestion_run_id=run_id,
+    )
+
+    r = await store.put_filing(
+        source_id="kap",
+        source_filing_ref="TEXT-1",
+        entity_id=None,
+        kind="news",
+        title="t",
+        published_at=datetime(2026, 4, 28, tzinfo=UTC),
+        primary_bytes=b"<html>some content</html>",
+        primary_mime="text/html",
+        primary_filename="main.html",
+    )
+    await session.commit()
+
+    await store.attach_extracted_text(r.filing.filing_id, "Some extracted text", lang="tr")
+    await session.commit()
+
+    body = await session.scalar(
+        text("SELECT body_text FROM doc.filing_body WHERE filing_id = :fid"),
+        {"fid": r.filing.filing_id},
+    )
+    assert body == "Some extracted text"
+
+    # Re-extract: latest wins
+    await store.attach_extracted_text(r.filing.filing_id, "Updated text", lang="tr")
+    await session.commit()
+    body2 = await session.scalar(
+        text("SELECT body_text FROM doc.filing_body WHERE filing_id = :fid"),
+        {"fid": r.filing.filing_id},
+    )
+    assert body2 == "Updated text"

@@ -296,10 +296,22 @@ class DocumentStore:
                         _log_orphan_cleanup_failed(bucket, k, e)
                     _uploaded_keys.remove(k)
 
-            # Step 6: attachments — Task 15 will add this. Skip for
-            # Task 14.
+            # Step 6: attachments — per-attachment upload + INSERT.
+            # NO per-attachment cleanup; failures bubble to the outer except
+            # which deletes EVERY uploaded key (primary + xbrl + however many
+            # attachments uploaded). codex 2026-04-28: per-attachment cleanup
+            # is unsound because the filing INSERT and attachment INSERTs all
+            # live in the same uncommitted transaction.
             if attachments:
-                raise NotImplementedError("attachments handling lands in Task 15")
+                await self._persist_attachments(
+                    filing_id=actual_filing_id,
+                    attachments=attachments,
+                    bucket=bucket,
+                    source_id=source_id,
+                    entity_id=entity_id,
+                    published_at=published_at,
+                    _uploaded_keys=_uploaded_keys,
+                )
 
             filing = await self.get_filing(actual_filing_id)
             return PutFilingResult(
@@ -324,6 +336,88 @@ class DocumentStore:
             if isinstance(e, ObjectStoreError):
                 raise
             raise DocumentDBError(f"DocumentStore.put_filing failed during DB phase: {e}") from e
+
+    async def _persist_attachments(
+        self,
+        *,
+        filing_id: UUID,
+        attachments: list[AttachmentIn],
+        bucket: str,
+        source_id: str,
+        entity_id: UUID | None,
+        published_at: datetime,
+        _uploaded_keys: list[str],
+    ) -> None:
+        """Upload + INSERT each attachment. Each upload appends to
+        _uploaded_keys BEFORE its INSERT so put_filing's outer cleanup loop
+        (in the except block) sees every uploaded blob, even if a later
+        attachment's INSERT raises.
+
+        ON CONFLICT (filing_id, sha256) DO NOTHING makes per-attachment
+        INSERTs idempotent — retries after partial failure reconcile by
+        sha256 without duplicate rows.
+
+        Does NOT have its own try/except — failures bubble to put_filing.
+        """
+        for att in attachments:
+            att_sha = hashlib.sha256(att.bytes).hexdigest()
+            att_key = _format_object_key(
+                source_id=source_id,
+                entity_id=entity_id,
+                published_at=published_at,
+                filing_id=filing_id,
+                filename=att.filename,
+            )
+            # Upload first; track in manifest BEFORE the INSERT so the outer
+            # cleanup knows about every uploaded blob even if the subsequent
+            # INSERT raises.
+            await self._oc.put_object(
+                bucket=bucket,
+                key=att_key,
+                body=att.bytes,
+                content_type=att.mime,
+            )
+            _uploaded_keys.append(att_key)
+
+            await self._s.execute(
+                text(
+                    "INSERT INTO doc.filing_attachment ("
+                    "  filing_id, object_key, mime, sha256, bytes, role, sequence"
+                    ") VALUES ("
+                    "  :fid, :ok, :mime, :sha, :bytes, :role, :seq"
+                    ") "
+                    "ON CONFLICT (filing_id, sha256) DO NOTHING"
+                ),
+                {
+                    "fid": filing_id,
+                    "ok": att_key,
+                    "mime": att.mime,
+                    "sha": att_sha,
+                    "bytes": len(att.bytes),
+                    "role": att.role,
+                    "seq": att.sequence,
+                },
+            )
+
+    async def attach_extracted_text(
+        self, filing_id: UUID, text_body: str, *, lang: str = "tr"
+    ) -> None:
+        """Insert or replace the extracted text for a filing.
+
+        ON CONFLICT (filing_id) DO UPDATE — latest extraction wins.
+        Touches doc.filing_body.extracted_at on every call.
+        """
+        await self._s.execute(
+            text(
+                "INSERT INTO doc.filing_body (filing_id, body_text, body_lang, extracted_at) "
+                "VALUES (:fid, :body, :lang, now()) "
+                "ON CONFLICT (filing_id) DO UPDATE "
+                "  SET body_text = EXCLUDED.body_text, "
+                "      body_lang = EXCLUDED.body_lang, "
+                "      extracted_at = now()"
+            ),
+            {"fid": filing_id, "body": text_body, "lang": lang},
+        )
 
 
 # ─── Module-private helpers ────────────────────────────────────────────
