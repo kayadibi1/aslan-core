@@ -394,3 +394,132 @@ async def test_audit_event_batch_size_matches_batch_keys_count(
             f"event_id={r.event_id}: batch_size={r.metadata['batch_size']} "
             f"but {n_keys} batch_keys rows present"
         )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_intra_batch_duplicate_audit_invariant(
+    session: AsyncSession,
+) -> None:
+    """Codex Batch 3 F1, 2026-04-29: ``metadata.batch_size`` records
+    the POST-dedup row count (= matches ``observation_batch_keys`` row
+    count, the rows actually persisted). ``attempted`` records the
+    caller's request size. ``duplicate_count`` makes the gap explicit.
+
+    Previous shape conflated the two by setting ``batch_size`` to the
+    pre-dedup ``attempted`` count, which broke the invariant
+    ``COUNT(*) FROM observation_batch_keys WHERE event_id=:eid
+    == metadata.batch_size`` for any batch containing intra-batch
+    identical-payload duplicates.
+
+    This test feeds two ObservationIns with identical (series_id, ts,
+    as_of, payload_hash) and asserts:
+    - exactly ONE batch_keys row,
+    - ``metadata.batch_size == 1`` (matches batch_keys row count),
+    - ``metadata.attempted == 2`` (caller's request size),
+    - ``metadata.duplicate_count == 1`` (the explicit gap),
+    - the invariant ``COUNT(*) == metadata.batch_size`` holds.
+    """
+    rid = await _seed(session, "dup-inv")
+    set_actor(Actor(actor_id="user:dup", actor_kind="user"))
+    w = ObservationWriter(session, ingestion_run_id=rid)
+    sr = await w.upsert_series(
+        series_code="ab.dup",
+        source_id="kap",
+        metric="m",
+        frequency="1d",
+        unit="TRY",
+    )
+    await session.commit()
+
+    ts = datetime(2026, 7, 1, tzinfo=UTC)
+    as_of = datetime(2026, 7, 2, tzinfo=UTC)
+    obs = [
+        ObservationIn(ts=ts, as_of=as_of, value=1.0),
+        ObservationIn(ts=ts, as_of=as_of, value=1.0),  # identical duplicate
+    ]
+    await w.write(sr.series_id, obs)
+    await session.commit()
+
+    e = (
+        await session.execute(
+            text(
+                "SELECT event_id, occurred_at, metadata FROM audit.events "
+                "WHERE target_schema='ts' AND target_table='observation' "
+                "  AND ingestion_run_id = :rid"
+            ),
+            {"rid": rid},
+        )
+    ).one()
+
+    md = e.metadata
+    assert md["batch_size"] == 1, f"expected post-dedup batch_size=1, got {md['batch_size']}"
+    assert md["attempted"] == 2, f"expected attempted=2 (caller request), got {md['attempted']}"
+    assert md["duplicate_count"] == 1, (
+        f"expected duplicate_count=1, got {md.get('duplicate_count')}"
+    )
+
+    # The invariant: batch_keys rows == metadata.batch_size.
+    n_keys = await session.scalar(
+        text(
+            "SELECT COUNT(*) FROM audit.observation_batch_keys "
+            "WHERE event_id = :eid AND occurred_at = :oa"
+        ),
+        {"eid": e.event_id, "oa": e.occurred_at},
+    )
+    assert n_keys == md["batch_size"], (
+        f"invariant violated: {n_keys} batch_keys rows but batch_size={md['batch_size']}"
+    )
+
+    # And only one observation row landed in ts.observation.
+    n_obs = await session.scalar(
+        text("SELECT COUNT(*) FROM ts.observation WHERE series_id = :sid"),
+        {"sid": sr.series_id},
+    )
+    assert n_obs == 1
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_no_duplicate_count_when_no_duplicates(
+    session: AsyncSession,
+) -> None:
+    """Codex Batch 3 F1, 2026-04-29: when ``attempted == batch_size``
+    (no dedup happened) the audit metadata omits ``duplicate_count`` —
+    the field exists only when there's a gap to report. Keeps the
+    common-case event payload tight."""
+    rid = await _seed(session, "no-dup")
+    set_actor(Actor(actor_id="user:nd", actor_kind="user"))
+    w = ObservationWriter(session, ingestion_run_id=rid)
+    sr = await w.upsert_series(
+        series_code="ab.nd",
+        source_id="kap",
+        metric="m",
+        frequency="1d",
+        unit="TRY",
+    )
+    await session.commit()
+
+    obs = [
+        ObservationIn(
+            ts=datetime(2026, 8, d, tzinfo=UTC),
+            as_of=datetime(2026, 8, d + 1, tzinfo=UTC),
+            value=float(d),
+        )
+        for d in range(1, 4)
+    ]
+    await w.write(sr.series_id, obs)
+    await session.commit()
+
+    e = (
+        await session.execute(
+            text(
+                "SELECT metadata FROM audit.events "
+                "WHERE target_schema='ts' AND target_table='observation' "
+                "  AND ingestion_run_id = :rid"
+            ),
+            {"rid": rid},
+        )
+    ).one()
+    md = e.metadata
+    assert md["batch_size"] == 3
+    assert md["attempted"] == 3
+    assert "duplicate_count" not in md

@@ -974,6 +974,32 @@ class ObservationWriter:
         user_agent = actor.user_agent if actor else None
         request_id = actor.request_id if actor else None
 
+        # Codex Batch 3 F1, 2026-04-29: ``batch_size`` MUST equal the
+        # post-dedup row count so the invariant
+        # ``COUNT(*) FROM observation_batch_keys WHERE event_id=:eid
+        #   == metadata.batch_size`` holds. Previous shape conflated
+        # the caller's request size with the persisted-key count and
+        # broke the invariant for any batch containing intra-batch
+        # identical-payload duplicates. ``attempted`` keeps the
+        # caller's original request size for forensic visibility, and
+        # ``duplicate_count`` makes the gap explicit when present.
+        batch_size = len(deduped)
+        duplicate_count = attempted - batch_size
+        event_metadata: dict[str, Any] = {
+            "batch_size": batch_size,
+            "attempted": attempted,
+            "series_id": series_id,
+            "ts_min": ts_min.isoformat(),
+            "ts_max": ts_max.isoformat(),
+            "as_of_min": as_of_min.isoformat(),
+            "as_of_max": as_of_max.isoformat(),
+            "batch_payload_hash": batch_payload_hash,
+            "inserted": inserted,
+            "unchanged": unchanged,
+            "ingestion_run_id": self._run_id,
+        }
+        if duplicate_count > 0:
+            event_metadata["duplicate_count"] = duplicate_count
         event_id_raw = await self._s.scalar(
             text(
                 "INSERT INTO audit.events ("
@@ -995,21 +1021,7 @@ class ObservationWriter:
                 "rqid": request_id,
                 "run": self._run_id,
                 "pk": json.dumps({"series_id": series_id}),
-                "meta": json.dumps(
-                    {
-                        "batch_size": attempted,
-                        "series_id": series_id,
-                        "ts_min": ts_min.isoformat(),
-                        "ts_max": ts_max.isoformat(),
-                        "as_of_min": as_of_min.isoformat(),
-                        "as_of_max": as_of_max.isoformat(),
-                        "batch_payload_hash": batch_payload_hash,
-                        "inserted": inserted,
-                        "unchanged": unchanged,
-                        "ingestion_run_id": self._run_id,
-                    },
-                    default=str,
-                ),
+                "meta": json.dumps(event_metadata, default=str),
             },
         )
         event_id = int(event_id_raw) if event_id_raw is not None else 0
