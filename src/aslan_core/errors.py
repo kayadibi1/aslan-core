@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
+from uuid import UUID
 
 from pydantic import ValidationError
 
@@ -202,7 +204,7 @@ class WatermarkRegression(WatermarkError):
 
 
 class StreamError(AslanCoreError):
-    pass
+    """Base class for every stream-layer error; subclass of AslanCoreError."""
 
 
 class StreamPublishError(StreamError):
@@ -215,6 +217,110 @@ class StreamReadError(StreamError):
 
 class StreamDeserializeError(StreamError):
     """Payload didn't match the registered Pydantic event model."""
+
+
+class StreamSchemaVersionMismatch(StreamError):
+    """Consumer received an event whose schema_version is outside its
+    [min_supported, max_supported] range.
+
+    Default policy: route to dead-letter; operator-overridable to 'skip'.
+
+    Carries: event_id, stream_name, received_version, supported_range,
+    direction ('newer' | 'older').
+    """
+
+    def __init__(
+        self,
+        *,
+        event_id: UUID,
+        stream_name: str,
+        received_version: int,
+        supported_range: tuple[int, int],
+        direction: Literal["newer", "older"],
+    ) -> None:
+        self.event_id = event_id
+        self.stream_name = stream_name
+        self.received_version = received_version
+        self.supported_range = supported_range
+        self.direction = direction
+        super().__init__(
+            f"stream={stream_name} event_id={event_id} "
+            f"schema_version={received_version} ({direction}) "
+            f"outside supported range {supported_range}"
+        )
+
+
+class StreamPayloadValidationError(StreamError):
+    """Pydantic validation against KnownStreamEvent failed (unknown
+    `kind` discriminator, malformed JSON, type mismatch). Routed to
+    dead-letter after max_attempts_before_deadletter retries."""
+
+    def __init__(
+        self,
+        *,
+        event_id: UUID | None,
+        stream_name: str,
+        message: str,
+    ) -> None:
+        self.event_id = event_id
+        self.stream_name = stream_name
+        super().__init__(f"stream={stream_name} event_id={event_id}: {message}")
+
+
+class StreamConsumerLagExceeded(StreamError):
+    """Optional alert error — consumer's lag gauge crossed an operator
+    threshold. NOT raised by aslan-core itself; reserved for callers."""
+
+    def __init__(
+        self,
+        *,
+        stream_name: str,
+        group_name: str,
+        lag_seconds: float,
+    ) -> None:
+        self.stream_name = stream_name
+        self.group_name = group_name
+        self.lag_seconds = lag_seconds
+        super().__init__(f"stream={stream_name} group={group_name} lag={lag_seconds:.1f}s")
+
+
+class StreamEventIdConflict(StreamError):
+    """Producer attempted to publish an event_id that already exists in
+    streams.outbox (UNIQUE constraint). Caller decides whether to treat
+    this as a no-op (caught + ignored) or a genuine bug."""
+
+    def __init__(self, *, event_id: UUID, stream_name: str) -> None:
+        self.event_id = event_id
+        self.stream_name = stream_name
+        super().__init__(f"event_id={event_id} already exists in outbox for stream={stream_name}")
+
+
+class UnknownEventKind(StreamError):
+    """Producer was called without a `stream` kwarg AND event.kind is
+    not registered in streams.names.STREAM_FOR_EVENT_KIND."""
+
+    def __init__(self, *, kind: str) -> None:
+        self.kind = kind
+        super().__init__(
+            f"event.kind={kind!r} not registered; pass stream= explicitly "
+            f"or add the kind to streams.names.STREAM_FOR_EVENT_KIND"
+        )
+
+
+class StreamRoutingContention(StreamError):
+    """Codex F22 round 11+12 — `acquire_or_adopt_intent` retried more
+    than the 3-attempt cap because concurrent adopters kept reconciling
+    + DELETEing the intent before our FOR UPDATE could acquire. A
+    sustained occurrence indicates a worker storm; operators should
+    investigate before re-running."""
+
+    def __init__(self, *, failure_id: int, attempts: int) -> None:
+        self.failure_id = failure_id
+        self.attempts = attempts
+        super().__init__(
+            f"acquire_or_adopt_intent looped {attempts} times for "
+            f"failure_id={failure_id}; investigate concurrent worker storm"
+        )
 
 
 class AuditError(AslanCoreError):
