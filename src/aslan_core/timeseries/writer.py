@@ -7,8 +7,11 @@ round-trip lands in Task 12. PII guards land in Task 11. Strict-mode
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+from collections.abc import Iterable
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -27,16 +30,19 @@ from aslan_core.errors import (
     IdentifyingSeriesMissingSubject,
     IdentifyingSeriesPiiInClearText,
     MetadataSchemaViolation,
+    ObservationConflict,
     SeriesCodeConflict,
 )
 from aslan_core.observability import metrics
 from aslan_core.observability.tracing import traced
 from aslan_core.schemas.timeseries import (
     Frequency,
+    ObservationIn,
     PiiClass,
     RestatementBasis,
     SeriesUpsertResult,
     SubjectRef,
+    WriteCount,
 )
 from aslan_core.timeseries.pii import (
     find_pii_in_clear_text,
@@ -644,6 +650,398 @@ class ObservationWriter:
             ),
         )
         return SeriesUpsertResult(series_id=sid, created=True)
+
+    @traced("ObservationWriter.write")
+    async def write(
+        self,
+        series_id: int,
+        observations: Iterable[ObservationIn],
+    ) -> WriteCount:
+        """Bulk write into ``ts.observation``.
+
+        Three-phase contract per spec §2 (codex F2 + F5 + F14 + F25):
+
+        Phase 0 — in-memory dedup + pre-flight validation BEFORE any DB
+        I/O. Each ``ObservationIn.metadata`` is walked for the
+        forbidden-key contract (``^\\d+$`` numeric-string keys) and the
+        batch is deduped by ``(series_id, ts, as_of)``. Same key with
+        identical ``payload_hash()`` → drop the duplicate; same key
+        with different ``payload_hash()`` → raise
+        :class:`ObservationConflict` immediately.
+
+        Phase 1 — per-``series_id`` advisory lock so concurrent writers
+        on the same series serialise; concurrent writers on different
+        series do not contend.
+
+        Phase 2 — chunked ``INSERT ... ON CONFLICT DO NOTHING RETURNING
+        ts, as_of`` (chunks of 500). For any chunk-key that did not
+        return as inserted, SELECT the existing row's ``payload_hash``
+        and either count it as ``unchanged`` (matching hash) or raise
+        :class:`ObservationConflict` (mismatch). Whole batch rolls
+        back on raise — partial writes corrupt forensic history.
+        """
+        # Strict-mode early-reject (codex F3 from v0.3): raise BEFORE
+        # any I/O if audit_strict=True and no actor is set. Lenient
+        # mode falls through.
+        assert_actor_or_strict_raise()
+        actor = current_actor()
+
+        obs_list = list(observations)
+        attempted = len(obs_list)
+
+        # Phase 0 — in-memory dedup + pre-flight validation BEFORE
+        # any DB I/O (codex F5 + F14 + F25, 2026-04-29).
+        #
+        # tz-aware enforcement and value/value_text exactly-one are
+        # already enforced at ObservationIn construction by the
+        # Pydantic validators. The numeric-string-key check on
+        # observation metadata runs HERE because metadata is a
+        # free-form dict that bypasses Pydantic value-level validation.
+        # The forbidden-key contract (codex F24) applies uniformly to
+        # BOTH ts.series_catalog.metadata AND ts.observation.metadata —
+        # the Art. 17 deletion runtime walks both.
+        seen: dict[tuple[int, datetime, datetime], str] = {}
+        deduped: list[ObservationIn] = []
+        for o in obs_list:
+            if o.metadata is not None:
+                _validate_no_numeric_string_keys(o.metadata)
+            key = (series_id, o.ts, o.as_of)
+            ph = o.payload_hash()
+            if key in seen:
+                if seen[key] != ph:
+                    raise ObservationConflict(
+                        "intra-batch same-key different-payload",
+                        key=key,
+                        existing_hash=seen[key],
+                        new_hash=ph,
+                    )
+                # identical duplicate — drop the redundant copy.
+                continue
+            seen[key] = ph
+            deduped.append(o)
+
+        # Histogram + counter wired AFTER Phase 0 so a structurally
+        # invalid batch (caught in Phase 0) does not bump the metric.
+        metrics.observation_write_batch_size.observe(attempted)
+
+        if not deduped:
+            metrics.observation_writes.labels(source_id="unknown", kind="bulk").inc(attempted)
+            return WriteCount(attempted=attempted, inserted=0, updated=0, unchanged=0)
+
+        # Phase 1 — per-series advisory lock for the txn lifetime so
+        # concurrent writers on the same series serialise (concurrent
+        # writers on different series do not contend).
+        await self._s.execute(
+            text("SELECT pg_advisory_xact_lock(  hashtextextended('ts.write:' || :sid, 0))"),
+            {"sid": str(series_id)},
+        )
+
+        # Phase 2 — chunked INSERT in batches of 500. Resolve conflicts
+        # by comparing payload_hash against the existing row.
+        chunk_size = 500
+        inserted_keys_total: set[tuple[datetime, datetime]] = set()
+        unchanged_keys_total: set[tuple[datetime, datetime]] = set()
+        for chunk in (deduped[i : i + chunk_size] for i in range(0, len(deduped), chunk_size)):
+            inserted_keys, unchanged_keys = await self._write_chunk(series_id, chunk, actor)
+            inserted_keys_total |= inserted_keys
+            unchanged_keys_total |= unchanged_keys
+
+        inserted = len(inserted_keys_total)
+        unchanged = len(unchanged_keys_total)
+
+        # Audit emission (codex F3 + F6): one event per write() call,
+        # plus per-key forensic rows in audit.observation_batch_keys.
+        # Same transaction as the observation INSERTs — if the per-key
+        # INSERT fails (e.g., CHECK violation, OOM) the whole batch
+        # rolls back atomically.
+        await self._emit_write_batch_audit(
+            series_id=series_id,
+            attempted=attempted,
+            deduped=deduped,
+            seen=seen,
+            inserted_keys=inserted_keys_total,
+            unchanged_keys=unchanged_keys_total,
+            inserted=inserted,
+            unchanged=unchanged,
+            actor=actor,
+        )
+
+        # Prometheus: count rows attempted (NOT batch count). The
+        # source_id label is resolved by SELECTing
+        # ts.series_catalog.source_id — bounded cardinality because
+        # sources are an enumerated set per spec.
+        source_id_for_metrics = await self._s.scalar(
+            text("SELECT source_id FROM ts.series_catalog WHERE series_id = :sid"),
+            {"sid": series_id},
+        )
+        metrics.observation_writes.labels(
+            source_id=source_id_for_metrics or "unknown",
+            kind="bulk",
+        ).inc(attempted)
+
+        return WriteCount(
+            attempted=attempted,
+            inserted=inserted,
+            updated=0,
+            unchanged=unchanged,
+        )
+
+    async def _write_chunk(
+        self,
+        series_id: int,
+        chunk: list[ObservationIn],
+        actor: Actor | None,
+    ) -> tuple[set[tuple[datetime, datetime]], set[tuple[datetime, datetime]]]:
+        """Insert one chunk via a single multi-row ``INSERT ... VALUES
+        (...), (...) ON CONFLICT DO NOTHING RETURNING``.
+
+        Why multi-row VALUES (not ``executemany``): SQLAlchemy 2.0
+        ``executemany`` over a raw ``text()`` statement drops
+        ``RETURNING`` rows on the asyncpg dialect (the cursor returns
+        ``ResourceClosedError`` on ``fetchall``). A single multi-row
+        VALUES statement reliably preserves ``RETURNING`` and runs in
+        one round-trip, which is what we want for chunks of 500 rows.
+
+        Returns ``(inserted_keys, unchanged_keys)`` so the caller can
+        tag per-key audit rows with the right ``action``. Same-key
+        different-payload raises :class:`ObservationConflict` and rolls
+        back the whole transaction.
+        """
+        chunk_hash_by_key: dict[tuple[datetime, datetime], str] = {}
+        bind_params: dict[str, Any] = {"sid": series_id, "rid": self._run_id}
+        actor_id = actor.actor_id if actor else None
+        actor_kind = actor.actor_kind if actor else None
+        client_ip = str(actor.client_ip) if (actor and actor.client_ip) else None
+        user_agent = actor.user_agent if actor else None
+        request_id = actor.request_id if actor else None
+        bind_params.update(
+            {
+                "aid": actor_id,
+                "ak": actor_kind,
+                "cip": client_ip,
+                "ua": user_agent,
+                "rqid": request_id,
+            }
+        )
+        rows_sql: list[str] = []
+        for i, o in enumerate(chunk):
+            ph = o.payload_hash()
+            chunk_hash_by_key[(o.ts, o.as_of)] = ph
+            bind_params[f"ts_{i}"] = o.ts
+            bind_params[f"as_of_{i}"] = o.as_of
+            bind_params[f"value_{i}"] = o.value
+            bind_params[f"value_text_{i}"] = o.value_text
+            bind_params[f"qf_{i}"] = o.quality_flag
+            bind_params[f"ph_{i}"] = ph
+            bind_params[f"meta_{i}"] = json.dumps(o.metadata)
+            rows_sql.append(
+                f"(:sid, :ts_{i}, :as_of_{i}, :value_{i}, :value_text_{i}, "
+                f":qf_{i}, :rid, :ph_{i}, CAST(:meta_{i} AS JSONB), "
+                f":aid, :ak, CAST(:cip AS INET), :ua, :rqid)"
+            )
+        # The VALUES clause is constructed from internal-only ``:name``
+        # bind placeholders (e.g. ``:ts_42``); every user-supplied value
+        # is bound via ``bind_params``. The dynamic concatenation only
+        # affects the count of placeholder rows, not the placeholder
+        # text itself — there is no path for caller input to reach the
+        # SQL string. Mirrors registry/client.py's established
+        # S608-suppression precedent for dynamic SET / IN-clause composition.
+        result = await self._s.execute(
+            text(
+                "INSERT INTO ts.observation ("  # noqa: S608
+                "  series_id, ts, as_of, value, value_text, quality_flag, "
+                "  ingestion_run_id, payload_hash, metadata, "
+                "  actor_id, actor_kind, client_ip, user_agent, request_id"
+                ") VALUES "
+                + ", ".join(rows_sql)
+                + " ON CONFLICT (series_id, ts, as_of) DO NOTHING "
+                "RETURNING ts, as_of"
+            ),
+            bind_params,
+        )
+        inserted_keys: set[tuple[datetime, datetime]] = {(r.ts, r.as_of) for r in result.fetchall()}
+        chunk_keys = set(chunk_hash_by_key.keys())
+        conflicted = chunk_keys - inserted_keys
+        if not conflicted:
+            return inserted_keys, set()
+
+        # Read back existing rows' payload_hash for the conflicted keys.
+        select_params: dict[str, Any] = {"sid": series_id}
+        in_clauses: list[str] = []
+        for i, (ts_v, as_of_v) in enumerate(conflicted):
+            select_params[f"ts_{i}"] = ts_v
+            select_params[f"as_of_{i}"] = as_of_v
+            in_clauses.append(f"(:ts_{i}, :as_of_{i})")
+        # IN-clause composed from internal index-derived placeholder
+        # names; values flow through bind_params. See registry/client.py
+        # for the same S608-suppression precedent.
+        rows = (
+            await self._s.execute(
+                text(
+                    "SELECT ts, as_of, payload_hash FROM ts.observation "  # noqa: S608
+                    "WHERE series_id = :sid AND (ts, as_of) IN (" + ",".join(in_clauses) + ")"
+                ),
+                select_params,
+            )
+        ).all()
+        existing_by_key = {(r.ts, r.as_of): r.payload_hash for r in rows}
+        unchanged_keys: set[tuple[datetime, datetime]] = set()
+        for k in conflicted:
+            ph_new = chunk_hash_by_key[k]
+            ph_existing = existing_by_key.get(k)
+            if ph_existing is None:
+                # Should not happen — the DO NOTHING fired but no row
+                # found? Surface as a forensic-grade ObservationConflict.
+                raise ObservationConflict(
+                    "post-INSERT readback missing key — DB consistency bug",
+                    key=(series_id, k[0], k[1]),
+                    existing_hash=None,
+                    new_hash=ph_new,
+                )
+            ph_existing_norm = ph_existing.strip()
+            if ph_existing_norm != ph_new:
+                raise ObservationConflict(
+                    "DB row exists with different payload",
+                    key=(series_id, k[0], k[1]),
+                    existing_hash=ph_existing_norm,
+                    new_hash=ph_new,
+                )
+            unchanged_keys.add(k)
+        return inserted_keys, unchanged_keys
+
+    async def _emit_write_batch_audit(
+        self,
+        *,
+        series_id: int,
+        attempted: int,
+        deduped: list[ObservationIn],
+        seen: dict[tuple[int, datetime, datetime], str],
+        inserted_keys: set[tuple[datetime, datetime]],
+        unchanged_keys: set[tuple[datetime, datetime]],
+        inserted: int,
+        unchanged: int,
+        actor: Actor | None,
+    ) -> None:
+        """Emit one ``observation.write_batch`` audit event + per-key
+        forensic rows (codex F3 + F6 + F16).
+
+        Same transaction as the observation INSERTs — atomic
+        rollback. The per-key INSERT runs as ``executemany``; if it
+        fails (CHECK violation, connection drop) the audit.events row
+        and the observation rows roll back together.
+        """
+        ts_values = [o.ts for o in deduped]
+        as_of_values = [o.as_of for o in deduped]
+        ts_min, ts_max = min(ts_values), max(ts_values)
+        as_of_min, as_of_max = min(as_of_values), max(as_of_values)
+
+        # Deterministic batch hash: sha256 of sorted-by-key
+        # concatenation of per-row payload_hash bytes — independent of
+        # input ordering. Same caller replaying the same batch
+        # produces the same value.
+        sorted_hashes = sorted(seen.values())
+        batch_payload_hash = hashlib.sha256("".join(sorted_hashes).encode("ascii")).hexdigest()
+
+        # Mirror occurred_at into both audit.events and
+        # audit.observation_batch_keys so investigators can join on
+        # (event_id, occurred_at) without ambiguity (codex F6).
+        occurred_at = datetime.now(UTC)
+
+        actor_id = actor.actor_id if actor else "system:unknown"
+        actor_kind = actor.actor_kind if actor else "system"
+        client_ip = str(actor.client_ip) if (actor and actor.client_ip) else None
+        user_agent = actor.user_agent if actor else None
+        request_id = actor.request_id if actor else None
+
+        event_id_raw = await self._s.scalar(
+            text(
+                "INSERT INTO audit.events ("
+                "  occurred_at, actor_id, actor_kind, client_ip, user_agent, "
+                "  request_id, ingestion_run_id, operation, target_schema, "
+                "  target_table, target_pk, before, after, metadata"
+                ") VALUES ("
+                "  :oa, :aid, :ak, CAST(:cip AS INET), :ua, :rqid, :run, "
+                "  'observation.write_batch', 'ts', 'observation', "
+                "  CAST(:pk AS JSONB), NULL, NULL, CAST(:meta AS JSONB)"
+                ") RETURNING event_id"
+            ),
+            {
+                "oa": occurred_at,
+                "aid": actor_id,
+                "ak": actor_kind,
+                "cip": client_ip,
+                "ua": user_agent,
+                "rqid": request_id,
+                "run": self._run_id,
+                "pk": json.dumps({"series_id": series_id}),
+                "meta": json.dumps(
+                    {
+                        "batch_size": attempted,
+                        "series_id": series_id,
+                        "ts_min": ts_min.isoformat(),
+                        "ts_max": ts_max.isoformat(),
+                        "as_of_min": as_of_min.isoformat(),
+                        "as_of_max": as_of_max.isoformat(),
+                        "batch_payload_hash": batch_payload_hash,
+                        "inserted": inserted,
+                        "unchanged": unchanged,
+                        "ingestion_run_id": self._run_id,
+                    },
+                    default=str,
+                ),
+            },
+        )
+        event_id = int(event_id_raw) if event_id_raw is not None else 0
+
+        # Bump the audit_events Prometheus counter to mirror the
+        # invariant maintained by audit.recorder.record() — emitters
+        # that bypass the recorder still count.
+        metrics.audit_events.labels(
+            operation=metrics._normalize_metric_label(
+                "observation.write_batch", metrics._KNOWN_AUDIT_OPERATIONS
+            ),
+            actor_kind=actor_kind,
+        ).inc()
+
+        # Per-key forensic rows. action='inserted' for keys returned by
+        # the INSERT RETURNING; 'unchanged' for keys that hit the
+        # DO NOTHING path AND matched payload_hash.
+        per_key_params: list[dict[str, Any]] = []
+        for o in deduped:
+            k = (o.ts, o.as_of)
+            if k in inserted_keys:
+                action = "inserted"
+            elif k in unchanged_keys:
+                action = "unchanged"
+            else:  # pragma: no cover — defensive
+                # Phase 2 either inserted or marked-unchanged every key,
+                # else it raised ObservationConflict and we never reach
+                # here. A miss would indicate a writer bug.
+                raise ObservationConflict(
+                    "audit-key labelling missed — writer bug",
+                    key=(series_id, o.ts, o.as_of),
+                    existing_hash=None,
+                    new_hash=seen[(series_id, o.ts, o.as_of)],
+                )
+            per_key_params.append(
+                {
+                    "eid": event_id,
+                    "oa": occurred_at,
+                    "sid": series_id,
+                    "ts": o.ts,
+                    "as_of": o.as_of,
+                    "ph": seen[(series_id, o.ts, o.as_of)],
+                    "action": action,
+                }
+            )
+        await self._s.execute(
+            text(
+                "INSERT INTO audit.observation_batch_keys "
+                "(event_id, occurred_at, series_id, ts, as_of, payload_hash, action) "
+                "VALUES (:eid, :oa, :sid, :ts, :as_of, :ph, :action)"
+            ),
+            per_key_params,
+        )
 
     async def _persist_subjects(
         self,

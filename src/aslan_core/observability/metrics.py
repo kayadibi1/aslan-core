@@ -123,6 +123,10 @@ _KNOWN_AUDIT_OPERATIONS: frozenset[str] = frozenset(
         "series.upsert",
         "series.idempotent_hit",
         "series.update",
+        # Bulk-write batch event from ObservationWriter.write (Task 16).
+        # ONE event per write() call carrying bounded forensic
+        # metadata; per-key detail lives in audit.observation_batch_keys.
+        "observation.write_batch",
     }
 )
 """Allow-list of every ``operation=`` string emitted by aslan-core's
@@ -408,6 +412,25 @@ object_storage_op_duration = _LazyHistogram(
     buckets=_DURATION_BUCKETS,
 )
 
+# v0.4 ObservationWriter.write — per-batch sample size (used by
+# operators for capacity planning + p99 batch-size alerts). No labels:
+# the histogram is a global signal; per-source breakdown lives on
+# ``observation_writes``.
+observation_write_batch_size = _LazyHistogram(
+    name="aslan_observation_write_batch_size",
+    documentation="Per-write batch size (number of ObservationIn rows attempted).",
+    buckets=(1, 10, 100, 500, 1_000, 5_000, 10_000, 50_000),
+)
+
+# End-to-end wall-clock for ObservationWriter.write. Wired in Task 19;
+# declared here so the metric is registered before the first call.
+observation_write_duration = _LazyHistogram(
+    name="aslan_observation_write_duration_seconds",
+    documentation="ObservationWriter.write end-to-end duration.",
+    labelnames=("source_id",),
+    buckets=(0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0),
+)
+
 
 # ── Gauges ───────────────────────────────────────────────────────────
 
@@ -431,6 +454,8 @@ __all__ = [
     "filing_releases",
     "object_storage_op_duration",
     "object_storage_orphans",
+    "observation_write_batch_size",
+    "observation_write_duration",
     "observation_writes",
     "series_upserts",
 ]
