@@ -35,11 +35,15 @@ depends_on: str | Sequence[str] | None = None
 
 # Codex F2 (2026-04-29) — src.watermark IS in the full-attribution list
 # (a watermark mutation has full per-call attribution).
+# Codex Batch 2 F1 (2026-04-29) — ref.sector IS a public mutation target
+# (EntityRegistryClient.upsert_sector creates/updates rows), so it gets
+# the full five-column audit set just like every other mutation table.
 _TABLES_FULL: tuple[str, ...] = (
     "ref.entity",
     "ref.identifier",
     "ref.entity_sector",
     "ref.entity_relationship",
+    "ref.sector",
     "doc.filing",
     "doc.filing_attachment",
     "doc.filing_body",

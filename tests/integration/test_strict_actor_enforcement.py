@@ -109,6 +109,49 @@ async def test_strict_mode_create_entity_raises_without_actor(
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_strict_mode_upsert_sector_raises_without_actor(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex Batch 2 F1: upsert_sector with no actor and audit_strict=True
+    must raise AuditMissingActor BEFORE any DB INSERT/UPDATE on
+    ref.sector. Asserts:
+      - the exception is raised
+      - no ref.sector row was created/changed
+      - no audit.events row was written
+    """
+    monkeypatch.setenv("ASLAN_AUDIT_STRICT", "true")
+    assert Settings(_env_file=None).audit_strict is True
+
+    from aslan_core.registry.client import EntityRegistryClient
+
+    run_id = await _seed_source_and_run(session)
+    sector_id = "bist:STRICT-XBANK"
+    pre_sectors = await session.scalar(
+        text("SELECT COUNT(*) FROM ref.sector WHERE sector_id = :sid"),
+        {"sid": sector_id},
+    )
+    pre_events = await session.scalar(text("SELECT COUNT(*) FROM audit.events"))
+
+    client = EntityRegistryClient(session, ingestion_run_id=run_id)
+    with pytest.raises(AuditMissingActor):
+        await client.upsert_sector(
+            sector_id=sector_id,
+            taxonomy="bist",
+            code="STRICT-XBANK",
+            name_tr="Bankalar",
+        )
+
+    post_sectors = await session.scalar(
+        text("SELECT COUNT(*) FROM ref.sector WHERE sector_id = :sid"),
+        {"sid": sector_id},
+    )
+    post_events = await session.scalar(text("SELECT COUNT(*) FROM audit.events"))
+    assert post_sectors == pre_sectors
+    assert post_events == pre_events
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_strict_mode_put_filing_raises_without_actor(
     session: AsyncSession,
     object_storage_fake: object,

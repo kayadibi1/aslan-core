@@ -190,6 +190,156 @@ async def test_assign_sector_idempotent_hit_preserves_original_attribution(
     set_actor(None)
 
 
+async def test_upsert_sector_writes_audit_row_on_create(
+    session: AsyncSession,
+) -> None:
+    """Codex Batch 2 F1, 2026-04-29: a fresh upsert_sector call MUST
+    stamp the row's audit columns AND emit one sector.upsert audit
+    event. The row is the canonical record of who first defined the
+    sector taxonomy entry — its actor cols are written by the actor
+    that first introduced this sector_id."""
+    await _wipe(session)
+    run = await _new_run(session)
+    set_actor(Actor(actor_id="user:taxonomist", actor_kind="user"))
+    client = EntityRegistryClient(session, ingestion_run_id=run)
+    await client.upsert_sector(
+        sector_id="bist:XBANK",
+        taxonomy="bist",
+        code="XBANK",
+        name_tr="Bankalar",
+    )
+    await session.commit()
+
+    row = (
+        await session.execute(
+            text("SELECT actor_id, actor_kind FROM ref.sector WHERE sector_id = 'bist:XBANK'")
+        )
+    ).one()
+    assert row.actor_id == "user:taxonomist"
+    assert row.actor_kind == "user"
+
+    events = (
+        await session.execute(
+            text(
+                "SELECT operation, actor_id FROM audit.events "
+                "WHERE target_table = 'sector' "
+                "ORDER BY occurred_at"
+            )
+        )
+    ).all()
+    assert [e.operation for e in events] == ["sector.upsert"]
+    assert events[0].actor_id == "user:taxonomist"
+
+    set_actor(None)
+
+
+async def test_upsert_sector_idempotent_hit_preserves_attribution(
+    session: AsyncSession,
+) -> None:
+    """Codex Batch 2 F1, 2026-04-29: two actors call upsert_sector with
+    identical args; the row's actor_id MUST stay the FIRST actor.
+    Events emitted: sector.upsert (first actor) + sector.idempotent_hit
+    (second actor)."""
+    await _wipe(session)
+    run = await _new_run(session)
+    set_actor(Actor(actor_id="user:first", actor_kind="user"))
+    client = EntityRegistryClient(session, ingestion_run_id=run)
+    await client.upsert_sector(
+        sector_id="bist:XBANK",
+        taxonomy="bist",
+        code="XBANK",
+        name_tr="Bankalar",
+    )
+    await session.commit()
+
+    set_actor(Actor(actor_id="user:retry", actor_kind="user"))
+    await client.upsert_sector(
+        sector_id="bist:XBANK",
+        taxonomy="bist",
+        code="XBANK",
+        name_tr="Bankalar",
+    )
+    await session.commit()
+
+    # Row's denormalised audit cols stay frozen on the first writer.
+    row = (
+        await session.execute(
+            text("SELECT actor_id FROM ref.sector WHERE sector_id = 'bist:XBANK'")
+        )
+    ).one()
+    assert row.actor_id == "user:first"
+
+    events = (
+        await session.execute(
+            text(
+                "SELECT operation, actor_id FROM audit.events "
+                "WHERE target_table = 'sector' "
+                "ORDER BY occurred_at"
+            )
+        )
+    ).all()
+    assert [e.operation for e in events] == [
+        "sector.upsert",
+        "sector.idempotent_hit",
+    ]
+    assert events[0].actor_id == "user:first"
+    assert events[1].actor_id == "user:retry"
+
+    set_actor(None)
+
+
+async def test_upsert_sector_field_change_is_fresh_write(
+    session: AsyncSession,
+) -> None:
+    """Codex Batch 2 F1, 2026-04-29: a second upsert with a CHANGED
+    field (e.g. name_en) is a fresh write — last-writer-wins on the
+    row's audit cols. Events: sector.upsert + sector.upsert."""
+    await _wipe(session)
+    run = await _new_run(session)
+    set_actor(Actor(actor_id="user:first", actor_kind="user"))
+    client = EntityRegistryClient(session, ingestion_run_id=run)
+    await client.upsert_sector(
+        sector_id="bist:XBANK",
+        taxonomy="bist",
+        code="XBANK",
+        name_tr="Bankalar",
+    )
+    await session.commit()
+
+    set_actor(Actor(actor_id="user:editor", actor_kind="user"))
+    await client.upsert_sector(
+        sector_id="bist:XBANK",
+        taxonomy="bist",
+        code="XBANK",
+        name_tr="Bankalar",
+        name_en="Banks",
+    )
+    await session.commit()
+
+    row = (
+        await session.execute(
+            text("SELECT actor_id, name_en FROM ref.sector WHERE sector_id = 'bist:XBANK'")
+        )
+    ).one()
+    assert row.actor_id == "user:editor"
+    assert row.name_en == "Banks"
+
+    events = (
+        await session.execute(
+            text(
+                "SELECT operation, actor_id FROM audit.events "
+                "WHERE target_table = 'sector' "
+                "ORDER BY occurred_at"
+            )
+        )
+    ).all()
+    assert [e.operation for e in events] == ["sector.upsert", "sector.upsert"]
+    assert events[0].actor_id == "user:first"
+    assert events[1].actor_id == "user:editor"
+
+    set_actor(None)
+
+
 async def test_link_idempotent_hit_preserves_original_attribution(
     session: AsyncSession,
 ) -> None:

@@ -682,17 +682,78 @@ class EntityRegistryClient:
         name_en: str | None = None,
         parent_sector_id: str | None = None,
     ) -> None:
+        """Idempotent on sector_id. Existing rows update taxonomy / code /
+        names / parent.
+
+        Idempotent-hit (codex Batch 2 F1, 2026-04-29): a call with the
+        same fields as the existing row is a true no-op — the row's
+        audit columns stay frozen on the original definer. A call that
+        mutates any field is a fresh write and last-writer-wins on
+        audit cols.
+        """
+        assert_actor_or_strict_raise()
+        # Pre-SELECT to detect idempotent-hit vs fresh-write.
+        existing = (
+            await self._s.execute(
+                text(
+                    "SELECT taxonomy, code, name_tr, name_en, parent_sector_id "
+                    "FROM ref.sector WHERE sector_id = :sid"
+                ),
+                {"sid": sector_id},
+            )
+        ).one_or_none()
+
+        if existing is not None:
+            same = (
+                existing.taxonomy == taxonomy
+                and existing.code == code
+                and existing.name_tr == name_tr
+                and existing.name_en == name_en
+                and existing.parent_sector_id == parent_sector_id
+            )
+            if same:
+                snap = {
+                    "sector_id": sector_id,
+                    "taxonomy": existing.taxonomy,
+                    "code": existing.code,
+                    "name_tr": existing.name_tr,
+                    "name_en": existing.name_en,
+                    "parent_sector_id": existing.parent_sector_id,
+                }
+                await self._emit_audit(
+                    operation="sector.idempotent_hit",
+                    target_table="sector",
+                    target_pk={"sector_id": sector_id},
+                    before=snap,
+                    after=snap,
+                    metadata={"returned_existing": True},
+                )
+                return
+
+        # Fresh write — INSERT or DO UPDATE branch. Stamp audit cols on
+        # both branches so last-writer-wins on the row's denormalised
+        # audit columns (single round-trip, no post-write UPDATE per
+        # codex F1).
+        ac = _audit_cols()
         await self._s.execute(
             text(
                 "INSERT INTO ref.sector "
-                "  (sector_id, taxonomy, code, name_tr, name_en, parent_sector_id) "
-                "VALUES (:sid, :tax, :code, :ntr, :nen, :pid) "
+                "  (sector_id, taxonomy, code, name_tr, name_en, parent_sector_id, "
+                "   actor_id, actor_kind, client_ip, user_agent, request_id) "
+                "VALUES (:sid, :tax, :code, :ntr, :nen, :pid, "
+                "        :actor_id, :actor_kind, :client_ip, "
+                "        :user_agent, :request_id) "
                 "ON CONFLICT (sector_id) DO UPDATE "
-                "  SET taxonomy = EXCLUDED.taxonomy, "
-                "      code = EXCLUDED.code, "
-                "      name_tr = EXCLUDED.name_tr, "
-                "      name_en = EXCLUDED.name_en, "
-                "      parent_sector_id = EXCLUDED.parent_sector_id"
+                "  SET taxonomy         = EXCLUDED.taxonomy, "
+                "      code             = EXCLUDED.code, "
+                "      name_tr          = EXCLUDED.name_tr, "
+                "      name_en          = EXCLUDED.name_en, "
+                "      parent_sector_id = EXCLUDED.parent_sector_id, "
+                "      actor_id         = EXCLUDED.actor_id, "
+                "      actor_kind       = EXCLUDED.actor_kind, "
+                "      client_ip        = EXCLUDED.client_ip, "
+                "      user_agent       = EXCLUDED.user_agent, "
+                "      request_id       = EXCLUDED.request_id"
             ),
             {
                 "sid": sector_id,
@@ -701,7 +762,36 @@ class EntityRegistryClient:
                 "ntr": name_tr,
                 "nen": name_en,
                 "pid": parent_sector_id,
+                **ac,
             },
+        )
+
+        before_snap = (
+            None
+            if existing is None
+            else {
+                "sector_id": sector_id,
+                "taxonomy": existing.taxonomy,
+                "code": existing.code,
+                "name_tr": existing.name_tr,
+                "name_en": existing.name_en,
+                "parent_sector_id": existing.parent_sector_id,
+            }
+        )
+        after_snap = {
+            "sector_id": sector_id,
+            "taxonomy": taxonomy,
+            "code": code,
+            "name_tr": name_tr,
+            "name_en": name_en,
+            "parent_sector_id": parent_sector_id,
+        }
+        await self._emit_audit(
+            operation="sector.upsert",
+            target_table="sector",
+            target_pk={"sector_id": sector_id},
+            before=before_snap,
+            after=after_snap,
         )
 
     async def assign_sector(

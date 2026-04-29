@@ -14,11 +14,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 pytestmark = pytest.mark.integration
 
 # Codex F2 (2026-04-29) — src.watermark IS in the full-attribution list.
+# Codex Batch 2 F1 (2026-04-29) — ref.sector IS a public mutation target
+# (upsert_sector creates/updates rows), so it gets full audit columns too.
 _FULL_TABLES: tuple[tuple[str, str], ...] = (
     ("ref", "entity"),
     ("ref", "identifier"),
     ("ref", "entity_sector"),
     ("ref", "entity_relationship"),
+    ("ref", "sector"),
     ("doc", "filing"),
     ("doc", "filing_attachment"),
     ("doc", "filing_body"),
