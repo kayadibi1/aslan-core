@@ -8,6 +8,7 @@ round-trip lands in Task 12. PII guards land in Task 11. Strict-mode
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 from uuid import UUID
 
@@ -20,7 +21,13 @@ from aslan_core.audit import (
     current_actor,
 )
 from aslan_core.audit import record as audit_record
-from aslan_core.errors import SeriesCodeConflict
+from aslan_core.errors import (
+    IdentifyingSeriesMetadataPii,
+    IdentifyingSeriesMissingSubject,
+    IdentifyingSeriesPiiInClearText,
+    MetadataSchemaViolation,
+    SeriesCodeConflict,
+)
 from aslan_core.observability.tracing import traced
 from aslan_core.schemas.timeseries import (
     Frequency,
@@ -29,6 +36,84 @@ from aslan_core.schemas.timeseries import (
     SeriesUpsertResult,
     SubjectRef,
 )
+from aslan_core.timeseries.pii import (
+    find_pii_in_clear_text,
+    find_pii_in_metadata,
+)
+
+# Codex F24, 2026-04-29 — numeric-string object keys are
+# indistinguishable from array indices once flattened by
+# `path_to_jsonb_set_text_array` for `jsonb_set`. Forbid them at
+# upsert so the path-tuple → text[] conversion is lossless. Mirrors
+# `pii._NUMERIC_STRING_KEY_RE` (deliberate duplication so the
+# deletion-runtime helpers don't depend on writer.py).
+_NUMERIC_KEY_RE: re.Pattern[str] = re.compile(r"^\d+$")
+
+
+def _validate_no_numeric_string_keys(obj: Any, path: tuple[str | int, ...] = ()) -> None:
+    """Codex F24, 2026-04-29 — recursively reject any object key (at
+    any nesting depth in ``metadata``) whose string value matches
+    ``^\\d+$``.
+
+    Such keys are indistinguishable from array indices once flattened
+    by :func:`path_to_jsonb_set_text_array` for ``jsonb_set``, and the
+    Art. 17 scrub UPDATE could write the wrong leaf because Postgres
+    ``jsonb_set`` dispatches by container kind at evaluation time, not
+    by Python type. ``{"fields": {"0": "bob@b.com"}}`` (numeric-string
+    object key) and ``{"fields": ["bob@b.com"]}`` (array index 0) both
+    flatten to ``['fields', '0']``.
+
+    Use a non-numeric prefix (``"item_0"``, ``"row_0"``, ``"_0"``)
+    when you need to key by an ordinal-shaped string.
+
+    Applies to ALL series regardless of ``pii_class`` so the metadata
+    shape is uniform across the deletion runtime's surface (a
+    ``pii_class='none'`` series may later be reclassified as
+    identifying — keeping the validator unconditional avoids a
+    backfill at reclassification time).
+    """
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if not isinstance(k, str):
+                # Pydantic / asyncpg should have caught this upstream;
+                # belt-and-braces in case raw JSON arrived via a future
+                # bypass path.
+                raise MetadataSchemaViolation(f"Non-string dict key at path {path}: {k!r}")
+            if _NUMERIC_KEY_RE.match(k):
+                raise MetadataSchemaViolation(
+                    f"Numeric-string object keys forbidden in metadata at "
+                    f"path {(*path, k)}: jsonb_set cannot disambiguate "
+                    f"them from array indices during Art. 17 scrubbing. "
+                    f"Use a non-numeric prefix (e.g. 'item_0' instead "
+                    f"of '0')."
+                )
+            _validate_no_numeric_string_keys(v, (*path, k))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            _validate_no_numeric_string_keys(v, (*path, i))
+    # Primitives (int / float / bool / None / str): nothing to validate.
+
+
+def _raise_if_pii_clear_text(field_name: str, value: str | None) -> None:
+    findings = find_pii_in_clear_text(field_name, value)
+    if findings:
+        f = findings[0]
+        raise IdentifyingSeriesPiiInClearText(
+            f"{f.json_path} contains a {f.matched_pattern}-shaped pattern; "
+            f"PII must live in ts.series_subject + metadata.subjects, not "
+            f"clear-text columns. Matched: {f.matched_text!r}"
+        )
+
+
+def _raise_if_pii_in_metadata(metadata: dict[str, Any] | None) -> None:
+    findings = find_pii_in_metadata(metadata)
+    if findings:
+        f = findings[0]
+        raise IdentifyingSeriesMetadataPii(
+            f"metadata[{f.json_path!r}] contains a {f.matched_pattern}-shaped "
+            f"pattern; PII must live in metadata.subjects/series_subject, "
+            f"not free-form metadata. Matched: {f.matched_text!r}"
+        )
 
 
 class ObservationWriter:
@@ -72,6 +157,34 @@ class ObservationWriter:
         """
         actor = current_actor()
         meta: dict[str, Any] = metadata if metadata is not None else {}
+
+        # Codex F24, 2026-04-29 — runs for ALL pii_class values, not
+        # just identifying. Numeric-string object keys are forbidden
+        # everywhere because the metadata shape must be uniform across
+        # the deletion runtime's surface.
+        if metadata is not None:
+            _validate_no_numeric_string_keys(metadata)
+
+        if pii_class == "identifying":
+            # Codex F4 + F18: forbid PII patterns in clear-text columns
+            # and require at least one structured SubjectRef so Art. 17
+            # deletion has a handle.
+            _raise_if_pii_clear_text("series_code", series_code)
+            _raise_if_pii_clear_text("description", description)
+            if not subjects:
+                # Note: the "no surviving subjects" path (subjects empty
+                # AND no existing rows) collapses to "subjects is empty"
+                # because ON CONFLICT DO NOTHING never deletes rows. If
+                # a later v0.5 path adds explicit subject removal,
+                # re-check the post-upsert ts.series_subject row count.
+                raise IdentifyingSeriesMissingSubject(
+                    "pii_class='identifying' requires at least one SubjectRef; "
+                    "an identifying series with no subject handle is "
+                    "structurally undeletable under Art. 17."
+                )
+            # Codex F18 + F19: scan metadata recursively (only top-level
+            # ``subjects`` is skipped — ``fields`` IS scanned).
+            _raise_if_pii_in_metadata(metadata)
 
         # Look up existing row by series_code.
         existing = (

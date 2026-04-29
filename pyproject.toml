@@ -78,8 +78,11 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "S105", "S106"]
+"tests/**" = ["S101", "S105", "S106", "RUF001", "RUF002", "RUF003"]
 "src/aslan_core/db/migrations/versions/*.py" = ["E501"]   # generated migrations may exceed 100
+# PII regex + comments deliberately use Turkish characters (ÇĞİÖŞÜ + lowercase)
+# that ruff flags as ambiguous against ASCII look-alikes.
+"src/aslan_core/timeseries/pii.py" = ["RUF001", "RUF002", "RUF003"]
 
 [tool.ruff.format]
 quote-style = "double"

@@ -28,12 +28,15 @@ import math
 import struct
 import unicodedata
 from datetime import datetime
-from typing import Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from aslan_core.errors import ObservationValidationError
+
+if TYPE_CHECKING:
+    from aslan_core.timeseries.pii import PiiFinding
 
 Frequency = Literal[
     "tick",
@@ -163,6 +166,21 @@ class Series(BaseModel):
     subjects: tuple[SubjectRef, ...] = ()
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+    def scan_metadata_for_pii(self) -> list[PiiFinding]:
+        """Codex F20: convenience wrapper for the deletion runtime.
+
+        Returns every PII-shaped string under non-``subjects`` metadata
+        keys (no subject filter). Empty list = clean. Non-raising — the
+        caller decides scrub policy. The aslan-service Art. 17 runtime
+        should typically prefer
+        :func:`aslan_core.timeseries.pii.find_pii_in_metadata_for_subject`
+        (codex F21) so it only scrubs the target subject's PII; this
+        wrapper is for general sweeps and ad-hoc audits.
+        """
+        from aslan_core.timeseries.pii import find_pii_in_metadata
+
+        return find_pii_in_metadata(self.metadata)
 
 
 class ObservationIn(BaseModel):
