@@ -92,7 +92,16 @@ def get_breaker() -> RedisCircuitBreaker:
 # here; the import is non-circular because the binding above has
 # already run.
 def _register_pages() -> None:
+    # Each module's import triggers its ``@app.get("/path")`` decorator
+    # and ``register_template(VMType, builder)`` call. The local-name
+    # bindings (``_overview`` etc.) are intentionally unused at this
+    # call site — the side effects ARE the registration.
+    from aslan_core.dashboard.pages import documents as _documents  # noqa: F401
+    from aslan_core.dashboard.pages import ingestion as _ingestion  # noqa: F401
+    from aslan_core.dashboard.pages import outbox as _outbox  # noqa: F401
     from aslan_core.dashboard.pages import overview as _overview  # noqa: F401
+    from aslan_core.dashboard.pages import streams as _streams  # noqa: F401
+    from aslan_core.dashboard.pages import timeseries as _timeseries  # noqa: F401
 
 
 _register_pages()
