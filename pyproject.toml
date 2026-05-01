@@ -123,6 +123,10 @@ module = [
     # mypy can't analyse them under strict.
     "fasthtml.*",
     "starlette.*",
+    # v0.6.0 dashboard runtime dep — uvicorn[standard] ships without
+    # py.typed; only ``serve()`` imports it (lazy) so runtime callers
+    # without the [dashboard] extra are unaffected.
+    "uvicorn.*",
     # v0.6.0 codex F-3 lint dep (dev-group). sqlglot ships without
     # a py.typed marker.
     "sqlglot.*",
