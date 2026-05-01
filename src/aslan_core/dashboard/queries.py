@@ -348,22 +348,21 @@ async def timeseries_overview(session: AsyncSession, *, limit: int = 50) -> Time
 
 
 async def audit_recent(session: AsyncSession, *, limit: int = 50) -> AuditVM:
-    """Recent ``audit.events`` rows. ``client_ip`` is truncated to /24
-    (IPv4) or /48 (IPv6) at the SQL layer. ``metadata`` is forbidden;
-    only the SECURITY DEFINER-derived ``metadata_key_count`` is
-    projected."""
+    """Recent ``audit.events`` rows.
+
+    Codex branch-state F-1: raw ``client_ip`` and ``user_agent`` are
+    no longer in the dashboard role's column-allowlist GRANT (migration
+    0022). The truncated CIDR comes from the SECURITY DEFINER helper
+    ``audit.event_client_ip_truncated`` (owned by ``aslan_app``, which
+    holds SELECT on the underlying column). ``metadata`` is similarly
+    behind ``audit.event_metadata_key_count``."""
     rows = (
         await session.execute(
             text(
                 "SELECT event_id, occurred_at, actor_id, actor_kind, "
                 "       operation, target_schema, target_table, "
-                "       COALESCE("
-                "         host(network(set_masklen(client_ip, "
-                "           CASE family(client_ip) WHEN 4 THEN 24 ELSE 48 END))) "
-                "         || CASE family(client_ip) "
-                "              WHEN 4 THEN '/24' ELSE '/48' END, "
-                "         '<no client_ip>'"
-                "       ) AS client_ip_truncated, "
+                "       audit.event_client_ip_truncated(event_id, occurred_at) "
+                "         AS client_ip_truncated, "
                 "       audit.event_metadata_key_count(event_id, occurred_at) "
                 "         AS metadata_key_count "
                 "FROM audit.events "

@@ -51,15 +51,27 @@ _GRANDFATHERED: dict[tuple[str, str], frozenset[str]] = {
 }
 
 
-def _extract_op_execute_strings(source: str) -> list[str]:
-    """Return every string literal passed as the first arg to
-    ``op.execute(...)`` in the parsed module. Handles direct
-    ``op.execute("…")`` and ``op.execute(text("…").bindparams(...))``
-    chains. Ignores f-strings (``op.execute(f"…")``) — the lint targets
-    fully-static SECURITY DEFINER definitions; an f-string CREATE
-    would be a separate review concern."""
+def _extract_op_execute(source: str) -> tuple[list[str], list[str]]:
+    """Return ``(static_strings, dynamic_call_sources)`` for every
+    ``op.execute(...)`` in the module.
+
+    ``static_strings`` are the literal SQL strings the existing
+    SECURITY DEFINER signature scan analyses (Constant str OR
+    ``text("…")`` / ``text("…").bindparams(...)`` wrappers).
+
+    ``dynamic_call_sources`` are the unparsed source representations
+    of every ``op.execute(...)`` whose first argument is NOT a static
+    literal — f-strings, concatenations, name references. Codex F-5:
+    a future migration that does
+    ``op.execute(f"CREATE FUNCTION ... SECURITY DEFINER ...")`` would
+    silently slip past a literal-only scan. The lint rejects any
+    dynamic op.execute whose source contains ``SECURITY DEFINER``,
+    forcing the migration author to use a static string for any DDL
+    that creates a SECURITY DEFINER function.
+    """
     tree = ast.parse(source)
-    results: list[str] = []
+    static: list[str] = []
+    dynamic: list[str] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -75,10 +87,9 @@ def _extract_op_execute_strings(source: str) -> list[str]:
             continue
         first = node.args[0]
         if isinstance(first, ast.Constant) and isinstance(first.value, str):
-            results.append(first.value)
+            static.append(first.value)
             continue
-        # text("…").bindparams(...) and similar chains: walk down .attr calls
-        # until we find a top-level call whose func is the text() name.
+        # text("…").bindparams(...) chain — walk down .attr calls.
         inner: ast.AST = first
         while isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute):
             inner = inner.func.value
@@ -93,8 +104,12 @@ def _extract_op_execute_strings(source: str) -> list[str]:
             and isinstance(inner.args[0], ast.Constant)
             and isinstance(inner.args[0].value, str)
         ):
-            results.append(inner.args[0].value)
-    return results
+            static.append(inner.args[0].value)
+            continue
+        # Anything else: capture the source for the SECURITY DEFINER
+        # contains-check.
+        dynamic.append(ast.unparse(node))
+    return static, dynamic
 
 
 def _normalize_args(args: str) -> str:
@@ -152,7 +167,21 @@ def test_security_definer_funcs_have_explicit_grants() -> None:
             continue
         source = migration.read_text(encoding="utf-8")
         revision = _revision_id(source, fallback=migration.stem)
-        sql_strings = _extract_op_execute_strings(source)
+        sql_strings, dynamic_calls = _extract_op_execute(source)
+
+        # Codex F-5: any dynamic op.execute whose source mentions
+        # SECURITY DEFINER must be rewritten as a static string so
+        # the lint can extract the signature and verify the
+        # REVOKE/GRANT pair.
+        for dyn_src in dynamic_calls:
+            if _SECURITY_DEFINER_RE.search(dyn_src):
+                failures.append(
+                    f"{migration.name} (rev {revision}): dynamic op.execute(...) "
+                    f"contains 'SECURITY DEFINER'. Rewrite as a static "
+                    f"string literal so the lint can verify the "
+                    f"same-file REVOKE/GRANT contract. Offending source:\n"
+                    f"  {dyn_src}"
+                )
 
         secdef_signatures: list[tuple[str, str, str]] = []
         for sql in sql_strings:
@@ -208,3 +237,27 @@ def test_security_definer_funcs_have_explicit_grants() -> None:
                 )
 
     assert not failures, "SECURITY DEFINER lint:\n  - " + "\n  - ".join(failures)
+
+
+def test_dynamic_op_execute_with_security_definer_is_rejected_in_isolation() -> None:
+    """Codex F-5 regression: feed the extractor a synthetic f-string
+    op.execute that contains SECURITY DEFINER and assert it shows up
+    in the dynamic-call source list. Catches a future scanner change
+    that re-introduces the f-string blind spot."""
+    synthetic = (
+        "def upgrade():\n"
+        '    schema = "audit"\n'
+        '    op.execute(f"""\n'
+        "        CREATE OR REPLACE FUNCTION {schema}.x()\n"
+        "          RETURNS INTEGER\n"
+        "          LANGUAGE sql\n"
+        "          SECURITY DEFINER\n"
+        "          AS $$ SELECT 1 $$\n"
+        '    """)\n'
+    )
+    static, dynamic = _extract_op_execute(synthetic)
+    assert static == [], "f-string op.execute must NOT be classified as static"
+    assert any(_SECURITY_DEFINER_RE.search(d) for d in dynamic), (
+        "f-string op.execute containing SECURITY DEFINER must be captured "
+        "as a dynamic call so the lint can fail it"
+    )

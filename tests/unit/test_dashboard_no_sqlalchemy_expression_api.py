@@ -34,6 +34,23 @@ NON_QUERIES_ONLY_STUBS: list[tuple[str, str]] = [
         "import sqlalchemy\nsa = sqlalchemy\nsa.text('X')",
     ),
     ("import-as-rebind", 'from sqlalchemy import text as t\nt("X")'),
+    # Codex F-2: function-local imports of ``sqlalchemy.text`` with a
+    # literal first arg are technically the same shape as the top-level
+    # version — legitimate in queries.py, illegal in every other module.
+    (
+        "function-local-from-import",
+        "def f():\n    from sqlalchemy import text\n    return text('SELECT 1')\n",
+    ),
+    (
+        "function-local-import-as",
+        "def f():\n    import sqlalchemy as sa\n    return sa.text('SELECT 1')\n",
+    ),
+    (
+        "method-local-import",
+        "class C:\n    def m(self):\n"
+        "        from sqlalchemy import text\n"
+        "        return text('SELECT 1')\n",
+    ),
 ]
 
 # Stubs that are forbidden in EVERY mode — runtime-introspection,
@@ -99,6 +116,16 @@ ALWAYS_FORBIDDEN_STUBS: list[tuple[str, str]] = [
     ),
     # ── Class-hierarchy walk (sandbox escape) ────────────────────
     ("class-mro-subclasses", "().__class__.__mro__[1].__subclasses__()"),
+    # ── Codex F-2: function-local imports of expression API ──────
+    # ``sqlalchemy.select`` is forbidden everywhere, including
+    # function-local in queries.py.
+    (
+        "nested-function-import-select",
+        "def outer():\n    def inner():\n"
+        "        from sqlalchemy import select\n"
+        "        return select()\n"
+        "    return inner\n",
+    ),
 ]
 
 ALL_EVIL_STUBS: list[tuple[str, str]] = NON_QUERIES_ONLY_STUBS + ALWAYS_FORBIDDEN_STUBS

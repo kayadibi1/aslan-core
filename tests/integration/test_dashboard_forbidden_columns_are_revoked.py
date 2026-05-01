@@ -241,6 +241,18 @@ _FORBIDDEN_COLUMNS: tuple[tuple[str, str], ...] = (
     ("audit.events", "before"),
     ("audit.events", "after"),
     ("audit.events", "metadata"),
+    # Codex branch-state F-1: raw client_ip + user_agent are no
+    # longer in the dashboard role's column-allowlist (migration
+    # 0022). The truncated CIDR is exposed via the SECURITY DEFINER
+    # helper ``audit.event_client_ip_truncated`` instead.
+    ("streams.outbox", "client_ip"),
+    ("streams.outbox", "user_agent"),
+    ("doc.filing", "client_ip"),
+    ("doc.filing", "user_agent"),
+    ("doc.filing_body", "client_ip"),
+    ("doc.filing_body", "user_agent"),
+    ("audit.events", "client_ip"),
+    ("audit.events", "user_agent"),
 )
 
 

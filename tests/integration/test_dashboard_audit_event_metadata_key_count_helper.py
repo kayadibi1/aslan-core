@@ -142,3 +142,61 @@ async def test_helper_owner_is_aslan_app(
         "WHERE n.nspname = 'audit' AND p.proname = 'event_metadata_key_count'"
     )
     assert owner == "aslan_app"
+
+
+# ── Codex branch-state F-1: client_ip truncation helper ──────────
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_client_ip_truncated_helper_returns_cidr(
+    aslan_dashboard_conn: asyncpg.Connection,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Migration 0022's SECURITY DEFINER helper renders the truncated
+    CIDR for an audit row whose ``client_ip`` is otherwise unreachable
+    from the dashboard role."""
+    async with session_factory() as s:
+        result = await s.execute(
+            text(
+                "INSERT INTO audit.events "
+                "(actor_id, actor_kind, operation, target_schema, target_table, "
+                " target_pk, client_ip) "
+                "VALUES ('user-cidr-test', 'user', 'insert', 'audit', 'events', "
+                "        CAST(:pk AS jsonb), CAST(:ip AS inet)) "
+                "RETURNING event_id, occurred_at"
+            ),
+            {"pk": '{"x":1}', "ip": "198.51.100.42"},
+        )
+        ev_id, ev_ts = result.one()
+        await s.commit()
+    try:
+        truncated: str = await aslan_dashboard_conn.fetchval(
+            "SELECT audit.event_client_ip_truncated($1, $2)",
+            ev_id,
+            ev_ts,
+        )
+        assert truncated == "198.51.100.0/24"
+    finally:
+        async with session_factory() as s:
+            await s.execute(
+                text("DELETE FROM audit.events WHERE event_id = :eid AND occurred_at = :ts"),
+                {"eid": ev_id, "ts": ev_ts},
+            )
+            await s.commit()
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_client_ip_truncated_helper_owner_is_aslan_app(
+    aslan_dashboard_conn: asyncpg.Connection,
+) -> None:
+    """Same OWNER lockdown as the metadata helper — runs as the role
+    that holds SELECT on the underlying column, not as the migration
+    runner."""
+    owner: str = await aslan_dashboard_conn.fetchval(
+        "SELECT r.rolname "
+        "FROM pg_proc p "
+        "JOIN pg_namespace n ON n.oid = p.pronamespace "
+        "JOIN pg_roles r ON r.oid = p.proowner "
+        "WHERE n.nspname = 'audit' AND p.proname = 'event_client_ip_truncated'"
+    )
+    assert owner == "aslan_app"

@@ -175,14 +175,26 @@ class _Scanner(ast.NodeVisitor):
     # ── Phase 1: build symbol table ──────────────────────────────
 
     def collect_aliases(self, tree: ast.AST) -> None:
+        """Build the alias table.
+
+        Imports are collected from EVERY scope (codex F-2): a function-
+        local ``from sqlalchemy import text`` is just as much a bypass
+        as a module-level one, and the symbol it binds shadows enclosing
+        scopes. We treat all imports as if they were module-level for
+        the purposes of name resolution. Module-level ``Assign`` aliases
+        (``sa = sqlalchemy``) are still only collected from the top-level
+        body to avoid false positives from local rebinds — those have
+        no legitimate use in dashboard code anyway.
+        """
         if not isinstance(tree, ast.Module):
             return
-        for node in tree.body:
+        for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 self._handle_import(node)
             elif isinstance(node, ast.ImportFrom):
                 self._handle_import_from(node)
-            elif isinstance(node, ast.Assign):
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
                 self._handle_assign(node)
 
     def _handle_import(self, node: ast.Import) -> None:
