@@ -63,6 +63,7 @@ from aslan_core.observability.metrics import (
     aslan_stream_outbox_drain_duration_seconds,
     aslan_stream_outbox_pending,
 )
+from aslan_core.streams.deadletter import redis_id_compare, redis_id_increment
 
 if TYPE_CHECKING:
     from redis.asyncio import Redis
@@ -216,6 +217,17 @@ async def _drain_one_batch(
         # — the outer SELECT FOR UPDATE locks are kept and the OTHER
         # pending rows in this batch still complete.
         sp = await session.begin_nested()
+        # F-outbox round-2 (codex post-merge): capture the Redis lower
+        # bound BEFORE the XADD so the post-failure orphan reconciler
+        # can paginate from this id forward instead of relying on a
+        # fixed XREVRANGE window. A hot stream that grows past the
+        # window between the accepted XADD and the recovery scan would
+        # otherwise leave the orphaned Redis copy invisible to the
+        # GDPR Art. 17 lookup table.
+        pre_xadd_lower_bound = await _capture_stream_lower_bound(
+            redis,
+            row.stream_name,
+        )
         try:
             # redis-py's xadd() type-stub asks for the broad str|bytes|...
             # union for both keys and values; we always pass str → str so
@@ -294,57 +306,30 @@ async def _drain_one_batch(
             failures += 1
             await sp.rollback()
             tb = traceback.format_exc()[:4000]
-            # F-outbox (codex post-merge): if the XADD landed in Redis
-            # but the drainer never observed the response (network
-            # failure mid-call, simulator wrapper raising after Redis
-            # accepted the entry, process kill between XADD and the
-            # client recv), the Redis entry exists with no
-            # ``streams.event_id_to_redis`` row. The redaction lookup
-            # cannot then find this copy of the event. Scan a bounded
-            # recent window of the stream for entries matching the
-            # row's ``event_id`` and index any orphan we find. The
-            # subsequent outbox retry will produce a NEW XADD (and
-            # NEW redis_message_id) which the success path indexes via
-            # the independent-session write above; that does not
-            # subsume this orphan because the redis_message_id differs.
+            # F-outbox (codex post-merge, hardened in round 2): if the
+            # XADD landed in Redis but the drainer never observed the
+            # response (network failure mid-call, simulator wrapper
+            # raising after Redis accepted the entry, process kill
+            # between XADD and the client recv), the Redis entry
+            # exists with no ``streams.event_id_to_redis`` row. The
+            # redaction lookup cannot then find this copy of the
+            # event. Paginate XRANGE from the lower bound captured
+            # BEFORE this XADD up to the current stream tail so a hot
+            # stream that grows past any fixed-size window between
+            # the accepted XADD and this recovery scan still gets the
+            # orphan indexed. The subsequent outbox retry will produce
+            # a NEW XADD (and NEW redis_message_id) which the success
+            # path above indexes via the independent-session write;
+            # that does not subsume this orphan because the
+            # redis_message_id differs.
             try:
-                async with session_factory() as orphan_session:
-                    recent = await redis.xrevrange(
-                        row.stream_name,
-                        max="+",
-                        min="-",
-                        count=200,
-                    )
-                    for rid_obj, fields in recent:
-                        eid_field = fields.get(b"event_id") or fields.get("event_id")
-                        if eid_field is None:
-                            continue
-                        eid_str = (
-                            eid_field.decode()
-                            if isinstance(eid_field, bytes | bytearray)
-                            else str(eid_field)
-                        )
-                        if eid_str != str(row.event_id):
-                            continue
-                        rid_str = (
-                            rid_obj.decode()
-                            if isinstance(rid_obj, bytes | bytearray)
-                            else str(rid_obj)
-                        )
-                        await orphan_session.execute(
-                            text(
-                                "INSERT INTO streams.event_id_to_redis "
-                                "(event_id, stream_name, redis_message_id) "
-                                "VALUES (:eid, :sn, :rid) "
-                                "ON CONFLICT DO NOTHING"
-                            ),
-                            {
-                                "eid": str(row.event_id),
-                                "sn": row.stream_name,
-                                "rid": rid_str,
-                            },
-                        )
-                    await orphan_session.commit()
+                await _reconcile_unindexed_xadd(
+                    session_factory=session_factory,
+                    redis=redis,
+                    stream_name=str(row.stream_name),
+                    event_id=str(row.event_id),
+                    lower_bound=pre_xadd_lower_bound,
+                )
             except (
                 AttributeError,
                 RedisError,
@@ -354,8 +339,9 @@ async def _drain_one_batch(
                 RuntimeError,
             ):  # pragma: no cover — defensive
                 # ``AttributeError`` covers a partial-mock Redis client
-                # that doesn't expose ``xrevrange`` (existing tests use
-                # such mocks for forced-XADD-failure shapes).
+                # that doesn't expose ``xrange``/``xinfo_stream``
+                # (existing tests use such mocks for forced-XADD-failure
+                # shapes).
                 _log.exception(
                     "post-failure event_id_to_redis reconciliation failed for %s",
                     row.outbox_id,
@@ -392,6 +378,110 @@ async def _drain_one_batch(
     oldest_age = (now - oldest).total_seconds()
     newest_age = (now - newest).total_seconds()
     return drained, oldest_age, newest_age, failures
+
+
+async def _capture_stream_lower_bound(redis: Redis, stream_name: str) -> str:
+    """Return the smallest Redis id strictly greater than the current
+    stream tail, so a paginated scan starting at this id catches the
+    NEXT XADD and everything after but not the prior tail.
+
+    Returns ``"0-0"`` for an empty or absent stream. Mock Redis clients
+    that don't expose ``xrevrange`` fall through via ``AttributeError``
+    to the same default — the bookkeeping is still durable, just from
+    the start of the stream.
+    """
+    try:
+        last = await redis.xrevrange(stream_name, count=1)
+    except (RedisError, AttributeError):
+        return "0-0"
+    if not last:
+        return "0-0"
+    last_id = last[0][0].decode() if isinstance(last[0][0], bytes | bytearray) else str(last[0][0])
+    if last_id == "0-0":
+        return "0-0"
+    return redis_id_increment(last_id)
+
+
+async def _reconcile_unindexed_xadd(
+    *,
+    session_factory: async_sessionmaker[AsyncSession],
+    redis: Redis,
+    stream_name: str,
+    event_id: str,
+    lower_bound: str,
+) -> None:
+    """Paginate XRANGE from ``lower_bound`` to the current stream tail
+    (captured at scan start) looking for any entry whose ``event_id``
+    matches and INSERT a ``streams.event_id_to_redis`` row.
+
+    Codex round-2 follow-up to F-outbox: the previous fixed
+    ``count=200`` XREVRANGE could miss orphaned XADDs on a hot stream
+    that appended more than the window between the accepted XADD and
+    this recovery scan.
+    """
+    try:
+        info = await redis.xinfo_stream(stream_name)
+    except (RedisError, AttributeError) as exc:
+        if isinstance(exc, RedisError) and "no such key" in str(exc).lower():
+            return
+        if isinstance(exc, AttributeError):
+            return
+        raise
+    last_entry = info.get("last-entry") if info else None
+    if not last_entry:
+        return
+    upper_bound = (
+        last_entry[0].decode()
+        if isinstance(last_entry[0], bytes | bytearray)
+        else str(last_entry[0])
+    )
+    if redis_id_compare(lower_bound, upper_bound) > 0:
+        return
+
+    cursor = lower_bound
+    async with session_factory() as orphan_session:
+        while True:
+            page = await redis.xrange(
+                stream_name,
+                min=cursor,
+                max=upper_bound,
+                count=1_000,
+            )
+            if not page:
+                break
+            for rid_obj, fields in page:
+                eid_field = fields.get(b"event_id") or fields.get("event_id")
+                if eid_field is None:
+                    continue
+                eid_str = (
+                    eid_field.decode()
+                    if isinstance(eid_field, bytes | bytearray)
+                    else str(eid_field)
+                )
+                if eid_str != event_id:
+                    continue
+                rid_str = (
+                    rid_obj.decode() if isinstance(rid_obj, bytes | bytearray) else str(rid_obj)
+                )
+                await orphan_session.execute(
+                    text(
+                        "INSERT INTO streams.event_id_to_redis "
+                        "(event_id, stream_name, redis_message_id) "
+                        "VALUES (:eid, :sn, :rid) "
+                        "ON CONFLICT DO NOTHING"
+                    ),
+                    {"eid": event_id, "sn": stream_name, "rid": rid_str},
+                )
+            last_id_obj = page[-1][0]
+            last_id = (
+                last_id_obj.decode()
+                if isinstance(last_id_obj, bytes | bytearray)
+                else str(last_id_obj)
+            )
+            cursor = redis_id_increment(last_id)
+            if redis_id_compare(cursor, upper_bound) > 0:
+                break
+        await orphan_session.commit()
 
 
 __all__ = ["drain_outbox"]

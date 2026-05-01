@@ -227,6 +227,12 @@ async def test_f2_pass_2_indexes_unindexed_redis_orphan_instead_of_xadding(
     """If a prior consumer XADDed but crashed before INSERTing the
     index row, pass 2 must scan the dead-letter stream, find the
     unindexed XADD, index it, and reuse it — not XADD a duplicate.
+
+    Codex round-2 follow-up: pass 2 MUST also durably insert the
+    index row when reusing an unindexed orphan; without that insert,
+    pass 3 verification cannot see the entry and pass 4 only rescues
+    it inside its bounded recent window. The index assertion below
+    is what locks that contract.
     """
     fid = await _insert_stuck_deadletter_row(
         session,
@@ -273,6 +279,68 @@ async def test_f2_pass_2_indexes_unindexed_redis_orphan_instead_of_xadding(
     assert idx_rid == orphan_message_id
 
 
+async def test_f2_pass_2_indexes_orphan_older_than_pass4_window(
+    session: AsyncSession,
+    redis_client: Redis,
+    session_factory: async_sessionmaker[AsyncSession],
+    _wipe_deadletter_state: None,
+) -> None:
+    """Codex round-2 regression: an unindexed orphan that's older than
+    pass 4's bounded window MUST still be indexed by pass 2. Without
+    pass 2 inserting the index, pass 3 verification has nothing to
+    check and pass 4 will never see the orphan past its window.
+    """
+    fid = await _insert_stuck_deadletter_row(
+        session,
+        event_id="00000000-0000-0000-0000-000000000062",
+    )
+    orphan_message_id = await redis_client.xadd(
+        f"{STREAM}.deadletter",
+        {
+            "event_id": "00000000-0000-0000-0000-000000000062",
+            "failure_id": str(fid),
+            "stream_name": STREAM,
+        },
+    )
+    # Push the orphan well outside any plausible pass 4 window by
+    # forcing pass4_window=1 — only the most recent entry would land
+    # in pass 4's scan, which is the canonical single-entry case the
+    # earlier pass-2 reuse test already covers.
+    await redis_client.xadd(
+        f"{STREAM}.deadletter",
+        {"event_id": "_filler_", "failure_id": "0", "stream_name": STREAM},
+    )
+
+    await stream_deadletter_janitor(
+        redis=redis_client,
+        session_factory=session_factory,
+        pass4_window=1,
+        once=True,
+    )
+
+    log = (
+        await session.execute(
+            text("SELECT redis_message_id FROM streams.deadletter_log WHERE failure_id = :fid"),
+            {"fid": fid},
+        )
+    ).scalar_one()
+    assert log == orphan_message_id
+
+    idx_rid = (
+        await session.execute(
+            text(
+                "SELECT redis_message_id FROM streams.deadletter_redis_index "
+                "WHERE failure_id = :fid"
+            ),
+            {"fid": fid},
+        )
+    ).scalar_one()
+    assert idx_rid == orphan_message_id, (
+        "pass 2 must index the orphan so pass 3 can verify it; "
+        "without this, an orphan beyond pass 4's window is invisible"
+    )
+
+
 # ── F-outbox regression ────────────────────────────────────────────
 
 
@@ -317,6 +385,38 @@ class _CrashAfterIndexCommitRedis:
         if self._calls == 2:
             raise RuntimeError("simulated savepoint-failing XADD path")
         return await self._real.xadd(*args, **kwargs)
+
+
+class _CrashAfterAcceptedXAddPlusFlood:
+    """Redis wrapper that simulates "XADD landed but response lost",
+    then floods the stream with N additional entries before the
+    drainer's recovery scan can run. Every call to this wrapper's
+    ``xadd`` lands in Redis; the first call additionally raises so
+    the drainer enters the failure path. Concrete enough to exercise
+    the codex round-2 follow-up: a fixed XREVRANGE window would miss
+    the orphan when the stream grows past the window size between the
+    accepted XADD and recovery.
+    """
+
+    def __init__(self, real: Any, flood_n: int) -> None:
+        self._real = real
+        self._flood_n = flood_n
+        self._fired = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+    async def xadd(self, *args: Any, **kwargs: Any) -> Any:
+        result = await self._real.xadd(*args, **kwargs)
+        if not self._fired:
+            self._fired = True
+            for _ in range(self._flood_n):
+                await self._real.xadd(
+                    args[0],
+                    {"event_id": str(uuid4()), "schema_version": "1", "payload": "{}"},
+                )
+            raise RuntimeError("simulated XADD response lost")
+        return result
 
 
 async def test_f_outbox_indexes_xadd_even_on_savepoint_rollback(
@@ -385,6 +485,79 @@ async def test_f_outbox_indexes_xadd_even_on_savepoint_rollback(
     assert redis_ids.issubset(indexed_ids), (
         f"every Redis copy must be indexed for redaction lookup: "
         f"missing={redis_ids - indexed_ids!r}"
+    )
+
+
+async def test_f_outbox_indexes_xadd_under_hot_stream_flood(
+    session: AsyncSession,
+    redis_client: Redis,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Codex round-2 regression: when the dead-letter Redis stream
+    grows past any fixed-size XREVRANGE window between the accepted
+    XADD and the drainer's recovery scan, the orphan MUST still be
+    indexed. The original bounded ``count=200`` recovery would have
+    silently lost the orphan.
+    """
+    async with session_factory() as s:
+        await s.execute(text("DELETE FROM streams.event_id_to_redis"))
+        await s.execute(text("DELETE FROM streams.outbox"))
+        await s.execute(
+            text(
+                "INSERT INTO src.source(source_id, name, kind, license_status) "
+                "VALUES('kap','KAP','scraper','open') ON CONFLICT DO NOTHING"
+            )
+        )
+        rid: int = (
+            await s.execute(
+                text(
+                    "INSERT INTO src.ingestion_run(source_id, job_name, status) "
+                    "VALUES('kap','f_outbox_flood','succeeded') RETURNING ingestion_run_id"
+                )
+            )
+        ).scalar_one()
+        await s.commit()
+    await redis_client.delete(STREAM)
+
+    eid = uuid4()
+    async with session_factory() as s:
+        producer = StreamProducer(session=s, ingestion_run_id=rid)
+        await producer.publish(_ev(event_id=eid, producer_run_id=rid))
+        await s.commit()
+
+    # 250 floods is comfortably past the 200-entry cap of the original
+    # bounded XREVRANGE recovery, ensuring the orphan would have been
+    # invisible to the prior implementation.
+    flood = _CrashAfterAcceptedXAddPlusFlood(redis_client, flood_n=250)
+    await drain_outbox(
+        redis=flood,  # type: ignore[arg-type]
+        session_factory=session_factory,
+        once=True,
+    )
+
+    # Find the orphan's redis_message_id in the stream by event_id.
+    entries = await redis_client.xrange(STREAM, min="-", max="+")
+    orphan_rid: str | None = None
+    for rid_obj, fields in entries:
+        if fields.get("event_id") == str(eid):
+            orphan_rid = rid_obj
+            break
+    assert orphan_rid is not None, "test setup: orphan should be in stream"
+
+    indexed = (
+        await session.execute(
+            text(
+                "SELECT 1 FROM streams.event_id_to_redis "
+                "WHERE stream_name = :s "
+                "AND event_id = CAST(:e AS UUID) "
+                "AND redis_message_id = :r"
+            ),
+            {"s": STREAM, "e": str(eid), "r": orphan_rid},
+        )
+    ).scalar_one_or_none()
+    assert indexed is not None, (
+        f"orphan {orphan_rid!r} for event_id {eid!s} must be indexed "
+        f"despite the stream having grown past a fixed recovery window"
     )
 
 

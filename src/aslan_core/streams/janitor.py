@@ -481,6 +481,16 @@ async def _resolve_canonical_orphan(
     crashed between XADD and the index INSERT). Returns ``None`` if no
     prior copy exists; the caller must XADD a fresh entry.
 
+    When an unindexed orphan is found via the dead-letter stream
+    scan, this function ALSO inserts the matching
+    ``streams.deadletter_redis_index`` row. Without that insert, pass 2
+    would mark routing complete with ``deadletter_log.redis_message_id``
+    pointing at the orphan but no durable index row, leaving the
+    Redis entry invisible to pass 3's verification — and pass 4 only
+    rescues such orphans inside its bounded recent window, so an
+    older orphan would stay un-indexed forever (codex round-2
+    follow-up to F2).
+
     F2 (codex post-merge) — without this lookup, ``_pass_2_stuck_row_scan``
     XADDs a duplicate when an indexed prior copy already exists, which
     pass 4 then XDELs as an orphan and leaves ``deadletter_log`` pointing
@@ -504,12 +514,27 @@ async def _resolve_canonical_orphan(
     # No durable index row. Walk the dead-letter stream for an unindexed
     # XADD orphan (consumer crashed between XADD and the index INSERT
     # before pass 4's bounded window picked it up).
-    return await find_orphan_in_deadletter_stream(
+    orphan = await find_orphan_in_deadletter_stream(
         redis,
         stream_name,
         lower_bound="0-0",
         target_failure_id=failure_id,
     )
+    if orphan is None:
+        return None
+    # Codex round-2 follow-up: index the orphan now so pass 3 can
+    # verify it and pass 4 can find it after the bounded window has
+    # rolled past. ``ON CONFLICT DO NOTHING`` keeps the call idempotent.
+    await session.execute(
+        text(
+            "INSERT INTO streams.deadletter_redis_index "
+            "(failure_id, redis_message_id) "
+            "VALUES (:fid, :rid) "
+            "ON CONFLICT DO NOTHING"
+        ),
+        {"fid": failure_id, "rid": orphan},
+    )
+    return orphan
 
 
 async def _finish_routing_after_adoption(
