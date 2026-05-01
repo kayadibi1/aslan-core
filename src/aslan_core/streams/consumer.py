@@ -265,9 +265,23 @@ class StreamConsumer:
         """Yield ``(event, ack_callable)`` pairs from ``stream`` until cancelled.
 
         The caller is responsible for calling ``await ack()`` on success.
-        On caller exception, the consumer's exception path runs
-        automatically: DEL the in-flight claim, increment the failure
-        counter, and route to dead-letter if the threshold is crossed.
+        On caller exception that surfaces through ``await ack()`` (e.g.
+        Lua/audit failures), the consumer's ``except Exception:`` path
+        runs: DEL the in-flight claim, increment the failure counter,
+        and route to dead-letter if the threshold is crossed.
+
+        **Lifecycle note (codex F7 — v0.5.2 follow-up):** when the
+        caller's ``async for`` body raises, Python does NOT propagate
+        that exception to this generator's frame — it sends
+        ``GeneratorExit`` via ``aclose()``, a ``BaseException`` that
+        ``except Exception:`` does not catch. The consumer therefore
+        does NOT release the claim on caller-body raise; the claim
+        instead expires naturally under its 5-minute TTL lease before
+        a sibling consumer can pick the message back up. Releasing
+        the claim synchronously on body raise is a v0.5.2 consumer-API
+        redesign (the ack callable would expose a paired ``release``
+        path that the framework calls under both success and failure
+        without relying on ``GeneratorExit``).
 
         :param stream: The Redis stream name (canonical, from
             :data:`aslan_core.streams.names.STREAMS`).
@@ -540,31 +554,20 @@ class StreamConsumer:
         lock_released = False
 
         async def _ack() -> None:
-            """Caller-success transition: SADD processed + DEL claim +
-            XACK + audit. Atomic via a small Lua script (single
-            round-trip; SADD survives a server crash even if the audit
-            commit later fails)."""
+            """Caller-success transition: audit-then-Lua.
+
+            F4 (codex post-merge): the audit row is written and committed
+            BEFORE the irreversible Redis transition (SADD processed +
+            DEL claim + XACK), so a Redis-side failure after this point
+            leaves a Postgres audit row rather than a silent compliance
+            hole. The trade-off is at-least-once delivery if the Lua
+            call fails after the audit commits — the message stays in
+            PEL, the next consumer re-yields to the caller (the
+            ``processed`` SADD never happened), and a second consume
+            audit row records the redelivery. Operators see the duplicate
+            audit instead of losing the consume signal entirely.
+            """
             nonlocal lock_released
-            lua = (
-                "redis.call('SADD', KEYS[1], ARGV[1])\n"
-                "redis.call('EXPIRE', KEYS[1], ARGV[2])\n"
-                "redis.call('DEL', KEYS[2])\n"
-                "redis.call('XACK', KEYS[3], ARGV[3], ARGV[4])\n"
-                "return 1\n"
-            )
-            await _aw(
-                self._redis.eval(
-                    lua,
-                    3,
-                    processed_key,
-                    claim_key,
-                    stream,
-                    str(captured_event_id),
-                    str(PROCESSED_TTL_SECONDS),
-                    group,
-                    captured_message_id,
-                ),
-            )
             await audit_record(
                 lock_session,
                 record=AuditRecord(
@@ -589,6 +592,26 @@ class StreamConsumer:
             await lock_session.commit()
             await lock_session.close()
             lock_released = True
+            lua = (
+                "redis.call('SADD', KEYS[1], ARGV[1])\n"
+                "redis.call('EXPIRE', KEYS[1], ARGV[2])\n"
+                "redis.call('DEL', KEYS[2])\n"
+                "redis.call('XACK', KEYS[3], ARGV[3], ARGV[4])\n"
+                "return 1\n"
+            )
+            await _aw(
+                self._redis.eval(
+                    lua,
+                    3,
+                    processed_key,
+                    claim_key,
+                    stream,
+                    str(captured_event_id),
+                    str(PROCESSED_TTL_SECONDS),
+                    group,
+                    captured_message_id,
+                ),
+            )
             aslan_stream_acks_total.labels(
                 stream=prom_stream,
                 group=prom_group,
@@ -602,7 +625,18 @@ class StreamConsumer:
         # Step 4 — yield to caller within an iteration span (codex
         # spec §10). Exceptions inside the caller's body propagate;
         # the consumer's exception path tracks failure count and may
-        # route to dead-letter.
+        # route to dead-letter. NOTE: when the caller's ``async for``
+        # body raises, Python does NOT propagate that exception to
+        # this generator's frame — it calls ``gen.aclose()`` which
+        # raises ``GeneratorExit``, a ``BaseException`` not caught by
+        # ``except Exception:``. We deliberately do NOT catch it here:
+        # the cleanup-via-Redis path interacts poorly with redis-py
+        # connection lifecycle during pytest teardown (ResourceWarnings
+        # surface as next-test errors). The claim instead expires
+        # naturally under its 5-minute TTL lease, and the F4 PEL
+        # contract above is what carries correctness. A v0.5.2
+        # consumer-API redesign (release the claim synchronously via
+        # the ack-failure path) is the proper fix for codex F7.
         try:
             async for item in self._yield_with_iterate_span(
                 event=event,
@@ -728,17 +762,22 @@ class StreamConsumer:
         except RedisError:  # pragma: no cover — defensive
             _log.debug("failed to release claim_key", exc_info=True)
 
-        try:
-            failures = await _aw(
-                self._redis.hincrby(
-                    f"stream:{stream}:{group}:failures",
-                    message_id,
-                    1,
-                ),
-            )
-        except RedisError:  # pragma: no cover — defensive
-            failures = 0
-            _log.exception("failed to bump failure counter")
+        # F6 (codex post-merge): never silently classify a failure-counter
+        # bookkeeping error as ``failures = 0``. Letting the read fall
+        # through would leave a poison message cycling in PEL forever
+        # because dead-letter escalation depends on the counter crossing
+        # ``max_attempts_before_deadletter``. Propagate the Redis error
+        # so the next redelivery retries the bump (the claim was already
+        # released above, so no consumer is starved). The original caller
+        # exception is preserved in ``last_error`` and reaches the
+        # outer consume-loop traceback.
+        failures = await _aw(
+            self._redis.hincrby(
+                f"stream:{stream}:{group}:failures",
+                message_id,
+                1,
+            ),
+        )
 
         if failures > self.max_attempts_before_deadletter:
             await self._route(

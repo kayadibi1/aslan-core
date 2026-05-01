@@ -264,14 +264,22 @@ async def test_failed_processing_retries_not_xack_skipped(
     )
     assert not is_processed, "processed SADD must NOT happen on caller failure"
 
-    # in-flight claim is held under a bounded TTL (5 min); the actual
-    # lease expires naturally on caller crash.
+    # F7 (codex post-merge): we'd LIKE to assert ``claim_ttl == -2``
+    # here so a regression in the claim-release path fails loudly.
+    # Reality: Python's ``async for`` does NOT call ``aclose()`` on
+    # the iterator when the body raises — cleanup runs lazily via GC.
+    # The consumer's ``GeneratorExit`` handler in ``_process_message``
+    # DOES delete the claim, but only after the test's next line runs.
+    # Even ``contextlib.aclosing`` did not appear to await the handler
+    # synchronously in this Python/redis-py/pytest-asyncio combination
+    # (verified post-merge). Tightening this assertion is therefore a
+    # v0.5.2 consumer-API redesign (release the claim synchronously
+    # via the ack-failure path, not via GeneratorExit). For v0.5.1
+    # we keep the lenient assertion: either the key is gone OR the
+    # lease TTL is still pinned >0. The "no XACK" assertion above is
+    # the real consume-side correctness guarantee for this test.
     claim_key = f"stream:{stream}:{group}:claim:{event.event_id}"
     claim_ttl = await redis_client.ttl(claim_key)
-    # ttl() returns -2 (no key), -1 (no expiry), or seconds remaining.
-    # Either the lease is still set with TTL >0 OR the key has been
-    # released. Both are acceptable F4 outcomes; what matters is that
-    # the message stayed in PEL and the processed marker did NOT fire.
     assert claim_ttl in (-2,) or claim_ttl > 0, (
         f"unexpected claim TTL state ({claim_ttl}); claim_key={claim_key!r}"
     )

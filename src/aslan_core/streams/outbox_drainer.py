@@ -47,7 +47,9 @@ import traceback
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from redis.exceptions import RedisError
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from aslan_core.audit import (
@@ -112,6 +114,7 @@ async def drain_outbox(
             async with session_factory() as session:
                 drained, oldest_age_s, newest_age_s, failures = await _drain_one_batch(
                     session=session,
+                    session_factory=session_factory,
                     redis=redis,
                     batch_size=batch_size,
                     redis_default_maxlen=redis_default_maxlen,
@@ -172,6 +175,7 @@ def _set_gauge(gauge: Any, value: float) -> None:
 async def _drain_one_batch(
     *,
     session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
     redis: Redis,
     batch_size: int,
     redis_default_maxlen: int,
@@ -232,12 +236,37 @@ async def _drain_one_batch(
                 maxlen=redis_default_maxlen,
                 approximate=True,
             )
-            # Both the outbox UPDATE and the event_id_to_redis INSERT
-            # MUST run in the same transaction so a crash between them
-            # leaves the outbox row pending — at-least-once semantics
-            # plus consumer-side event_id dedup gives exactly-once
-            # observable delivery (codex critical-contract item 6 +
-            # spec §6 + Task 11 idempotency proof).
+            # F-outbox (codex post-merge): index every successful XADD
+            # in an INDEPENDENT transaction so the redaction lookup
+            # table records this Redis copy even if the outer savepoint
+            # below later rolls back. Without this, a savepoint failure
+            # (serialization conflict, transient DB error) leaves the
+            # outbox row pending → next drain XADDs again, but the
+            # earlier XADD has no event_id_to_redis row, making it
+            # invisible to GDPR Art. 17 redaction lookup. Composite PK
+            # (event_id, stream_name, redis_message_id) accommodates
+            # multiple Redis copies of the same event_id.
+            async with session_factory() as idx_session:
+                await idx_session.execute(
+                    text(
+                        "INSERT INTO streams.event_id_to_redis "
+                        "(event_id, stream_name, redis_message_id) "
+                        "VALUES (:eid, :sn, :rid) "
+                        "ON CONFLICT DO NOTHING"
+                    ),
+                    {
+                        "eid": str(row.event_id),
+                        "sn": row.stream_name,
+                        "rid": redis_message_id,
+                    },
+                )
+                await idx_session.commit()
+            # Mark the outbox row as published in the savepoint. The
+            # event_id_to_redis INSERT below is now idempotent against
+            # the durable write above; we keep it so the outbox UPDATE
+            # and a redundant index touch share a transaction (matches
+            # the codex spec §6 contract for exactly-once observable
+            # delivery via consumer-side event_id dedup).
             await session.execute(
                 text(
                     "UPDATE streams.outbox "
@@ -265,6 +294,72 @@ async def _drain_one_batch(
             failures += 1
             await sp.rollback()
             tb = traceback.format_exc()[:4000]
+            # F-outbox (codex post-merge): if the XADD landed in Redis
+            # but the drainer never observed the response (network
+            # failure mid-call, simulator wrapper raising after Redis
+            # accepted the entry, process kill between XADD and the
+            # client recv), the Redis entry exists with no
+            # ``streams.event_id_to_redis`` row. The redaction lookup
+            # cannot then find this copy of the event. Scan a bounded
+            # recent window of the stream for entries matching the
+            # row's ``event_id`` and index any orphan we find. The
+            # subsequent outbox retry will produce a NEW XADD (and
+            # NEW redis_message_id) which the success path indexes via
+            # the independent-session write above; that does not
+            # subsume this orphan because the redis_message_id differs.
+            try:
+                async with session_factory() as orphan_session:
+                    recent = await redis.xrevrange(
+                        row.stream_name,
+                        max="+",
+                        min="-",
+                        count=200,
+                    )
+                    for rid_obj, fields in recent:
+                        eid_field = fields.get(b"event_id") or fields.get("event_id")
+                        if eid_field is None:
+                            continue
+                        eid_str = (
+                            eid_field.decode()
+                            if isinstance(eid_field, bytes | bytearray)
+                            else str(eid_field)
+                        )
+                        if eid_str != str(row.event_id):
+                            continue
+                        rid_str = (
+                            rid_obj.decode()
+                            if isinstance(rid_obj, bytes | bytearray)
+                            else str(rid_obj)
+                        )
+                        await orphan_session.execute(
+                            text(
+                                "INSERT INTO streams.event_id_to_redis "
+                                "(event_id, stream_name, redis_message_id) "
+                                "VALUES (:eid, :sn, :rid) "
+                                "ON CONFLICT DO NOTHING"
+                            ),
+                            {
+                                "eid": str(row.event_id),
+                                "sn": row.stream_name,
+                                "rid": rid_str,
+                            },
+                        )
+                    await orphan_session.commit()
+            except (
+                AttributeError,
+                RedisError,
+                SQLAlchemyError,
+                ValueError,
+                TypeError,
+                RuntimeError,
+            ):  # pragma: no cover — defensive
+                # ``AttributeError`` covers a partial-mock Redis client
+                # that doesn't expose ``xrevrange`` (existing tests use
+                # such mocks for forced-XADD-failure shapes).
+                _log.exception(
+                    "post-failure event_id_to_redis reconciliation failed for %s",
+                    row.outbox_id,
+                )
             # Bump publish_attempts in a fresh SAVEPOINT so the bookkeeping
             # write is durable even though the XADD path failed. The
             # outer transaction still owns the FOR UPDATE locks for the

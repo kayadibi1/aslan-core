@@ -138,9 +138,15 @@ async def write_registry_entry(
     redacted_payload_hash: str,
     original_payload_hash: str,
     redacted_at: datetime | None = None,
-    redis: Redis | None = None,
 ) -> None:
-    """Call the SECURITY DEFINER function; never direct-INSERT the table."""
+    """Call the SECURITY DEFINER function; never direct-INSERT the table.
+
+    The Redis cache is intentionally not primed here: the caller's
+    transaction has not yet committed, and a rollback would otherwise
+    leave the cache advertising a redaction that the database does not
+    have for ``REDACTION_CACHE_TTL_SECONDS``. Consumers populate the
+    cache lazily through :func:`fetch_cached_registry_entry`.
+    """
     await session.execute(
         text(
             """
@@ -165,18 +171,6 @@ async def write_registry_entry(
             "original_payload_hash": original_payload_hash,
         },
     )
-    if redis is not None:
-        await cache_registry_entry(
-            redis,
-            RedactionRegistryEntry(
-                event_id=event_id,
-                redaction_reason=redaction_reason,
-                original_stream=original_stream,
-                redacted_payload=redacted_payload,
-                redacted_payload_hash=redacted_payload_hash,
-                original_payload_hash=original_payload_hash,
-            ),
-        )
 
 
 __all__ = [
