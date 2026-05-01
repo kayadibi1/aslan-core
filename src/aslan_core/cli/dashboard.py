@@ -64,12 +64,6 @@ def dashboard() -> None:
     help="TCP port to listen on.",
 )
 @click.option(
-    "--reload",
-    is_flag=True,
-    default=False,
-    help="Enable auto-reload (development only).",
-)
-@click.option(
     "--i-know-this-is-unsafe",
     "unsafe_ack",
     is_flag=True,
@@ -82,13 +76,21 @@ def dashboard() -> None:
         "operator data within reach of any caller on the network."
     ),
 )
-def serve(*, host: str, port: int, reload: bool, unsafe_ack: bool) -> None:
+def serve(*, host: str, port: int, unsafe_ack: bool) -> None:
     """Start the dashboard via uvicorn.
 
     Reads ``ASLAN_DASHBOARD_DSN`` for the dedicated ``aslan_dashboard``
     PostgreSQL role created in migration 0020. Without that env var
     the CLI exits with a usage error pointing at the migration —
     operators recover with ``alembic upgrade head`` plus an env var.
+
+    Note on ``--reload``: ultrareview bug_005 surfaced that
+    uvicorn's auto-reload requires the application as an import
+    string AND a worker subprocess that re-runs ``configure_app``.
+    Wiring that up correctly is meaningful work and the flag is
+    dev-only ergonomics; it has been removed entirely until a
+    later release adds the proper plumbing. Developers can restart
+    the process manually in the meantime.
     """
     if "ASLAN_DASHBOARD_DSN" not in os.environ:
         raise click.UsageError(
@@ -109,4 +111,4 @@ def serve(*, host: str, port: int, reload: bool, unsafe_ack: bool) -> None:
         )
 
     serve_fn = _resolve_serve()
-    serve_fn(host=host, port=port, reload=reload)
+    serve_fn(host=host, port=port)

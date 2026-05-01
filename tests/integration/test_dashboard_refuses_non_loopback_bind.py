@@ -62,10 +62,9 @@ def test_serve_non_loopback_bind_with_ack_does_not_exit_for_bind_reason(
     runner = _runner_env(monkeypatch)
     called_with: dict[str, object] = {}
 
-    def _fake_serve(*, host: str, port: int, reload: bool) -> None:
+    def _fake_serve(*, host: str, port: int) -> None:
         called_with["host"] = host
         called_with["port"] = port
-        called_with["reload"] = reload
 
     monkeypatch.setattr("aslan_core.dashboard.serve", _fake_serve)
     bind_all = "0.0.0.0"  # noqa: S104 — exercising the unsafe-ack branch

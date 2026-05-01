@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 
 
-def serve(*, host: str = "127.0.0.1", port: int = 8585, reload: bool = False) -> None:
+def serve(*, host: str = "127.0.0.1", port: int = 8585) -> None:
     """Start the FastHTML dashboard via uvicorn.
 
     Reads ``ASLAN_DASHBOARD_DSN`` for the dedicated ``aslan_dashboard``
@@ -34,6 +34,13 @@ def serve(*, host: str = "127.0.0.1", port: int = 8585, reload: bool = False) ->
     custom embeddings (rare; the v0.6.0 surface is CLI-driven) are
     on the hook for setting up an isolated process and a fronting
     proxy themselves.
+
+    No ``reload`` parameter: ultrareview bug_005 found that
+    uvicorn's auto-reload requires an import string + a worker
+    subprocess that re-runs ``configure_app``. Wiring that up
+    properly is real work and the feature is dev-only ergonomics;
+    it has been dropped from the CLI until a later release adds
+    the proper plumbing.
 
     Imports inside the function body so consumers without the
     ``[dashboard]`` extra installed can ``from aslan_core import
@@ -63,7 +70,7 @@ def serve(*, host: str = "127.0.0.1", port: int = 8585, reload: bool = False) ->
     redis = Redis.from_url(redis_url)
     configure_app(session_factory=session_factory, redis_client=redis)
 
-    uvicorn.run(app, host=host, port=port, reload=reload)
+    uvicorn.run(app, host=host, port=port)
 
 
 __all__ = ["serve"]

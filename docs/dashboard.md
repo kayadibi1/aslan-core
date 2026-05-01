@@ -94,8 +94,7 @@ recovery.
 ## CLI
 
 ```
-aslan dashboard serve [--host HOST] [--port PORT] [--reload]
-                     [--i-know-this-is-unsafe]
+aslan dashboard serve [--host HOST] [--port PORT] [--i-know-this-is-unsafe]
 ```
 
 * `--host` defaults to `127.0.0.1`. Loopback hosts (`127.0.0.1`,
@@ -104,7 +103,9 @@ aslan dashboard serve [--host HOST] [--port PORT] [--reload]
   `--i-know-this-is-unsafe`. The flag is the operator's explicit
   acknowledgement that a fronting reverse-proxy is in place — see
   the next section.
-* `--reload` enables uvicorn auto-reload (development only).
+* No auto-reload flag. uvicorn's `--reload` requires an
+  import-string + per-worker startup hook plumbing that v0.6.0
+  does not ship; restart the process manually during development.
 
 ## Localhost / SSH-tunnel deployment
 
