@@ -107,7 +107,18 @@ warn_unused_ignores = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["asyncpg.*", "alembic.*", "testcontainers.*", "aioboto3.*", "botocore.*"]
+module = [
+    "asyncpg.*",
+    "alembic.*",
+    "testcontainers.*",
+    "aioboto3.*",
+    "botocore.*",
+    # v0.6.0 [dashboard] extra. python-fasthtml + its starlette
+    # transitive dep ship without py.typed markers under uv's lock;
+    # mypy can't analyse them under strict.
+    "fasthtml.*",
+    "starlette.*",
+]
 ignore_missing_imports = true
 
 # v0.3.0 [obs] extra — sentry-sdk, opentelemetry, prometheus_client are
