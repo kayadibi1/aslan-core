@@ -53,7 +53,6 @@ def test_outbox_row_vm_rejects_extra_fields() -> None:
         "publish_attempts": 0,
         "last_attempt_at": None,
         "last_error_kind": None,
-        "payload_size_bytes": 0,
     }
     OutboxRowVM(**base_kwargs)  # baseline: valid construction succeeds
     with pytest.raises(ValidationError):
@@ -65,12 +64,11 @@ def test_audit_row_vm_rejects_metadata_field() -> None:
     (an int from the SECURITY DEFINER helper), never the raw metadata.
     A future refactor that tries to pass ``metadata=...`` MUST fail."""
     from datetime import UTC, datetime
-    from uuid import uuid4
 
     from aslan_core.dashboard.view_models import AuditRowVM
 
     base_kwargs = {
-        "event_id": uuid4(),
+        "event_id": 1,
         "occurred_at": datetime.now(UTC),
         "actor_id": "user:alice",
         "actor_kind": "user",

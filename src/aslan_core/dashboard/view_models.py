@@ -76,6 +76,15 @@ class OverviewVM(_VMBase):
 
 
 class OutboxRowVM(_VMBase):
+    """Outbox row projection. ``payload_size_bytes`` is intentionally
+    NOT surfaced — migration 0020's plan-rounds dropped the
+    ``streams.outbox_payload_size`` SECURITY DEFINER helper after
+    determining that per-row payload-size adds attack surface for
+    marginal operator value. Operators rely on counts and ages
+    instead. If a future operator workflow needs payload-size, add
+    the helper back as a follow-up migration with the same shape as
+    ``audit.event_metadata_key_count``."""
+
     outbox_id: int
     stream_name: str
     event_id: UUID
@@ -86,7 +95,6 @@ class OutboxRowVM(_VMBase):
     publish_attempts: int
     last_attempt_at: datetime | None
     last_error_kind: str | None
-    payload_size_bytes: int
 
 
 class OutboxVM(_VMBase):
@@ -191,7 +199,10 @@ class TimeseriesVM(_VMBase):
 
 
 class AuditRowVM(_VMBase):
-    event_id: UUID
+    """``audit.events.event_id`` is ``BIGSERIAL``, not UUID. The
+    composite PK is ``(event_id, occurred_at)``."""
+
+    event_id: int
     occurred_at: datetime
     actor_id: str
     actor_kind: Literal["user", "service", "system"]
