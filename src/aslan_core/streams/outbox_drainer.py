@@ -439,31 +439,35 @@ async def _reconcile_unindexed_xadd(
         return
 
     cursor = lower_bound
-    async with session_factory() as orphan_session:
-        while True:
-            page = await redis.xrange(
-                stream_name,
-                min=cursor,
-                max=upper_bound,
-                count=1_000,
+    # Codex round-3 follow-up: each matching row commits in its OWN
+    # short-lived session. The previous shape held one open transaction
+    # for the whole paginated scan and committed at the end, so a later
+    # XRANGE/Redis error after a found-and-INSERTed orphan would roll
+    # back the insert. The next drain captures a NEW lower bound past
+    # the current tail, leaving the orphan permanently below the retry
+    # window — the exact loss the reconciler exists to prevent. Per-match
+    # commits trade one extra DB round-trip for durable progress.
+    while True:
+        page = await redis.xrange(
+            stream_name,
+            min=cursor,
+            max=upper_bound,
+            count=1_000,
+        )
+        if not page:
+            break
+        for rid_obj, fields in page:
+            eid_field = fields.get(b"event_id") or fields.get("event_id")
+            if eid_field is None:
+                continue
+            eid_str = (
+                eid_field.decode() if isinstance(eid_field, bytes | bytearray) else str(eid_field)
             )
-            if not page:
-                break
-            for rid_obj, fields in page:
-                eid_field = fields.get(b"event_id") or fields.get("event_id")
-                if eid_field is None:
-                    continue
-                eid_str = (
-                    eid_field.decode()
-                    if isinstance(eid_field, bytes | bytearray)
-                    else str(eid_field)
-                )
-                if eid_str != event_id:
-                    continue
-                rid_str = (
-                    rid_obj.decode() if isinstance(rid_obj, bytes | bytearray) else str(rid_obj)
-                )
-                await orphan_session.execute(
+            if eid_str != event_id:
+                continue
+            rid_str = rid_obj.decode() if isinstance(rid_obj, bytes | bytearray) else str(rid_obj)
+            async with session_factory() as match_session:
+                await match_session.execute(
                     text(
                         "INSERT INTO streams.event_id_to_redis "
                         "(event_id, stream_name, redis_message_id) "
@@ -472,16 +476,14 @@ async def _reconcile_unindexed_xadd(
                     ),
                     {"eid": event_id, "sn": stream_name, "rid": rid_str},
                 )
-            last_id_obj = page[-1][0]
-            last_id = (
-                last_id_obj.decode()
-                if isinstance(last_id_obj, bytes | bytearray)
-                else str(last_id_obj)
-            )
-            cursor = redis_id_increment(last_id)
-            if redis_id_compare(cursor, upper_bound) > 0:
-                break
-        await orphan_session.commit()
+                await match_session.commit()
+        last_id_obj = page[-1][0]
+        last_id = (
+            last_id_obj.decode() if isinstance(last_id_obj, bytes | bytearray) else str(last_id_obj)
+        )
+        cursor = redis_id_increment(last_id)
+        if redis_id_compare(cursor, upper_bound) > 0:
+            break
 
 
 __all__ = ["drain_outbox"]
