@@ -335,6 +335,7 @@ async def test_consume_increments_consumes_counter(
     session_factory: async_sessionmaker[AsyncSession],
     _flush_redis: None,
 ) -> None:
+    pytest.importorskip("prometheus_client")
     await _produce_and_drain(session, redis_client, session_factory)
     from aslan_core.observability.metrics import aslan_stream_consumes_total
 
