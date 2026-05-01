@@ -323,6 +323,85 @@ def test_known_frequencies_matches_spec_literal() -> None:
     assert len(_KNOWN_FREQUENCIES) == 13
 
 
+def test_known_streams_set_pinned_exactly() -> None:
+    """v0.5.0 Task 20: ``_KNOWN_STREAMS`` is the cardinality boundary
+    for the ``stream`` Prometheus label. The allow-list is mirrored
+    onto :data:`aslan_core.streams.names.STREAMS` (plus the synthetic
+    ``aslan.bist.ticks`` prefix collapse + the ``other`` fallback).
+    Any drift between the two is a load-bearing bug — a stream name
+    that's in :data:`STREAMS` but missing from the allow-list lands
+    on ``stream=other`` (silent cardinality boundary), and a stream in
+    the allow-list missing from :data:`STREAMS` is dead weight.
+    """
+    from aslan_core.observability.metrics import _KNOWN_STREAMS
+
+    expected = {
+        "aslan.kap.filings.new",
+        "aslan.kap.filings.amended",
+        "aslan.kap.filings.financial_report",
+        "aslan.evds.observations.new",
+        "aslan.tefas.observations.new",
+        "aslan.tefas.nav.new",
+        # Per-symbol BIST ticks streams collapse to this prefix via
+        # normalize_bist_ticks_label.
+        "aslan.bist.ticks",
+        "aslan.entity.created",
+        "other",
+    }
+    assert expected == _KNOWN_STREAMS, (
+        f"_KNOWN_STREAMS drift — extra={sorted(_KNOWN_STREAMS - expected)}, "
+        f"missing={sorted(expected - _KNOWN_STREAMS)}"
+    )
+
+
+def test_known_streams_mirrors_streams_names_module() -> None:
+    """v0.5.0 Task 20: every key in
+    :data:`aslan_core.streams.names.STREAMS` MUST appear in the
+    Prometheus allow-list (codex spec §9 — the allow-list mirrors the
+    canonical names module). Missing entries silently collapse the
+    metric to ``stream=other``; unwanted entries inflate cardinality.
+    """
+    from aslan_core.observability.metrics import _KNOWN_STREAMS
+    from aslan_core.streams.names import STREAMS
+
+    assert set(STREAMS.keys()) <= _KNOWN_STREAMS, (
+        f"streams.names.STREAMS leaks past allow-list: "
+        f"{sorted(set(STREAMS.keys()) - _KNOWN_STREAMS)}"
+    )
+
+
+def test_known_consumer_groups_set_pinned_exactly() -> None:
+    """v0.5.0 Task 20: pin the ``group`` Prometheus label allow-list.
+
+    Includes the production aslan-service consumer-group identifiers
+    (``aslan-service.push`` and ``aslan-service.search-index``) plus
+    the test-only group names that the integration suite uses
+    (``internal-test``, ``g1``..``g7``, ``g4a``, ``g4b``,
+    ``test-g``)."""
+    from aslan_core.observability.metrics import _KNOWN_CONSUMER_GROUPS
+
+    expected = {
+        "aslan-service.push",
+        "aslan-service.search-index",
+        "internal-test",
+        "test-g",
+        "g1",
+        "g2",
+        "g3",
+        "g4a",
+        "g4b",
+        "g5",
+        "g6",
+        "g7",
+        "other",
+    }
+    assert expected == _KNOWN_CONSUMER_GROUPS, (
+        f"_KNOWN_CONSUMER_GROUPS drift — "
+        f"extra={sorted(_KNOWN_CONSUMER_GROUPS - expected)}, "
+        f"missing={sorted(expected - _KNOWN_CONSUMER_GROUPS)}"
+    )
+
+
 def test_unknown_frequency_maps_to_other() -> None:
     """v0.4.0 Task 25: defensive check on the ``Frequency`` label.
     A typo or future-extension value collapses to ``"other"`` so the
