@@ -96,10 +96,13 @@ def _register_pages() -> None:
     # and ``register_template(VMType, builder)`` call. The local-name
     # bindings (``_overview`` etc.) are intentionally unused at this
     # call site — the side effects ARE the registration.
+    from aslan_core.dashboard.pages import audit as _audit  # noqa: F401
+    from aslan_core.dashboard.pages import deadletter as _deadletter  # noqa: F401
     from aslan_core.dashboard.pages import documents as _documents  # noqa: F401
     from aslan_core.dashboard.pages import ingestion as _ingestion  # noqa: F401
     from aslan_core.dashboard.pages import outbox as _outbox  # noqa: F401
     from aslan_core.dashboard.pages import overview as _overview  # noqa: F401
+    from aslan_core.dashboard.pages import redactions as _redactions  # noqa: F401
     from aslan_core.dashboard.pages import streams as _streams  # noqa: F401
     from aslan_core.dashboard.pages import timeseries as _timeseries  # noqa: F401
 
