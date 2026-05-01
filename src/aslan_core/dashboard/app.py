@@ -19,8 +19,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from fasthtml.common import FastHTML
+from starlette.requests import Request
+from starlette.responses import Response
 
 from aslan_core.dashboard.redis_probes import RedisCircuitBreaker
+from aslan_core.dashboard.static import serve_static
 
 if TYPE_CHECKING:
     from redis.asyncio import Redis
@@ -80,6 +83,32 @@ def get_redis_client() -> Redis:
 
 def get_breaker() -> RedisCircuitBreaker:
     return _breaker
+
+
+# ── Static asset routes ──────────────────────────────────────────
+
+
+# Three fixed routes mapped to literal asset names. The route table
+# carries no dynamic segment — there is no ``/static/{path:path}``
+# variant — so path traversal cannot reach ``serve_static``. The
+# ``request`` parameter is intentionally unused; FastHTML / Starlette
+# require the signature.
+@app.get("/static/dashboard.css")  # type: ignore[misc,untyped-decorator,unused-ignore]
+async def _serve_dashboard_css(request: Request) -> Response:
+    _ = request
+    return serve_static("dashboard.css")
+
+
+@app.get("/static/htmx.min.js")  # type: ignore[misc,untyped-decorator,unused-ignore]
+async def _serve_htmx_js(request: Request) -> Response:
+    _ = request
+    return serve_static("htmx.min.js")
+
+
+@app.get("/static/favicon.ico")  # type: ignore[misc,untyped-decorator,unused-ignore]
+async def _serve_favicon(request: Request) -> Response:
+    _ = request
+    return serve_static("favicon.ico")
 
 
 # ── Page registration ────────────────────────────────────────────

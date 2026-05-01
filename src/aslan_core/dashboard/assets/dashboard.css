@@ -1,1 +1,202 @@
-/* v0.6.0 dashboard stylesheet placeholder — real CSS lands in Task 11. */
+/* aslan dashboard — v0.6.0 stylesheet.
+ *
+ * Operator-internal surface; system font stack only (no web fonts =
+ * one fewer outbound request and one fewer SRI hash to maintain).
+ * Layout is sidebar nav + main content; tables use a compact monospace
+ * for ids and timestamps so failure rows scan at a glance.
+ *
+ * The compliance banner on /audit + /redactions has explicit visual
+ * weight (red border, sticky-top inside the main column). It MUST be
+ * non-dismissible — there is no .dismiss / .hidden class that scripts
+ * could toggle. The banner-presence integration tests scan the markup
+ * for dismissal tokens.
+ */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  font-family:
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    Roboto,
+    sans-serif;
+  font-size: 14px;
+  color: #1f2933;
+  background: #f5f7fa;
+}
+
+/* ── Layout ─────────────────────────────────────────────────────── */
+
+body {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  min-height: 100vh;
+}
+
+.aslan-nav {
+  background: #1f2933;
+  color: #cbd2d9;
+  padding: 16px 0;
+}
+
+.aslan-nav ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.aslan-nav a {
+  display: block;
+  padding: 8px 20px;
+  color: #cbd2d9;
+  text-decoration: none;
+  border-left: 3px solid transparent;
+}
+
+.aslan-nav a:hover {
+  background: #323f4b;
+  color: #f5f7fa;
+  border-left-color: #4098d7;
+}
+
+.aslan-main {
+  padding: 24px 32px;
+  overflow-x: auto;
+}
+
+/* ── Headings + cards ───────────────────────────────────────────── */
+
+h1 {
+  margin: 0 0 16px 0;
+  font-size: 22px;
+  font-weight: 600;
+}
+
+h2 {
+  margin: 24px 0 8px 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: #52606d;
+}
+
+p {
+  margin: 4px 0 12px 0;
+}
+
+.aslan-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
+.aslan-card {
+  background: white;
+  border: 1px solid #cbd2d9;
+  border-radius: 4px;
+  padding: 12px 16px;
+}
+
+.aslan-card-title {
+  font-size: 12px;
+  text-transform: uppercase;
+  color: #7b8794;
+  letter-spacing: 0.5px;
+}
+
+.aslan-card-value {
+  font-size: 22px;
+  font-weight: 600;
+  margin-top: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Tables ─────────────────────────────────────────────────────── */
+
+.aslan-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: white;
+  border: 1px solid #cbd2d9;
+  border-radius: 4px;
+  font-size: 13px;
+}
+
+.aslan-table th,
+.aslan-table td {
+  padding: 6px 10px;
+  text-align: left;
+  border-bottom: 1px solid #e4e7eb;
+  font-variant-numeric: tabular-nums;
+}
+
+.aslan-table th {
+  background: #f5f7fa;
+  font-weight: 600;
+  color: #52606d;
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.4px;
+}
+
+.aslan-table tr:last-child td {
+  border-bottom: none;
+}
+
+.aslan-table tr:hover td {
+  background: #f5f7fa;
+}
+
+/* Monospace for id-shaped + timestamp-shaped cells. The dashboard
+ * almost always wants this — tabular-nums helps but a monospace stack
+ * keeps UUIDs and ISO-8601 strings alignable. */
+.aslan-table td:nth-child(1),
+.aslan-table td:nth-child(5),
+.aslan-deadletter .aslan-table td:nth-child(7),
+.aslan-outbox .aslan-table td:nth-child(5),
+.aslan-outbox .aslan-table td:nth-child(6),
+.aslan-audit .aslan-table td:nth-child(2) {
+  font-family:
+    ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    Monaco,
+    Consolas,
+    monospace;
+  font-size: 12px;
+}
+
+/* ── Compliance banner ──────────────────────────────────────────── */
+
+.aslan-compliance-banner {
+  background: #fff5f5;
+  border: 2px solid #cf1124;
+  border-radius: 4px;
+  color: #610316;
+  padding: 12px 16px;
+  margin-bottom: 16px;
+  font-weight: 600;
+}
+
+.aslan-compliance-banner p {
+  margin: 0;
+}
+
+/* ── Error pages ────────────────────────────────────────────────── */
+
+.aslan-error {
+  text-align: center;
+  padding: 64px 24px;
+}
+
+.aslan-error h1 {
+  font-size: 28px;
+  color: #52606d;
+  margin-bottom: 16px;
+}

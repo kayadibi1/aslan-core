@@ -52,6 +52,7 @@ from fasthtml.common import (
 )
 from starlette.responses import HTMLResponse
 
+from aslan_core.dashboard.static import HTMX_SRI
 from aslan_core.dashboard.view_models import _VMBase
 
 if TYPE_CHECKING:
@@ -100,13 +101,24 @@ _NAV_ITEMS: tuple[tuple[str, str], ...] = (
 
 def _base_template(*, title: str, body: Any) -> Any:
     """Wrap ``body`` in the dashboard's HTML skeleton — sidebar nav,
-    htmx, stylesheet, favicon. Returns a FastHTML element tree."""
+    htmx, stylesheet, favicon. Returns a FastHTML element tree.
+
+    The htmx ``<script>`` tag carries an SRI ``integrity`` attribute
+    so a future re-vendor cannot silently swap the file. The hash is
+    computed from the bytes on disk at module-import time
+    (``aslan_core.dashboard.static.HTMX_SRI``) and verified against
+    the ``htmx.min.js.sha256`` sidecar — a mismatch fails app startup
+    rather than serving a hash-mismatched script."""
     return Html(
         Head(
             Title(f"{title} · aslan dashboard"),
             Link(rel="stylesheet", href="/static/dashboard.css"),
             Link(rel="icon", href="/static/favicon.ico"),
-            Script(src="/static/htmx.min.js"),
+            Script(
+                src="/static/htmx.min.js",
+                integrity=HTMX_SRI,
+                crossorigin="anonymous",
+            ),
         ),
         Body(
             Nav(
