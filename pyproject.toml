@@ -126,6 +126,9 @@ module = [
     # v0.6.0 codex F-3 lint dep (dev-group). sqlglot ships without
     # a py.typed marker.
     "sqlglot.*",
+    # v0.6.0 dashboard test dep. httpx is a transitive of starlette
+    # (used in tests via httpx.AsyncClient + ASGITransport).
+    "httpx.*",
 ]
 ignore_missing_imports = true
 

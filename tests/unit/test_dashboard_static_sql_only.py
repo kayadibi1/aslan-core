@@ -44,16 +44,52 @@ def test_dashboard_module_is_scanner_clean(module_path: Path) -> None:
     )
 
 
-def test_only_queries_py_imports_sqlalchemy_text() -> None:
-    """Belt-and-suspenders: explicit string-based check that the only
-    file in ``aslan_core.dashboard`` containing ``import.*text`` from
-    ``sqlalchemy`` is ``queries.py``. Catches a typo that snuck the
-    import past the AST scanner."""
+def test_only_queries_py_imports_sqlalchemy_expression_api() -> None:
+    """Belt-and-suspenders: only ``queries.py`` may import the
+    SQLAlchemy expression API. The async-driver subpackage
+    (``sqlalchemy.ext.asyncio``) is permitted because the dashboard
+    runtime needs ``async_sessionmaker`` / ``AsyncSession`` type
+    references — those types do not construct SQL.
+
+    Catches a typo that snuck the expression API past the AST
+    scanner. Forbidden lines:
+
+      * ``from sqlalchemy import text`` (or ``select`` / ``func`` /
+        ``literal_column`` / ``column`` / ``Table`` / ``bindparam``
+        / ``literal`` / ``cast``)
+      * ``import sqlalchemy`` (the bare top-level import — opens
+        the door to ``sqlalchemy.text(...)``)
+      * ``import sqlalchemy as`` (any aliased top-level import)
+
+    Permitted:
+
+      * ``from sqlalchemy.ext.asyncio import …`` (typed handles only)
+      * ``import sqlalchemy.ext.asyncio as …`` (subpackage alias)
+    """
+    forbidden_from = (
+        "text",
+        "select",
+        "func",
+        "literal_column",
+        "column",
+        "Table",
+        "bindparam",
+        "literal",
+        "cast",
+    )
     offenders: list[str] = []
     for path in _DASHBOARD_PACKAGE.rglob("*.py"):
         if path.name in {_QUERIES_FILENAME, _SCANNER_FILENAME}:
             continue
         source = path.read_text(encoding="utf-8")
-        if "from sqlalchemy" in source or "import sqlalchemy" in source:
-            offenders.append(str(path.relative_to(_DASHBOARD_PACKAGE)))
-    assert not offenders, f"only queries.py may import sqlalchemy; offenders: {offenders}"
+        for line in source.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("from sqlalchemy import "):
+                imports = stripped.removeprefix("from sqlalchemy import ").split(",")
+                if any(name.strip().split(" as ")[0] in forbidden_from for name in imports):
+                    offenders.append(f"{path.relative_to(_DASHBOARD_PACKAGE)}: {stripped!r}")
+            elif stripped == "import sqlalchemy" or stripped.startswith("import sqlalchemy as"):
+                offenders.append(f"{path.relative_to(_DASHBOARD_PACKAGE)}: {stripped!r}")
+    assert not offenders, (
+        f"only queries.py may import the SQLAlchemy expression API; offenders: {offenders}"
+    )
