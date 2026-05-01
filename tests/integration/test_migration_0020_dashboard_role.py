@@ -46,9 +46,15 @@ async def test_aslan_dashboard_default_transaction_read_only(
     assert any("default_transaction_read_only=on" in s for s in setting)
 
 
-async def test_event_metadata_key_count_helper_owned_by_aslan_app(
+async def test_event_metadata_key_count_helper_owned_by_aslan_audit_helpers(
     session: AsyncSession,
 ) -> None:
+    """Migration 0020 set the owner to aslan_app so the SECURITY DEFINER
+    body would run with the role that held SELECT on audit.events.metadata.
+    Codex post-impl review (HIGH) flagged this as a privilege expansion
+    — every aslan_app path then had raw audit metadata access. Migration
+    0024 introduced the dedicated NOLOGIN aslan_audit_helpers role and
+    transferred ownership."""
     proowner = (
         await session.execute(
             text(
@@ -59,7 +65,7 @@ async def test_event_metadata_key_count_helper_owned_by_aslan_app(
             )
         )
     ).scalar_one_or_none()
-    assert proowner == "aslan_app"
+    assert proowner == "aslan_audit_helpers"
 
 
 async def test_event_metadata_key_count_is_security_definer(

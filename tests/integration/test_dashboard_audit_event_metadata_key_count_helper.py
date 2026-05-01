@@ -128,12 +128,15 @@ async def test_helper_combined_with_metadata_column_raises_insufficient_privileg
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_helper_owner_is_aslan_app(
+async def test_helper_owner_is_aslan_audit_helpers(
     aslan_dashboard_conn: asyncpg.Connection,
 ) -> None:
-    """Codex round-9: the SECURITY DEFINER must be owned by ``aslan_app``
-    (which holds SELECT on ``metadata``), not by whatever role applied
-    the migration."""
+    """Codex round-9 originally pinned ownership to ``aslan_app`` (the
+    only role with SELECT on ``metadata`` at the time). Codex post-impl
+    review (HIGH) flagged this as expanding aslan_app's privileges.
+    Migration 0024 introduced ``aslan_audit_helpers`` (NOLOGIN) and
+    transferred ownership; the helper-owner-isolated suite asserts the
+    full role + GRANT shape."""
     owner: str = await aslan_dashboard_conn.fetchval(
         "SELECT r.rolname "
         "FROM pg_proc p "
@@ -141,7 +144,7 @@ async def test_helper_owner_is_aslan_app(
         "JOIN pg_roles r ON r.oid = p.proowner "
         "WHERE n.nspname = 'audit' AND p.proname = 'event_metadata_key_count'"
     )
-    assert owner == "aslan_app"
+    assert owner == "aslan_audit_helpers"
 
 
 # ── Codex branch-state F-1: client_ip truncation helper ──────────
@@ -186,12 +189,13 @@ async def test_client_ip_truncated_helper_returns_cidr(
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_client_ip_truncated_helper_owner_is_aslan_app(
+async def test_client_ip_truncated_helper_owner_is_aslan_audit_helpers(
     aslan_dashboard_conn: asyncpg.Connection,
 ) -> None:
-    """Same OWNER lockdown as the metadata helper — runs as the role
-    that holds SELECT on the underlying column, not as the migration
-    runner."""
+    """Same OWNER lockdown as the metadata helper — runs as the
+    dedicated NOLOGIN ``aslan_audit_helpers`` role that holds SELECT
+    on the underlying column. Migration 0024 transferred ownership
+    from ``aslan_app`` (codex post-impl HIGH)."""
     owner: str = await aslan_dashboard_conn.fetchval(
         "SELECT r.rolname "
         "FROM pg_proc p "
@@ -199,4 +203,4 @@ async def test_client_ip_truncated_helper_owner_is_aslan_app(
         "JOIN pg_roles r ON r.oid = p.proowner "
         "WHERE n.nspname = 'audit' AND p.proname = 'event_client_ip_truncated'"
     )
-    assert owner == "aslan_app"
+    assert owner == "aslan_audit_helpers"
