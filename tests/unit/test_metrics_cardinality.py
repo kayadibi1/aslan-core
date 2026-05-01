@@ -275,6 +275,16 @@ def test_known_audit_operations_set_pinned_exactly() -> None:
         # v0.5 streams (publish + outbox-drainer)
         "stream.publish",
         "stream.outbox_drained",
+        # v0.5 consumer + dead-letter audit operations.
+        "stream.consume_ack",
+        "stream.consumed_redacted",
+        "stream.deadletter",
+        "stream.deadletter_orphan_lost",
+        "stream.deadletter_orphan_lost_recovered",
+        "stream.deadletter_orphan_reconciled",
+        "stream.deadletter_orphan_xdel",
+        "stream.deadletter_index_orphaned_in_redis",
+        "stream.entry_redacted",
     }
     assert expected_full == _KNOWN_AUDIT_OPERATIONS, (
         f"allow-list drift detected. "

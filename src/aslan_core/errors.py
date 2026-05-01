@@ -323,6 +323,17 @@ class StreamRoutingContention(StreamError):
         )
 
 
+class StreamRedactionIntegrityError(StreamError):
+    """Raised when a redaction-registry payload fails its tamper check."""
+
+    def __init__(self, *, event_id: UUID, stream_name: str) -> None:
+        self.event_id = event_id
+        self.stream_name = stream_name
+        super().__init__(
+            f"redaction registry payload hash mismatch for stream={stream_name} event_id={event_id}"
+        )
+
+
 class AuditError(AslanCoreError):
     """Base for audit-subsystem failures."""
 

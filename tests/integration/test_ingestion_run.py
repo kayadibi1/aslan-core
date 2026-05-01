@@ -229,7 +229,7 @@ async def test_ingestion_run_increment_rows_emits_audit_event(
                     "SELECT operation, before, after FROM audit.events "
                     "WHERE target_schema = 'src' AND ingestion_run_id = :id "
                     "  AND operation = 'ingestion_run.increment_rows' "
-                    "ORDER BY occurred_at"
+                    "ORDER BY occurred_at, event_id"
                 ),
                 {"id": run_id},
             )
