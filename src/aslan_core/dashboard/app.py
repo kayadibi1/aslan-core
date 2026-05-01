@@ -99,6 +99,7 @@ def _register_pages() -> None:
     from aslan_core.dashboard.pages import audit as _audit  # noqa: F401
     from aslan_core.dashboard.pages import deadletter as _deadletter  # noqa: F401
     from aslan_core.dashboard.pages import documents as _documents  # noqa: F401
+    from aslan_core.dashboard.pages import errors as _errors  # noqa: F401
     from aslan_core.dashboard.pages import ingestion as _ingestion  # noqa: F401
     from aslan_core.dashboard.pages import outbox as _outbox  # noqa: F401
     from aslan_core.dashboard.pages import overview as _overview  # noqa: F401
