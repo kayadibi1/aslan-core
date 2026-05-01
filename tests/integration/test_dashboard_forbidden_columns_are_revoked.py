@@ -253,6 +253,13 @@ _FORBIDDEN_COLUMNS: tuple[tuple[str, str], ...] = (
     ("doc.filing_body", "user_agent"),
     ("audit.events", "client_ip"),
     ("audit.events", "user_agent"),
+    # Codex post-implementation HIGH: migration 0023 revoked the
+    # ``metadata`` column from the dashboard role on these two
+    # tables. The narrow VM contract treats ``metadata`` JSONB as
+    # forbidden across the board; the privilege layer is now the
+    # load-bearing floor instead of the queries.py reviewer.
+    ("src.ingestion_run", "metadata"),
+    ("doc.filing", "metadata"),
 )
 
 

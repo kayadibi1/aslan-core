@@ -65,21 +65,29 @@ def test_forbidden_payload_column_is_caught() -> None:
     assert any("streams.outbox.payload" in f.message for f in findings)
 
 
-def test_forbidden_metadata_in_audit_events_is_caught() -> None:
+def test_forbidden_metadata_is_caught_on_every_table() -> None:
     """``metadata`` is forbidden on ``audit.events`` (rendered via
-    the ``event_metadata_key_count`` SECURITY DEFINER helper) but
-    legitimate on ``src.ingestion_run`` and ``doc.filing``. The lint
-    must distinguish."""
-    bad = _wrap_in_text("SELECT metadata FROM audit.events")
-    findings = scan(bad, is_queries=True)
+    the ``event_metadata_key_count`` SECURITY DEFINER helper).
+
+    Codex post-impl HIGH: migration 0023 also revoked ``metadata``
+    on ``src.ingestion_run`` and ``doc.filing`` so the privilege
+    layer matches the in-code VM contract that treats every JSONB
+    metadata blob as forbidden. The lint mirrors the GRANT and
+    rejects all three."""
+    bad_audit = _wrap_in_text("SELECT metadata FROM audit.events")
+    findings = scan(bad_audit, is_queries=True)
     assert findings
     assert any("audit.events.metadata" in f.message for f in findings)
 
-    good_src = _wrap_in_text("SELECT metadata FROM src.ingestion_run")
-    assert scan(good_src, is_queries=True) == []
+    bad_src = _wrap_in_text("SELECT metadata FROM src.ingestion_run")
+    findings = scan(bad_src, is_queries=True)
+    assert findings
+    assert any("src.ingestion_run.metadata" in f.message for f in findings)
 
-    good_doc = _wrap_in_text("SELECT metadata FROM doc.filing")
-    assert scan(good_doc, is_queries=True) == []
+    bad_doc = _wrap_in_text("SELECT metadata FROM doc.filing")
+    findings = scan(bad_doc, is_queries=True)
+    assert findings
+    assert any("doc.filing.metadata" in f.message for f in findings)
 
 
 def test_forbidden_column_via_alias_is_caught() -> None:

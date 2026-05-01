@@ -227,7 +227,7 @@ _COLUMN_ALLOWLIST: dict[str, frozenset[str]] = {
             "docs_written",
             "bytes_written",
             "config_hash",
-            "metadata",
+            # ``metadata`` revoked in migration 0023 (codex post-impl HIGH).
             "actor_id",
             "actor_kind",
         }
@@ -254,7 +254,7 @@ _COLUMN_ALLOWLIST: dict[str, frozenset[str]] = {
             "extracted_text_key",
             "has_xbrl",
             "xbrl_object_key",
-            "metadata",
+            # ``metadata`` revoked in migration 0023 (codex post-impl HIGH).
             "ingestion_run_id",
             "discovered_at",
             "revision_no",
