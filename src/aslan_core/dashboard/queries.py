@@ -176,15 +176,27 @@ async def deadletter_recent(
     Returns ``(rows, total)`` where each row is a ``dict`` carrying
     every SQL-derived field. The page handler fuses with Redis probe
     data and constructs the final ``DeadletterVM`` at render time —
-    ``redis_state`` is not knowable from SQL alone."""
+    ``redis_state`` is not knowable from SQL alone.
+
+    The LEFT JOIN on ``streams.deadletter_redis_index`` lets the page
+    handler distinguish ``MISSING_INDEX`` (durable record exists in
+    ``deadletter_log`` but the Redis-side index entry was never
+    written — janitor has not yet reconciled, or the XADD failed)
+    from rows that are at least durably indexed. ``deadletter_stream``
+    is projected so the page handler probes the right Redis stream
+    per row."""
     rows = (
         await session.execute(
             text(
-                "SELECT failure_id, event_id, stream_name, group_name, "
-                "       consumer_name, failure_count, routed_at, routed_at_redis, "
-                "       redis_message_id "
-                "FROM streams.deadletter_log "
-                "ORDER BY routed_at DESC "
+                "SELECT dl.failure_id, dl.event_id, dl.stream_name, "
+                "       dl.deadletter_stream, dl.group_name, dl.consumer_name, "
+                "       dl.failure_count, dl.routed_at, dl.routed_at_redis, "
+                "       dl.redis_message_id, "
+                "       (dri.failure_id IS NOT NULL) AS has_redis_index "
+                "FROM streams.deadletter_log AS dl "
+                "LEFT JOIN streams.deadletter_redis_index AS dri "
+                "  ON dri.failure_id = dl.failure_id "
+                "ORDER BY dl.routed_at DESC "
                 "LIMIT :limit OFFSET :offset"
             ),
             {"limit": limit, "offset": offset},
@@ -199,6 +211,7 @@ async def deadletter_recent(
                 "failure_id": r.failure_id,
                 "event_id": r.event_id,
                 "stream_name": r.stream_name,
+                "deadletter_stream": r.deadletter_stream,
                 "group_name": r.group_name,
                 "consumer_name": r.consumer_name,
                 "failure_count": r.failure_count,
@@ -206,6 +219,7 @@ async def deadletter_recent(
                 "routed_at": r.routed_at,
                 "routed_at_redis": r.routed_at_redis,
                 "redis_message_id": r.redis_message_id,
+                "has_redis_index": bool(r.has_redis_index),
             }
             for r in rows
         ],
@@ -395,16 +409,30 @@ async def audit_recent(session: AsyncSession, *, limit: int = 50) -> AuditVM:
 
 async def redactions_recent(session: AsyncSession, *, limit: int = 50) -> RedactionsVM:
     """Recent redactions. ``redacted_payload`` is forbidden; only the
-    hash is projected. ``redis_copies_total`` and
-    ``redis_copies_xdeled`` come from Redis probes — set to 0 here
-    and filled in by the page handler at render time."""
+    hash is projected.
+
+    ``redis_copies_total`` and ``redis_copies_xdeled`` come from
+    ``streams.event_id_to_redis`` — that table is the durable index
+    of every Redis copy ever created for an event_id; ``redacted_at``
+    on that table is set when the Redis copy was XDEL'd. So:
+
+      * ``redis_copies_total`` = COUNT(event_id_to_redis) per event
+      * ``redis_copies_xdeled`` = COUNT(event_id_to_redis WHERE redacted_at IS NOT NULL)
+
+    Both are computable from SQL alone — no Redis probe needed."""
     rows = (
         await session.execute(
             text(
-                "SELECT event_id, redaction_reason, original_stream, "
-                "       redacted_at, redacted_payload_hash, original_payload_hash "
-                "FROM streams.redaction_registry "
-                "ORDER BY redacted_at DESC "
+                "SELECT rr.event_id, rr.redaction_reason, rr.original_stream, "
+                "       rr.redacted_at, rr.redacted_payload_hash, "
+                "       rr.original_payload_hash, "
+                "       (SELECT count(*)::int FROM streams.event_id_to_redis er "
+                "          WHERE er.event_id = rr.event_id) AS redis_copies_total, "
+                "       (SELECT count(*)::int FROM streams.event_id_to_redis er "
+                "          WHERE er.event_id = rr.event_id "
+                "          AND er.redacted_at IS NOT NULL) AS redis_copies_xdeled "
+                "FROM streams.redaction_registry AS rr "
+                "ORDER BY rr.redacted_at DESC "
                 "LIMIT :limit"
             ),
             {"limit": limit},
@@ -419,8 +447,8 @@ async def redactions_recent(session: AsyncSession, *, limit: int = 50) -> Redact
                 redacted_at=r.redacted_at,
                 redacted_payload_hash=r.redacted_payload_hash,
                 original_payload_hash=r.original_payload_hash,
-                redis_copies_total=0,
-                redis_copies_xdeled=0,
+                redis_copies_total=r.redis_copies_total,
+                redis_copies_xdeled=r.redis_copies_xdeled,
             )
             for r in rows
         ],
