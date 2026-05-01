@@ -53,6 +53,7 @@ from __future__ import annotations
 import ast
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -147,6 +148,170 @@ _FORBIDDEN_SQL_SUBSTRINGS: tuple[str, ...] = (
     "BEGIN READ WRITE",
     "RESET ROLE",
     "SET ROLE",
+)
+
+# ── Codex F-3: queries.py column-allowlist ───────────────────────
+
+
+# Mirrors the GRANT lists in migrations 0020 / 0021 / 0022. Each
+# entry is the set of columns the ``aslan_dashboard`` role can SELECT.
+# A column reference in queries.py that is not in the role's allowlist
+# would fail at runtime with ``InsufficientPrivilegeError`` (the
+# load-bearing GDPR boundary); this lint catches the same gap at
+# CI time.
+#
+# Updating these constants WITHOUT updating the migrations is itself
+# a bug — the migrations are authoritative. The lint and the
+# migrations co-evolve.
+_COLUMN_ALLOWLIST: dict[str, frozenset[str]] = {
+    "streams.outbox": frozenset(
+        {
+            "outbox_id",
+            "stream_name",
+            "event_id",
+            "schema_version",
+            "producer_run_id",
+            "source_id",
+            "created_at",
+            "published_at",
+            "redis_message_id",
+            "publish_attempts",
+            "last_attempt_at",
+            "actor_id",
+            "actor_kind",
+            "request_id",
+            # client_ip + user_agent revoked in migration 0022 (codex F-1).
+        }
+    ),
+    "streams.deadletter_log": frozenset(
+        {
+            "failure_id",
+            "stream_name",
+            "deadletter_stream",
+            "event_id",
+            "original_message_id",
+            "group_name",
+            "consumer_name",
+            "failure_count",
+            "routed_at",
+            "routed_at_redis",
+            "redis_message_id",
+            "actor_id",
+            "actor_kind",
+            "request_id",
+        }
+    ),
+    "streams.redaction_registry": frozenset(
+        {
+            "event_id",
+            "redaction_reason",
+            "redacted_at",
+            "original_stream",
+            "redacted_payload_hash",
+            "original_payload_hash",
+            "actor_id",
+            "actor_kind",
+            "request_id",
+        }
+    ),
+    "src.ingestion_run": frozenset(
+        {
+            "ingestion_run_id",
+            "source_id",
+            "job_name",
+            "started_at",
+            "finished_at",
+            "status",
+            "error_count",
+            "rows_written",
+            "docs_written",
+            "bytes_written",
+            "config_hash",
+            "metadata",
+            "actor_id",
+            "actor_kind",
+        }
+    ),
+    "doc.filing": frozenset(
+        {
+            "filing_id",
+            "source_id",
+            "source_filing_ref",
+            "entity_id",
+            "kind",
+            "subkind",
+            "language",
+            "published_at",
+            "period_start",
+            "period_end",
+            "source_url",
+            "is_amendment",
+            "previous_filing_id",
+            "primary_object_key",
+            "primary_mime",
+            "primary_sha256",
+            "primary_bytes",
+            "extracted_text_key",
+            "has_xbrl",
+            "xbrl_object_key",
+            "metadata",
+            "ingestion_run_id",
+            "discovered_at",
+            "revision_no",
+            "actor_id",
+            "actor_kind",
+            "request_id",
+            # client_ip + user_agent revoked in 0022 (codex F-1).
+        }
+    ),
+    "doc.filing_body": frozenset(
+        {
+            "filing_id",
+            "body_lang",
+            "extracted_at",
+            "actor_id",
+            "actor_kind",
+            "request_id",
+            # client_ip + user_agent revoked in 0022 (codex F-1).
+        }
+    ),
+    "audit.events": frozenset(
+        {
+            "event_id",
+            "occurred_at",
+            "actor_id",
+            "actor_kind",
+            "request_id",
+            "ingestion_run_id",
+            "operation",
+            "target_schema",
+            "target_table",
+            "target_pk",
+            # client_ip + user_agent revoked in 0022; the truncated
+            # CIDR is reachable only via the SECURITY DEFINER helper
+            # ``audit.event_client_ip_truncated``. ``before`` /
+            # ``after`` / ``metadata`` were never granted.
+        }
+    ),
+}
+
+# Tables the dashboard role has full table-level SELECT on. No
+# column-allowlist; any column reference is permitted.
+_FULL_TABLE_GRANTS: frozenset[str] = frozenset(
+    {
+        "streams.event_id_to_redis",
+        "streams.deadletter_redis_index",
+        "streams.deadletter_xadd_intent",
+        "src.source",
+        "ts.series_catalog",
+        "ts.observation",
+        "audit.observation_batch_keys",
+        "ref.entity",
+        "ref.identifier",
+        "ref.currency",
+        "ref.sector",
+        "doc.filing_attachment",
+    }
 )
 
 
@@ -335,6 +500,86 @@ class _Scanner(ast.NodeVisitor):
                 node,
                 "sqlalchemy.text() literal contains a non-trailing ';' statement separator",
             )
+        # Codex F-3: parse SQL via sqlglot and verify every column
+        # reference is in the dashboard role's GRANT allowlist.
+        self._check_column_allowlist(sql, node)
+
+    def _check_column_allowlist(self, sql: str, ast_node: ast.AST) -> None:
+        """Codex F-3: parse ``sql`` via sqlglot and reject any column
+        reference whose ``(table, column)`` pair is not in
+        ``_COLUMN_ALLOWLIST`` and whose table is not in
+        ``_FULL_TABLE_GRANTS``.
+
+        Lazy-imported so the dashboard runtime is not forced to
+        install ``sqlglot`` (it's a dev-group dep, used only by the
+        lint). If sqlglot is unavailable the check is skipped — the
+        privilege layer remains the load-bearing boundary; the lint
+        is defense in depth on top of it.
+        """
+        try:
+            import sqlglot
+            from sqlglot.errors import ParseError
+            from sqlglot.optimizer.scope import traverse_scope
+        except ImportError:
+            return
+
+        try:
+            parsed = sqlglot.parse_one(sql, dialect="postgres")
+        except ParseError as exc:
+            self._reject(
+                ast_node,
+                f"queries.py: sqlalchemy.text() literal failed to parse "
+                f"under PostgreSQL dialect — {exc}",
+            )
+            return
+
+        for scope in traverse_scope(parsed):
+            for col in scope.columns:
+                full_table = self._resolve_column_table(col, scope)
+                if full_table is None:
+                    continue
+                if full_table in _FULL_TABLE_GRANTS:
+                    continue
+                allowlist = _COLUMN_ALLOWLIST.get(full_table)
+                if allowlist is None:
+                    # Not a checked table (e.g. pg_catalog, an extension).
+                    continue
+                if col.name not in allowlist:
+                    self._reject(
+                        ast_node,
+                        f"queries.py: column reference {full_table}.{col.name} "
+                        f"is NOT in the aslan_dashboard role's GRANT allowlist "
+                        f"(migrations 0020/0021/0022). The privilege layer "
+                        f"would reject this at runtime; the lint catches it "
+                        f"at CI time (codex F-3).",
+                    )
+
+    @staticmethod
+    def _resolve_column_table(col: Any, scope: Any) -> str | None:
+        """Resolve ``col.table`` to a fully-qualified ``schema.table``
+        via ``scope`` and its parent chain. Returns ``None`` for
+        unresolvable references (an unknown alias likely indicates a
+        SQL bug; we don't reject because the privilege layer will)."""
+        # Unqualified column: only resolvable if the immediate scope
+        # has exactly one table.
+        if not col.table:
+            tables = list(scope.tables)
+            if len(tables) != 1:
+                return None
+            t = tables[0]
+            schema = t.db or ""
+            return f"{schema}.{t.name}" if schema else t.name
+
+        # Qualified column: walk current → parent scopes.
+        current = scope
+        while current is not None:
+            for t in current.tables:
+                alias = t.alias or t.name
+                if alias == col.table:
+                    schema = t.db or ""
+                    return f"{schema}.{t.name}" if schema else t.name
+            current = current.parent
+        return None
 
     # ── Reporter ─────────────────────────────────────────────────
 

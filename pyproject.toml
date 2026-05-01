@@ -59,6 +59,11 @@ dev = [
     "mypy>=1.20",
     "pre-commit>=3.8",
     "types-PyYAML>=6.0",
+    # v0.6.0 dashboard lint dep (codex F-3): the static-SQL scanner
+    # parses queries.py text() literals via sqlglot's PostgreSQL
+    # dialect and enforces the column-allowlist from migrations
+    # 0020/0021/0022. Lint-only; the dashboard runtime never imports it.
+    "sqlglot>=25.0",
 ]
 
 [project.scripts]
@@ -118,6 +123,9 @@ module = [
     # mypy can't analyse them under strict.
     "fasthtml.*",
     "starlette.*",
+    # v0.6.0 codex F-3 lint dep (dev-group). sqlglot ships without
+    # a py.typed marker.
+    "sqlglot.*",
 ]
 ignore_missing_imports = true
 
