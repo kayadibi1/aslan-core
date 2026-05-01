@@ -212,6 +212,41 @@ unknown groups collapse to ``"other"`` via
 :func:`_normalize_metric_label`."""
 
 
+_KNOWN_DASHBOARD_PATHS: frozenset[str] = frozenset(
+    {
+        "/",
+        "/outbox",
+        "/streams",
+        "/ingestion",
+        "/documents",
+        "/timeseries",
+        "/deadletter",
+        "/static",
+        "/metrics",
+        # Compliance-sensitive routes are deliberately bucketed under
+        # the literal "<sensitive>" label so the metric never
+        # distinguishes /audit from /redactions traffic. Spec §6.2:
+        # the per-view-attribution claim is reserved until
+        # aslan-service auth lands; until then the metric must not
+        # let an attacker tell which surface an operator hit.
+        "<sensitive>",
+        "<other>",
+    }
+)
+"""Allow-list of v0.6.0 dashboard request-path labels. Closed
+enum: routes outside this list collapse to ``"<other>"``; the
+two compliance-sensitive routes (``/audit`` + ``/redactions``)
+collapse to ``"<sensitive>"`` so a label observer cannot tell
+the two surfaces apart."""
+
+
+_KNOWN_DASHBOARD_STATUSES: frozenset[str] = frozenset({"200", "404", "405", "500", "<other>"})
+"""Allow-list of HTTP status-code labels for the dashboard's
+request counter. 200 / 404 / 405 / 500 are the four shapes the
+v0.6.0 surface can produce; anything else collapses to
+``"<other>"``."""
+
+
 def _normalize_metric_label(
     value: str,
     allow_list: frozenset[str],
@@ -655,6 +690,41 @@ aslan_stream_entry_redacted_total = _LazyCounter(
 )
 
 
+# v0.6.0 dashboard request metrics (codex round-4 + round-5):
+#
+# * ``dashboard_requests_total`` — counter labelled by (path, status).
+#   Path comes from a closed enum (:data:`_KNOWN_DASHBOARD_PATHS`)
+#   that buckets the two compliance-sensitive routes
+#   (``/audit`` + ``/redactions``) under ``"<sensitive>"`` so a
+#   metric observer cannot tell which inspect surface an operator
+#   hit. Status from a four-element closed enum
+#   (:data:`_KNOWN_DASHBOARD_STATUSES`).
+# * ``dashboard_request_duration_seconds`` — histogram with NO
+#   labels (codex round-4). Per-route timing would let an observer
+#   correlate the duration distribution with the underlying SQL or
+#   Redis fan-out shape; an unlabelled histogram preserves global
+#   alerting (p99 latency) without per-surface side-channel.
+dashboard_requests_total = _LazyCounter(
+    name="aslan_dashboard_requests_total",
+    documentation=(
+        "v0.6.0 dashboard HTTP requests, labelled by closed-enum path + "
+        "closed-enum status. /audit + /redactions bucket under <sensitive>."
+    ),
+    labelnames=("path", "status"),
+)
+
+dashboard_request_duration_seconds = _LazyHistogram(
+    name="aslan_dashboard_request_duration_seconds",
+    documentation=(
+        "v0.6.0 dashboard request duration in seconds. Intentionally "
+        "unlabelled — per-route timing is a side-channel that would "
+        "let a metric observer distinguish the compliance-sensitive "
+        "surfaces from the rest."
+    ),
+    buckets=_DURATION_BUCKETS,
+)
+
+
 __all__ = [
     "advisory_lock_holders",
     "aslan_stream_acks_total",
@@ -677,6 +747,8 @@ __all__ = [
     "aslan_stream_publishes_total",
     "aslan_stream_schema_mismatch_total",
     "audit_events",
+    "dashboard_request_duration_seconds",
+    "dashboard_requests_total",
     "db_query_duration",
     "entity_creates",
     "entity_merge_required",

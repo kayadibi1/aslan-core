@@ -22,6 +22,10 @@ from fasthtml.common import FastHTML
 from starlette.requests import Request
 from starlette.responses import Response
 
+from aslan_core.dashboard.metrics import (
+    DashboardMetricsMiddleware,
+    render_metrics_response,
+)
 from aslan_core.dashboard.redis_probes import RedisCircuitBreaker
 from aslan_core.dashboard.static import serve_static
 
@@ -39,6 +43,12 @@ if TYPE_CHECKING:
 # default htmx CDN / pico CSS injection would conflict with our
 # vendored static assets (Task 11).
 app: FastHTML = FastHTML(hdrs=())
+
+# v0.6.0 metrics middleware (Task 14): wraps every HTTP request with
+# the closed-enum (path, status) counter + unlabelled duration
+# histogram. Mounted at app construction so even 4xx / 5xx responses
+# emitted by Starlette's exception handlers land on the counter.
+app.add_middleware(DashboardMetricsMiddleware)
 
 
 _session_factory: async_sessionmaker[AsyncSession] | None = None
@@ -109,6 +119,20 @@ async def _serve_htmx_js(request: Request) -> Response:
 async def _serve_favicon(request: Request) -> Response:
     _ = request
     return serve_static("favicon.ico")
+
+
+# ── /metrics ─────────────────────────────────────────────────────
+
+
+@app.get("/metrics")  # type: ignore[misc,untyped-decorator,unused-ignore]
+async def _metrics_route(request: Request) -> Response:
+    """Prometheus exposition endpoint. Operator-internal (the
+    deployment shape in spec §6.1 has the dashboard on a loopback
+    or behind an authenticating proxy, so /metrics is reachable
+    only by the same audience as the rest of the dashboard)."""
+    _ = request
+    body, content_type = await render_metrics_response()
+    return Response(content=body, media_type=content_type)
 
 
 # ── Page registration ────────────────────────────────────────────
