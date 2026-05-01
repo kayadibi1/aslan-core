@@ -234,6 +234,7 @@ dependencies = [
 
 [package.optional-dependencies]
 dashboard = [
+    { name = "prometheus-client" },
     { name = "python-fasthtml" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -271,6 +272,7 @@ requires-dist = [
     { name = "opentelemetry-instrumentation-asyncpg", marker = "extra == 'obs'", specifier = ">=0.48b0" },
     { name = "opentelemetry-instrumentation-sqlalchemy", marker = "extra == 'obs'", specifier = ">=0.48b0" },
     { name = "opentelemetry-sdk", marker = "extra == 'obs'", specifier = ">=1.27" },
+    { name = "prometheus-client", marker = "extra == 'dashboard'", specifier = ">=0.21" },
     { name = "prometheus-client", marker = "extra == 'obs'", specifier = ">=0.21" },
     { name = "pydantic", specifier = ">=2.9" },
     { name = "pydantic-settings", specifier = ">=2.6" },

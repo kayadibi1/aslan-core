@@ -47,6 +47,13 @@ obs = [
 dashboard = [
     "python-fasthtml >=0.6,<1.0",
     "uvicorn[standard] >=0.30",
+    # Codex post-implementation review: /metrics + the Dashboard
+    # request counter / duration histogram are operator-facing
+    # signals, not optional. Pinning ``prometheus-client`` here
+    # (rather than only in [obs]) ensures every documented
+    # ``aslan-core[dashboard]`` install ships non-empty metrics so
+    # 500-spike alerts work out of the box.
+    "prometheus-client >=0.21",
 ]
 
 [dependency-groups]
