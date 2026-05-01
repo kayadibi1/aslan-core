@@ -129,7 +129,13 @@ class DeadletterVM(_VMBase):
 
 class StreamRowVM(_VMBase):
     stream_name: str
-    xlen: int
+    # ``xlen`` is ``None`` when the per-stream Redis probe failed
+    # (timeout, breaker open, or per-page budget exhausted). The page
+    # renders that as ``?`` rather than collapsing it to ``0`` —
+    # ultrareview bug_003: an ``xlen=0`` cell is operationally
+    # indistinguishable from a successfully empty stream and would
+    # mislead operators during incident response.
+    xlen: int | None
     last_entry_age_s: float | None
     pending_per_group: dict[str, int]
 

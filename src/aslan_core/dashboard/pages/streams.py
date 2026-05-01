@@ -36,6 +36,10 @@ def _build_streams_body(vm: StreamsVM) -> object:
 
 def _stream_row(row: StreamRowVM) -> object:
     last_age = f"{row.last_entry_age_s:.0f}s" if row.last_entry_age_s is not None else "—"
+    # ``?`` for an unknown xlen — distinct from ``0`` (a successfully
+    # empty stream). ultrareview bug_003: collapsing both into ``0``
+    # would mislead an operator during a partial Redis incident.
+    xlen_cell = str(row.xlen) if row.xlen is not None else "?"
     pending = (
         ", ".join(f"{g}={n}" for g, n in row.pending_per_group.items())
         if row.pending_per_group
@@ -43,7 +47,7 @@ def _stream_row(row: StreamRowVM) -> object:
     )
     return Tr(
         Td(row.stream_name),
-        Td(str(row.xlen)),
+        Td(xlen_cell),
         Td(last_age),
         Td(pending),
     )
@@ -79,7 +83,9 @@ async def streams_page(request: Request) -> HTMLResponse:
             rows.append(
                 StreamRowVM(
                     stream_name=stream_name,
-                    xlen=int(length) if length is not None else 0,
+                    # Pass ``None`` through unchanged when the probe
+                    # failed; the renderer surfaces ``?``.
+                    xlen=int(length) if length is not None else None,
                     last_entry_age_s=None,  # Task 9 fills this when needed
                     pending_per_group={},
                 )
