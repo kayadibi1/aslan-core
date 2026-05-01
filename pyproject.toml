@@ -39,6 +39,15 @@ obs = [
     "opentelemetry-instrumentation-asyncpg>=0.48b0",
     "prometheus-client>=0.21",
 ]
+# v0.6.0 dashboard extra. Consumers that want the read-only operator
+# web UI install ``aslan-core[dashboard]``. The base install runs
+# without these — ``aslan_core.dashboard`` imports at signature level
+# only; ``serve()`` calls ``uvicorn.run`` lazily so a missing dep
+# raises ``ImportError`` only at start-up time, never at import time.
+dashboard = [
+    "python-fasthtml >=0.6,<1.0",
+    "uvicorn[standard] >=0.30",
+]
 
 [dependency-groups]
 dev = [
