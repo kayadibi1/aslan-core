@@ -1,5 +1,54 @@
 # CHANGELOG
 
+## v0.5.0 — 2026-04-29 — Streams (StreamProducer + outbox + StreamConsumer + GDPR redaction)
+
+### Added
+- **`streams` schema** owned by aslan-core's Alembic; six tables shipped:
+  - `streams.outbox` — pending Redis Stream writes (drainer-owned, unique on event_id)
+  - `streams.event_id_to_redis` — drainer-populated `(event_id, stream_name) → redis_message_id` index for crash-safe exactly-once-observable delivery (codex F3)
+  - `streams.deadletter_log` — durable Postgres-first row per stuck message; unique on `(stream, group, original_message_id)` for ON CONFLICT DO UPDATE idempotency (codex F18)
+  - `streams.deadletter_redis_index` — `(failure_id → redis_message_id)` mapping (codex F9)
+  - `streams.deadletter_xadd_intent` — pre-XADD intent rows for `acquire_or_adopt_intent` (codex F21+F22)
+  - `streams.redaction_registry` — GDPR Art. 17 redaction registry; direct mutation REVOKEd from `aslan_app`; SECURITY DEFINER function `streams.redaction_registry_insert` is the only mutation surface (codex F15 round 6)
+- **`StreamProducer` API**: transactional outbox INSERT in the caller's session; auto-stamps `producer_run_id`, `actor_id`, `actor_kind`, `traceparent` BEFORE any DB I/O; strict-mode rejects publish without an actor (codex F3)
+- **`drain_outbox` daemon**: long-running drainer with `SELECT … FOR UPDATE SKIP LOCKED`; UPDATE outbox + INSERT into `event_id_to_redis` in the SAME transaction so a crash between them leaves the row pending (codex critical-contract item 6)
+- **`StreamConsumer` API**: XREADGROUP-driven async iterator with split claim/processed dedup contract (codex F1 + F-impl-1), XAUTOCLAIM crash-recovery (codex F16), schema-version gate with route-to-dead-letter on first occurrence (codex spec §4), OTel link propagation from producer traceparent (codex spec §10)
+- **Dead-letter routing protocol** (`route_to_deadletter`, `acquire_or_adopt_intent`, `find_orphan_in_deadletter_stream`, `stream_deadletter_janitor`): durable Postgres-first 6-step routing with bounded re-entry depth (codex F22), paginated XRANGE walk (codex F19), 4-pass janitor (codex F17)
+- **GDPR Art. 17 helpers** (`write_registry_entry`, `acquire_event_lock`, `canonical_payload_hash`, `redaction_lock_key`): per-event `pg_advisory_xact_lock` blocks concurrent redaction during consumer yield (codex F13); `aslan_app` role can SELECT from registry but only mutate via the SECURITY DEFINER function (codex F15)
+- **`aslan streams` CLI**: 10 subcommands (publish, tail, drain, lag, pending, deadletter list/retry, claim-release, processed-clear, known) — operator-facing surface for the streams subsystem
+- **5 canonical event schemas**: `FilingNewEvent`, `FilingAmendedEvent`, `ObservationBatchEvent`, `EntityCreatedEvent`, `StreamEntryRedactedEvent` — discriminated-union `KnownStreamEvent` Pydantic-v2 models, all `frozen=True`, tz-aware UTC
+- **Canonical stream-name constants** (`STREAMS`, `STREAM_FOR_EVENT_KIND`, `PII_BEARING_STREAMS`) — frozen MappingProxyType views; mirrored on the `_KNOWN_STREAMS` Prometheus allow-list (codex spec §9)
+- **9 new audit operations** in the allow-list: `stream.publish`, `stream.outbox_drained`, `stream.consume_ack`, `stream.consumed_redacted`, `stream.deadletter`, `stream.deadletter_orphan_lost`, `stream.deadletter_orphan_lost_recovered`, `stream.deadletter_orphan_reconciled`, `stream.deadletter_orphan_xdel`, `stream.deadletter_index_orphaned_in_redis`, `stream.entry_redacted`
+- **Pinned-set tests** for `_KNOWN_AUDIT_OPERATIONS`, `_KNOWN_STREAMS`, `_KNOWN_CONSUMER_GROUPS` to prevent silent cardinality drift
+- **F-headline regression tests**: F1 (split claim/processed), F4 (caller exception leaves PEL intact), F13 (advisory lock blocks concurrent redaction), F15 (aslan_app cannot direct-INSERT registry), F18 (ON CONFLICT idempotency), F19 (paginated XRANGE), F20 (fresh other-owner aborts), F21 (stale adoption reconciles orphan), F22 (bounded re-entry storm raises StreamRoutingContention)
+
+### Migrations
+- 0015 — `streams` schema
+- 0016 — `streams.outbox` + indexes
+- 0017 — `streams.deadletter_log` + `deadletter_redis_index` + `deadletter_xadd_intent`
+- 0018 — `streams.redaction_registry` + `aslan_app` role + SECURITY DEFINER function + REVOKE/GRANT
+- 0019 — `streams.event_id_to_redis` (drainer-populated index)
+
+### Codex adversarial review history (multiple spec/plan rounds + 3 implementation rounds)
+
+Spec/plan review caught 22 contract bugs (F1–F22) including:
+- Split claim/processed dedup contract for drainer-retry duplicates (F1, F-impl-1)
+- ON CONFLICT idempotency on the durable deadletter_log row (F18)
+- Postgres-first 6-step routing protocol with crash-safe XADD ↔ index INSERT atomicity (F5, F9)
+- `acquire_or_adopt_intent` multi-step adoption with bounded re-entry depth (F21, F22)
+- Paginated XRANGE walk in the orphan-finder (F19)
+- Per-event `pg_advisory_xact_lock` to block concurrent redaction during consumer yield (F13)
+- `aslan_app` role isolation: SECURITY DEFINER function as the only registry mutation surface (F15 round 6)
+- 4-pass dead-letter janitor: stale intent reconciliation, stuck row re-drive, index-to-stream verification, stream-to-index defense-in-depth (F17)
+
+Implementation review caught additional bugs:
+- Loser-XACK contract on duplicate event_ids (F-impl-1) — the second consumer XACKs the duplicate without yielding
+- Drainer crash-after-XADD idempotency proven via dedicated 10x-retry test
+- Cardinality drift prevention via pinned-set tests for streams + consumer groups
+
+### Credit
+- Codex implemented Tasks 12-18 (StreamConsumer + dead-letter routing + janitor + GDPR redaction) over the rate-limit window.
+
 ## v0.4.0 — 2026-04-29 — Timeseries (ObservationWriter + Reader + ts schema)
 
 ### Added

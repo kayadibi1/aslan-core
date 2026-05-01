@@ -1,6 +1,6 @@
 [project]
 name = "aslan-core"
-version = "0.4.0"
+version = "0.5.0"
 description = "Shared Python package for the Aslan Terminal data-plane services."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -17,6 +17,7 @@ dependencies = [
     "pyyaml>=6.0",
     "structlog>=24.4",
     "aioboto3>=13.0",
+    "redis>=5.0",
 ]
 
 [project.optional-dependencies]
@@ -43,7 +44,7 @@ obs = [
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
-    "testcontainers[postgres,minio]>=4.7",
+    "testcontainers[minio,postgres,redis]>=4.7",
     "hypothesis>=6.110",
     "ruff>=0.7",
     "mypy>=1.20",
@@ -130,7 +131,15 @@ asyncio_default_test_loop_scope = "session"
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = ["-ra", "--strict-markers", "--strict-config", "-m", "not integration"]
-filterwarnings = ["error"]
+filterwarnings = [
+    "error",
+    # testcontainers' RedisContainer module triggers a DeprecationWarning
+    # at IMPORT time about the deprecated `@wait_container_is_ready`
+    # decorator (their internal API). We don't own this warning; suppress
+    # so ``from testcontainers.redis import RedisContainer`` does not
+    # promote to an ImportError under our ``error`` warning policy.
+    "ignore:The @wait_container_is_ready decorator is deprecated:DeprecationWarning",
+]
 markers = [
     "integration: requires the testcontainers Postgres+Timescale stack",
 ]

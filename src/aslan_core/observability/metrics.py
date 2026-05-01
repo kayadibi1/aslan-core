@@ -137,6 +137,19 @@ _KNOWN_AUDIT_OPERATIONS: frozenset[str] = frozenset(
         "series.metadata_bypass_detected",
         "observation.metadata_pii_scrubbed",
         "observation.metadata_bypass_detected",
+        # v0.5.0 stream-publish + outbox-drainer audit operations.
+        "stream.publish",
+        "stream.outbox_drained",
+        # v0.5.0 consumer + dead-letter audit operations (Tasks 13-14, 17).
+        "stream.consume_ack",
+        "stream.consumed_redacted",
+        "stream.deadletter",
+        "stream.deadletter_orphan_lost",
+        "stream.deadletter_orphan_lost_recovered",
+        "stream.deadletter_orphan_reconciled",
+        "stream.deadletter_orphan_xdel",
+        "stream.deadletter_index_orphaned_in_redis",
+        "stream.entry_redacted",
     }
 )
 """Allow-list of every ``operation=`` string emitted by aslan-core's
@@ -146,6 +159,57 @@ collapse to ``"other"`` rather than create an unbounded metric. Update
 this set whenever a new ``operation`` string is added to a public
 mutation path; the corresponding allow-list test in
 ``tests/unit/test_metrics_cardinality.py`` enforces parity."""
+
+
+_KNOWN_STREAMS: frozenset[str] = frozenset(
+    {
+        "aslan.kap.filings.new",
+        "aslan.kap.filings.amended",
+        "aslan.kap.filings.financial_report",
+        "aslan.evds.observations.new",
+        "aslan.tefas.observations.new",
+        "aslan.tefas.nav.new",
+        # Per-symbol BIST ticks streams (e.g. ``aslan.bist.ticks.AKBNK``)
+        # collapse to this prefix via :func:`aslan_core.streams.names
+        # .normalize_bist_ticks_label` before label emission.
+        "aslan.bist.ticks",
+        "aslan.entity.created",
+        "other",
+    }
+)
+"""Allow-list of canonical stream names that may appear on the
+Prometheus ``stream`` label (codex spec §9). Mirrors
+:data:`aslan_core.streams.names.STREAMS` plus ``"other"`` for any
+out-of-allow-list stream that the producer / drainer / consumer
+collapses defensively. Hardened in Task 20 with a parity test against
+``aslan_core.streams.names.STREAMS``."""
+
+
+_KNOWN_CONSUMER_GROUPS: frozenset[str] = frozenset(
+    {
+        "aslan-service.push",
+        "aslan-service.search-index",
+        "internal-test",
+        # Test-only group identifiers; pinned here so the integration
+        # tests in v0.5 do not collapse to ``"other"`` on the
+        # ``aslan_stream_*_total{group=...}`` label. Task 20 prunes
+        # these once the test suite stabilizes onto ``"internal-test"``.
+        "test-g",
+        "g1",
+        "g2",
+        "g3",
+        "g4a",
+        "g4b",
+        "g5",
+        "g6",
+        "g7",
+        "other",
+    }
+)
+"""Allow-list of consumer-group names that may appear on the
+Prometheus ``group`` label (codex spec §9). Bounded cardinality —
+unknown groups collapse to ``"other"`` via
+:func:`_normalize_metric_label`."""
 
 
 def _normalize_metric_label(
@@ -453,9 +517,165 @@ advisory_lock_holders = _LazyGauge(
     ),
 )
 
+# v0.5.0 stream-outbox pending counter — kept current by the drainer
+# after each batch (codex spec §6).
+aslan_stream_outbox_pending = _LazyGauge(
+    name="aslan_stream_outbox_pending",
+    documentation="Count of streams.outbox rows whose published_at IS NULL.",
+)
+
+
+# ── v0.5.0 stream metrics ────────────────────────────────────────────
+
+aslan_stream_publishes_total = _LazyCounter(
+    name="aslan_stream_publishes_total",
+    documentation=("Number of stream events published via StreamProducer.publish / publish_many."),
+    labelnames=("stream", "source_id"),
+)
+
+aslan_stream_publish_duration_seconds = _LazyHistogram(
+    name="aslan_stream_publish_duration_seconds",
+    documentation="End-to-end duration of a single StreamProducer.publish call.",
+    labelnames=("stream",),
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5),
+)
+
+aslan_stream_outbox_drain_duration_seconds = _LazyHistogram(
+    name="aslan_stream_outbox_drain_duration_seconds",
+    documentation="Wall-clock duration of one drain_outbox iteration.",
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
+)
+
+
+# ── v0.5.0 consumer + dead-letter metrics ───────────────────────────
+
+aslan_stream_consumes_total = _LazyCounter(
+    name="aslan_stream_consumes_total",
+    documentation="Number of stream entries delivered to consumers (post-XREADGROUP).",
+    labelnames=("stream", "group"),
+)
+
+aslan_stream_acks_total = _LazyCounter(
+    name="aslan_stream_acks_total",
+    documentation="Number of stream entries XACKed by consumers on caller success.",
+    labelnames=("stream", "group"),
+)
+
+aslan_stream_consume_duration_seconds = _LazyHistogram(
+    name="aslan_stream_consume_duration_seconds",
+    documentation="Wall-clock duration of one per-message consumer processing pass.",
+    labelnames=("stream",),
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5),
+)
+
+aslan_stream_consume_dedup_skip_total = _LazyCounter(
+    name="aslan_stream_consume_dedup_skip_total",
+    documentation="Consumer skipped a duplicate event_id (processed-marker hit).",
+    labelnames=("stream", "group"),
+)
+
+aslan_stream_consume_claim_held_elsewhere_total = _LazyCounter(
+    name="aslan_stream_consume_claim_held_elsewhere_total",
+    documentation="Consumer skipped because another consumer holds the in-flight claim.",
+    labelnames=("stream", "group"),
+)
+
+aslan_stream_consumer_lag_seconds = _LazyGauge(
+    name="aslan_stream_consumer_lag_seconds",
+    documentation="now() - produced_at of the last yielded event, in seconds.",
+    labelnames=("stream", "group"),
+)
+
+aslan_stream_schema_mismatch_total = _LazyCounter(
+    name="aslan_stream_schema_mismatch_total",
+    documentation="Consumer encountered a stream entry outside its supported schema_version range.",
+    labelnames=("stream", "direction"),  # direction ∈ {"newer", "older"}
+)
+
+aslan_stream_deadletter_total = _LazyCounter(
+    name="aslan_stream_deadletter_total",
+    documentation="Stream events routed to <stream>.deadletter after N failures.",
+    labelnames=("stream", "group"),
+)
+
+aslan_stream_deadletter_xadd_rollback_total = _LazyCounter(
+    name="aslan_stream_deadletter_xadd_rollback_total",
+    documentation=(
+        "Step-4 race-detector rolled back our XADD because a concurrent worker "
+        "won the failure_id (codex spec §7)."
+    ),
+    labelnames=("stream",),
+)
+
+aslan_stream_deadletter_index_recovered_total = _LazyCounter(
+    name="aslan_stream_deadletter_index_recovered_total",
+    documentation=(
+        "Step-2 of dead-letter routing recovered a prior worker's redis_message_id "
+        "from streams.deadletter_redis_index (codex F9 round 4)."
+    ),
+    labelnames=("stream",),
+)
+
+aslan_stream_deadletter_orphans_reconciled_total = _LazyCounter(
+    name="aslan_stream_deadletter_orphans_reconciled_total",
+    documentation=(
+        "Janitor / stale-adoption reconciled an XADD-before-index orphan "
+        "(action='reconciled' or 'xdel')."
+    ),
+    labelnames=("stream", "action"),
+)
+
+aslan_stream_deadletter_orphans_lost_total = _LazyCounter(
+    name="aslan_stream_deadletter_orphans_lost_total",
+    documentation=(
+        "XADD never landed; intent recorded but no Redis entry exists (codex F14 round 6)."
+    ),
+    labelnames=("stream",),
+)
+
+aslan_stream_deadletter_intent_adopted_total = _LazyCounter(
+    name="aslan_stream_deadletter_intent_adopted_total",
+    documentation=(
+        "acquire_or_adopt_intent outcome (codex F21 round 10): "
+        "action ∈ {own, reconciled_by_us, abort}."
+    ),
+    labelnames=("stream", "action"),
+)
+
+aslan_stream_consumed_redacted_total = _LazyCounter(
+    name="aslan_stream_consumed_redacted_total",
+    documentation="Redacted stream events yielded to consumers.",
+    labelnames=("stream", "group"),
+)
+
+aslan_stream_entry_redacted_total = _LazyCounter(
+    name="aslan_stream_entry_redacted_total",
+    documentation="Stream entries redacted by the Art. 17 runtime.",
+    labelnames=("stream",),
+)
+
 
 __all__ = [
     "advisory_lock_holders",
+    "aslan_stream_acks_total",
+    "aslan_stream_consume_claim_held_elsewhere_total",
+    "aslan_stream_consume_dedup_skip_total",
+    "aslan_stream_consume_duration_seconds",
+    "aslan_stream_consumed_redacted_total",
+    "aslan_stream_consumer_lag_seconds",
+    "aslan_stream_consumes_total",
+    "aslan_stream_deadletter_index_recovered_total",
+    "aslan_stream_deadletter_intent_adopted_total",
+    "aslan_stream_deadletter_orphans_lost_total",
+    "aslan_stream_deadletter_orphans_reconciled_total",
+    "aslan_stream_deadletter_total",
+    "aslan_stream_deadletter_xadd_rollback_total",
+    "aslan_stream_entry_redacted_total",
+    "aslan_stream_outbox_drain_duration_seconds",
+    "aslan_stream_outbox_pending",
+    "aslan_stream_publish_duration_seconds",
+    "aslan_stream_publishes_total",
+    "aslan_stream_schema_mismatch_total",
     "audit_events",
     "db_query_duration",
     "entity_creates",
