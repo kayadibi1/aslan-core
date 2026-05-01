@@ -115,3 +115,32 @@ async def aslan_dashboard_conn(
         yield conn
     finally:
         await conn.close()
+
+
+@pytest_asyncio.fixture(loop_scope="session")
+async def aslan_dashboard_session(
+    aslan_dashboard_dsn: str,
+) -> AsyncIterator[AsyncSession]:
+    """SQLAlchemy AsyncSession authenticated as ``aslan_dashboard``.
+
+    Mirrors the local fixture in
+    ``test_dashboard_queries_run_under_aslan_dashboard.py``; promoted
+    here so the session-role / read-only / o1-redis-calls tests can
+    reuse it. Each test gets a fresh engine; rolled back on teardown
+    (the role's ``default_transaction_read_only=on`` means commits
+    are no-ops anyway).
+    """
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    engine = create_async_engine(
+        aslan_dashboard_dsn.replace("postgresql://", "postgresql+asyncpg://", 1),
+    )
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory() as session:
+            try:
+                yield session
+            finally:
+                await session.rollback()
+    finally:
+        await engine.dispose()

@@ -153,7 +153,7 @@ def test_render_returns_html_response_with_base_template() -> None:
     response = render(_request(), vm)
 
     assert isinstance(response, HTMLResponse)
-    body = response.body.decode()
+    body = bytes(response.body).decode()
     # Title carries the VM-derived label.
     assert "Overview · aslan dashboard" in body
     # Static assets referenced.
@@ -205,6 +205,7 @@ def test_render_does_not_invoke_vm_str_method() -> None:
         redaction_last_at=None,
     )
     response = render(_request(), leaky)
-    assert "LEAKED-STR" not in response.body.decode()
-    assert "LEAKED-REPR" not in response.body.decode()
+    body = bytes(response.body).decode()
+    assert "LEAKED-STR" not in body
+    assert "LEAKED-REPR" not in body
     assert str_calls == [], "render() must not invoke __str__/__repr__ on the VM"
