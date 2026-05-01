@@ -27,6 +27,7 @@ import pytest
 from pydantic import BaseModel
 from starlette.responses import HTMLResponse
 
+from aslan_core.dashboard import render as render_mod
 from aslan_core.dashboard.render import (
     clear_templates,
     register_template,
@@ -38,10 +39,22 @@ from aslan_core.dashboard.view_models import OverviewVM, _VMBase
 @pytest.fixture(autouse=True)
 def _isolate_template_registry() -> Any:
     """Each test gets a clean template registry so registrations
-    don't leak between tests."""
+    don't leak between tests.
+
+    Snapshot + restore the registry around each test rather than
+    leaving it cleared — page modules call ``register_template(...)``
+    at import time, and those imports happen exactly once per pytest
+    session. Wiping the registry permanently means any later
+    integration test that hits a page route gets ``LookupError`` from
+    the render helper. Snapshot/restore keeps the production
+    registrations intact across the whole pytest run."""
+    snapshot = dict(render_mod._TEMPLATES)
     clear_templates()
-    yield
-    clear_templates()
+    try:
+        yield
+    finally:
+        clear_templates()
+        render_mod._TEMPLATES.update(snapshot)
 
 
 def _request() -> MagicMock:
