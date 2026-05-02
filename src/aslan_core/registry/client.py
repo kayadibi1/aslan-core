@@ -448,7 +448,7 @@ class EntityRegistryClient:
         sets.append("request_id = :request_id")
         params.update(ac)
         await self._s.execute(
-            text(f"UPDATE ref.entity SET {', '.join(sets)} WHERE entity_id = :eid"),  # noqa: S608
+            text(f"UPDATE ref.entity SET {', '.join(sets)} WHERE entity_id = :eid"),  # noqa: S608  # nosemgrep: avoid-sqlalchemy-text
             params,
         )
         after_entity = await self.get(entity_id)

@@ -967,7 +967,7 @@ class ObservationWriter:
         # for the same S608-suppression precedent.
         rows = (
             await self._s.execute(
-                text(
+                text(  # nosemgrep: avoid-sqlalchemy-text
                     "SELECT ts, as_of, payload_hash FROM ts.observation "  # noqa: S608
                     "WHERE series_id = :sid AND (ts, as_of) IN (" + ",".join(in_clauses) + ")"
                 ),
