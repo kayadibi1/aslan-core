@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 import pytest_asyncio
@@ -10,12 +11,17 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from testcontainers.postgres import PostgresContainer
+from testcontainers.redis import RedisContainer
 
 from aslan_core.db.engine import create_engine
 from aslan_core.db.session import create_session_factory
 from aslan_core.documents.object_storage import InMemoryFake as _InMemoryFake
 
+if TYPE_CHECKING:
+    from redis.asyncio import Redis
+
 TIMESCALE_IMAGE = "timescale/timescaledb:latest-pg16"
+REDIS_IMAGE = "redis:7"
 
 
 @pytest.fixture(scope="session")
@@ -94,3 +100,43 @@ def object_storage_fake() -> _InMemoryFake:
     """Function-scoped fresh InMemoryFake. Tests assert against
     fake.all_keys() / fake.get_body() to verify cleanup behavior."""
     return _InMemoryFake()
+
+
+# ── Redis fixtures (v0.5.0) ──────────────────────────────────────────
+
+
+@pytest.fixture(scope="session")
+def redis_container() -> Iterator[RedisContainer]:
+    """Session-scoped Redis testcontainer for the v0.5.0 streams tests.
+
+    Cheap to spin up (~200ms); reused across the full integration run
+    so individual tests don't pay the container-start cost.
+    """
+    with RedisContainer(REDIS_IMAGE) as r:
+        yield r
+
+
+@pytest.fixture(scope="session")
+def redis_url(redis_container: RedisContainer) -> str:
+    """Build a ``redis://host:port/0`` URL from the testcontainer."""
+    host = redis_container.get_container_host_ip()
+    port = redis_container.get_exposed_port(6379)
+    return f"redis://{host}:{port}/0"
+
+
+@pytest_asyncio.fixture(loop_scope="session")
+async def redis_client(redis_url: str) -> AsyncIterator[Redis]:
+    """Function-scoped async Redis client.
+
+    Flushes the database on entry so each test starts with an empty
+    Redis and on exit so the next test isn't perturbed by leftover keys.
+    """
+    from redis.asyncio import Redis
+
+    client: Redis = Redis.from_url(redis_url, decode_responses=True)
+    try:
+        await client.flushdb()
+        yield client
+        await client.flushdb()
+    finally:
+        await client.aclose()

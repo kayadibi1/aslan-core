@@ -65,6 +65,29 @@ _KNOWN_FILING_KINDS: frozenset[str] = frozenset(
 of the metric stays bounded by ``len(_KNOWN_FILING_KINDS)``. Expand
 deliberately when a new domain value is added to the spec."""
 
+_KNOWN_FREQUENCIES: frozenset[str] = frozenset(
+    {
+        "tick",
+        "1s",
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "1h",
+        "1d",
+        "1w",
+        "1mo",
+        "1q",
+        "1y",
+        "irregular",
+    }
+)
+"""Allow-list of every ``frequency`` string the v0.4 timeseries Pydantic
+``Frequency`` literal accepts. Bounds the cardinality of
+``aslan_series_upserts_total{frequency=...}``: any value outside this
+set collapses to ``"other"`` (the same defensive normalisation pattern
+used for ``filing_puts.kind`` and ``audit_events.operation``)."""
+
 _KNOWN_AUDIT_OPERATIONS: frozenset[str] = frozenset(
     {
         "entity.create",
@@ -94,6 +117,39 @@ _KNOWN_AUDIT_OPERATIONS: frozenset[str] = frozenset(
         "ingestion_run.complete",
         "ingestion_run.set_metadata",
         "ingestion_run.increment_rows",
+        # ``series.*`` operations from ObservationWriter.upsert_series
+        # (v0.4.0 Tasks 8-13).
+        "series.upsert",
+        "series.idempotent_hit",
+        "series.update",
+        # Bulk-write batch event from ObservationWriter.write (Task 16).
+        # ONE event per write() call carrying bounded forensic
+        # metadata; per-key detail lives in audit.observation_batch_keys.
+        "observation.write_batch",
+        # v0.4.0 Task 25 — Art. 17 deletion runtime + PII tripwires.
+        # Emitted by the aslan-service deletion runtime (NOT by aslan-core
+        # itself; aslan-core only enforces upsert-time PII rejection).
+        # Listed here so a service-side emitter that lands an audit row
+        # under one of these operations gets a bounded Prometheus label
+        # instead of inflating cardinality.
+        "series.subject_erased",
+        "series.metadata_pii_scrubbed",
+        "series.metadata_bypass_detected",
+        "observation.metadata_pii_scrubbed",
+        "observation.metadata_bypass_detected",
+        # v0.5.0 stream-publish + outbox-drainer audit operations.
+        "stream.publish",
+        "stream.outbox_drained",
+        # v0.5.0 consumer + dead-letter audit operations (Tasks 13-14, 17).
+        "stream.consume_ack",
+        "stream.consumed_redacted",
+        "stream.deadletter",
+        "stream.deadletter_orphan_lost",
+        "stream.deadletter_orphan_lost_recovered",
+        "stream.deadletter_orphan_reconciled",
+        "stream.deadletter_orphan_xdel",
+        "stream.deadletter_index_orphaned_in_redis",
+        "stream.entry_redacted",
     }
 )
 """Allow-list of every ``operation=`` string emitted by aslan-core's
@@ -103,6 +159,92 @@ collapse to ``"other"`` rather than create an unbounded metric. Update
 this set whenever a new ``operation`` string is added to a public
 mutation path; the corresponding allow-list test in
 ``tests/unit/test_metrics_cardinality.py`` enforces parity."""
+
+
+_KNOWN_STREAMS: frozenset[str] = frozenset(
+    {
+        "aslan.kap.filings.new",
+        "aslan.kap.filings.amended",
+        "aslan.kap.filings.financial_report",
+        "aslan.evds.observations.new",
+        "aslan.tefas.observations.new",
+        "aslan.tefas.nav.new",
+        # Per-symbol BIST ticks streams (e.g. ``aslan.bist.ticks.AKBNK``)
+        # collapse to this prefix via :func:`aslan_core.streams.names
+        # .normalize_bist_ticks_label` before label emission.
+        "aslan.bist.ticks",
+        "aslan.entity.created",
+        "other",
+    }
+)
+"""Allow-list of canonical stream names that may appear on the
+Prometheus ``stream`` label (codex spec §9). Mirrors
+:data:`aslan_core.streams.names.STREAMS` plus ``"other"`` for any
+out-of-allow-list stream that the producer / drainer / consumer
+collapses defensively. Hardened in Task 20 with a parity test against
+``aslan_core.streams.names.STREAMS``."""
+
+
+_KNOWN_CONSUMER_GROUPS: frozenset[str] = frozenset(
+    {
+        "aslan-service.push",
+        "aslan-service.search-index",
+        "internal-test",
+        # Test-only group identifiers; pinned here so the integration
+        # tests in v0.5 do not collapse to ``"other"`` on the
+        # ``aslan_stream_*_total{group=...}`` label. Task 20 prunes
+        # these once the test suite stabilizes onto ``"internal-test"``.
+        "test-g",
+        "g1",
+        "g2",
+        "g3",
+        "g4a",
+        "g4b",
+        "g5",
+        "g6",
+        "g7",
+        "other",
+    }
+)
+"""Allow-list of consumer-group names that may appear on the
+Prometheus ``group`` label (codex spec §9). Bounded cardinality —
+unknown groups collapse to ``"other"`` via
+:func:`_normalize_metric_label`."""
+
+
+_KNOWN_DASHBOARD_PATHS: frozenset[str] = frozenset(
+    {
+        "/",
+        "/outbox",
+        "/streams",
+        "/ingestion",
+        "/documents",
+        "/timeseries",
+        "/deadletter",
+        "/static",
+        "/metrics",
+        # Compliance-sensitive routes are deliberately bucketed under
+        # the literal "<sensitive>" label so the metric never
+        # distinguishes /audit from /redactions traffic. Spec §6.2:
+        # the per-view-attribution claim is reserved until
+        # aslan-service auth lands; until then the metric must not
+        # let an attacker tell which surface an operator hit.
+        "<sensitive>",
+        "<other>",
+    }
+)
+"""Allow-list of v0.6.0 dashboard request-path labels. Closed
+enum: routes outside this list collapse to ``"<other>"``; the
+two compliance-sensitive routes (``/audit`` + ``/redactions``)
+collapse to ``"<sensitive>"`` so a label observer cannot tell
+the two surfaces apart."""
+
+
+_KNOWN_DASHBOARD_STATUSES: frozenset[str] = frozenset({"200", "404", "405", "500", "<other>"})
+"""Allow-list of HTTP status-code labels for the dashboard's
+request counter. 200 / 404 / 405 / 500 are the four shapes the
+v0.6.0 surface can produce; anything else collapses to
+``"<other>"``."""
 
 
 def _normalize_metric_label(
@@ -345,6 +487,15 @@ audit_events = _LazyCounter(
     labelnames=("operation", "actor_kind"),
 )
 
+series_upserts = _LazyCounter(
+    name="aslan_series_upserts_total",
+    documentation=(
+        "Total ObservationWriter.upsert_series calls (fresh + idempotent + "
+        "field-change paths combined)."
+    ),
+    labelnames=("source_id", "frequency"),
+)
+
 
 # ── Histograms ───────────────────────────────────────────────────────
 
@@ -370,6 +521,25 @@ object_storage_op_duration = _LazyHistogram(
     buckets=_DURATION_BUCKETS,
 )
 
+# v0.4 ObservationWriter.write — per-batch sample size (used by
+# operators for capacity planning + p99 batch-size alerts). No labels:
+# the histogram is a global signal; per-source breakdown lives on
+# ``observation_writes``.
+observation_write_batch_size = _LazyHistogram(
+    name="aslan_observation_write_batch_size",
+    documentation="Per-write batch size (number of ObservationIn rows attempted).",
+    buckets=(1, 10, 100, 500, 1_000, 5_000, 10_000, 50_000),
+)
+
+# End-to-end wall-clock for ObservationWriter.write. Wired in Task 19;
+# declared here so the metric is registered before the first call.
+observation_write_duration = _LazyHistogram(
+    name="aslan_observation_write_duration_seconds",
+    documentation="ObservationWriter.write end-to-end duration.",
+    labelnames=("source_id",),
+    buckets=(0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0),
+)
+
 
 # ── Gauges ───────────────────────────────────────────────────────────
 
@@ -382,10 +552,203 @@ advisory_lock_holders = _LazyGauge(
     ),
 )
 
+# v0.5.0 stream-outbox pending counter — kept current by the drainer
+# after each batch (codex spec §6).
+aslan_stream_outbox_pending = _LazyGauge(
+    name="aslan_stream_outbox_pending",
+    documentation="Count of streams.outbox rows whose published_at IS NULL.",
+)
+
+
+# ── v0.5.0 stream metrics ────────────────────────────────────────────
+
+aslan_stream_publishes_total = _LazyCounter(
+    name="aslan_stream_publishes_total",
+    documentation=("Number of stream events published via StreamProducer.publish / publish_many."),
+    labelnames=("stream", "source_id"),
+)
+
+aslan_stream_publish_duration_seconds = _LazyHistogram(
+    name="aslan_stream_publish_duration_seconds",
+    documentation="End-to-end duration of a single StreamProducer.publish call.",
+    labelnames=("stream",),
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5),
+)
+
+aslan_stream_outbox_drain_duration_seconds = _LazyHistogram(
+    name="aslan_stream_outbox_drain_duration_seconds",
+    documentation="Wall-clock duration of one drain_outbox iteration.",
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
+)
+
+
+# ── v0.5.0 consumer + dead-letter metrics ───────────────────────────
+
+aslan_stream_consumes_total = _LazyCounter(
+    name="aslan_stream_consumes_total",
+    documentation="Number of stream entries delivered to consumers (post-XREADGROUP).",
+    labelnames=("stream", "group"),
+)
+
+aslan_stream_acks_total = _LazyCounter(
+    name="aslan_stream_acks_total",
+    documentation="Number of stream entries XACKed by consumers on caller success.",
+    labelnames=("stream", "group"),
+)
+
+aslan_stream_consume_duration_seconds = _LazyHistogram(
+    name="aslan_stream_consume_duration_seconds",
+    documentation="Wall-clock duration of one per-message consumer processing pass.",
+    labelnames=("stream",),
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5),
+)
+
+aslan_stream_consume_dedup_skip_total = _LazyCounter(
+    name="aslan_stream_consume_dedup_skip_total",
+    documentation="Consumer skipped a duplicate event_id (processed-marker hit).",
+    labelnames=("stream", "group"),
+)
+
+aslan_stream_consume_claim_held_elsewhere_total = _LazyCounter(
+    name="aslan_stream_consume_claim_held_elsewhere_total",
+    documentation="Consumer skipped because another consumer holds the in-flight claim.",
+    labelnames=("stream", "group"),
+)
+
+aslan_stream_consumer_lag_seconds = _LazyGauge(
+    name="aslan_stream_consumer_lag_seconds",
+    documentation="now() - produced_at of the last yielded event, in seconds.",
+    labelnames=("stream", "group"),
+)
+
+aslan_stream_schema_mismatch_total = _LazyCounter(
+    name="aslan_stream_schema_mismatch_total",
+    documentation="Consumer encountered a stream entry outside its supported schema_version range.",
+    labelnames=("stream", "direction"),  # direction ∈ {"newer", "older"}
+)
+
+aslan_stream_deadletter_total = _LazyCounter(
+    name="aslan_stream_deadletter_total",
+    documentation="Stream events routed to <stream>.deadletter after N failures.",
+    labelnames=("stream", "group"),
+)
+
+aslan_stream_deadletter_xadd_rollback_total = _LazyCounter(
+    name="aslan_stream_deadletter_xadd_rollback_total",
+    documentation=(
+        "Step-4 race-detector rolled back our XADD because a concurrent worker "
+        "won the failure_id (codex spec §7)."
+    ),
+    labelnames=("stream",),
+)
+
+aslan_stream_deadletter_index_recovered_total = _LazyCounter(
+    name="aslan_stream_deadletter_index_recovered_total",
+    documentation=(
+        "Step-2 of dead-letter routing recovered a prior worker's redis_message_id "
+        "from streams.deadletter_redis_index (codex F9 round 4)."
+    ),
+    labelnames=("stream",),
+)
+
+aslan_stream_deadletter_orphans_reconciled_total = _LazyCounter(
+    name="aslan_stream_deadletter_orphans_reconciled_total",
+    documentation=(
+        "Janitor / stale-adoption reconciled an XADD-before-index orphan "
+        "(action='reconciled' or 'xdel')."
+    ),
+    labelnames=("stream", "action"),
+)
+
+aslan_stream_deadletter_orphans_lost_total = _LazyCounter(
+    name="aslan_stream_deadletter_orphans_lost_total",
+    documentation=(
+        "XADD never landed; intent recorded but no Redis entry exists (codex F14 round 6)."
+    ),
+    labelnames=("stream",),
+)
+
+aslan_stream_deadletter_intent_adopted_total = _LazyCounter(
+    name="aslan_stream_deadletter_intent_adopted_total",
+    documentation=(
+        "acquire_or_adopt_intent outcome (codex F21 round 10): "
+        "action ∈ {own, reconciled_by_us, abort}."
+    ),
+    labelnames=("stream", "action"),
+)
+
+aslan_stream_consumed_redacted_total = _LazyCounter(
+    name="aslan_stream_consumed_redacted_total",
+    documentation="Redacted stream events yielded to consumers.",
+    labelnames=("stream", "group"),
+)
+
+aslan_stream_entry_redacted_total = _LazyCounter(
+    name="aslan_stream_entry_redacted_total",
+    documentation="Stream entries redacted by the Art. 17 runtime.",
+    labelnames=("stream",),
+)
+
+
+# v0.6.0 dashboard request metrics (codex round-4 + round-5):
+#
+# * ``dashboard_requests_total`` — counter labelled by (path, status).
+#   Path comes from a closed enum (:data:`_KNOWN_DASHBOARD_PATHS`)
+#   that buckets the two compliance-sensitive routes
+#   (``/audit`` + ``/redactions``) under ``"<sensitive>"`` so a
+#   metric observer cannot tell which inspect surface an operator
+#   hit. Status from a four-element closed enum
+#   (:data:`_KNOWN_DASHBOARD_STATUSES`).
+# * ``dashboard_request_duration_seconds`` — histogram with NO
+#   labels (codex round-4). Per-route timing would let an observer
+#   correlate the duration distribution with the underlying SQL or
+#   Redis fan-out shape; an unlabelled histogram preserves global
+#   alerting (p99 latency) without per-surface side-channel.
+dashboard_requests_total = _LazyCounter(
+    name="aslan_dashboard_requests_total",
+    documentation=(
+        "v0.6.0 dashboard HTTP requests, labelled by closed-enum path + "
+        "closed-enum status. /audit + /redactions bucket under <sensitive>."
+    ),
+    labelnames=("path", "status"),
+)
+
+dashboard_request_duration_seconds = _LazyHistogram(
+    name="aslan_dashboard_request_duration_seconds",
+    documentation=(
+        "v0.6.0 dashboard request duration in seconds. Intentionally "
+        "unlabelled — per-route timing is a side-channel that would "
+        "let a metric observer distinguish the compliance-sensitive "
+        "surfaces from the rest."
+    ),
+    buckets=_DURATION_BUCKETS,
+)
+
 
 __all__ = [
     "advisory_lock_holders",
+    "aslan_stream_acks_total",
+    "aslan_stream_consume_claim_held_elsewhere_total",
+    "aslan_stream_consume_dedup_skip_total",
+    "aslan_stream_consume_duration_seconds",
+    "aslan_stream_consumed_redacted_total",
+    "aslan_stream_consumer_lag_seconds",
+    "aslan_stream_consumes_total",
+    "aslan_stream_deadletter_index_recovered_total",
+    "aslan_stream_deadletter_intent_adopted_total",
+    "aslan_stream_deadletter_orphans_lost_total",
+    "aslan_stream_deadletter_orphans_reconciled_total",
+    "aslan_stream_deadletter_total",
+    "aslan_stream_deadletter_xadd_rollback_total",
+    "aslan_stream_entry_redacted_total",
+    "aslan_stream_outbox_drain_duration_seconds",
+    "aslan_stream_outbox_pending",
+    "aslan_stream_publish_duration_seconds",
+    "aslan_stream_publishes_total",
+    "aslan_stream_schema_mismatch_total",
     "audit_events",
+    "dashboard_request_duration_seconds",
+    "dashboard_requests_total",
     "db_query_duration",
     "entity_creates",
     "entity_merge_required",
@@ -393,7 +756,10 @@ __all__ = [
     "filing_releases",
     "object_storage_op_duration",
     "object_storage_orphans",
+    "observation_write_batch_size",
+    "observation_write_duration",
     "observation_writes",
+    "series_upserts",
 ]
 
 # The cardinality-bounding helper and allow-lists are intentionally

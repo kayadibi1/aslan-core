@@ -8,3 +8,11 @@ __pycache__/
 dist/
 *.egg-info/
 .DS_Store
+
+# Local agent + tool artifacts (Claude Code, Codex, Playwright MCP).
+# Never commit; these contain ephemeral local state and may include
+# session-scoped credentials or third-party page captures.
+.sesskey
+.claude/
+.playwright-mcp/
+AGENTS.md
