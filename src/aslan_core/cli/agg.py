@@ -86,5 +86,6 @@ async def _seed_restatement(rows: list[dict[str, Any]]) -> None:
                     actor_kind=actor.actor_kind if actor else None,
                 )
                 click.echo(f"  {result.name} (config_id={result.config_id})")
+            await s.commit()
     finally:
         await engine.dispose()

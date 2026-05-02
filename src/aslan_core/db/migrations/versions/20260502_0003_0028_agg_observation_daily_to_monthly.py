@@ -23,37 +23,61 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     # Continuous aggregates cannot be created inside a transaction block.
+    # Guards are retry-safe: if a partial run left the view created but
+    # the policy or GRANT missing, re-running converges without manual
+    # cleanup.
     conn = op.get_bind()
     conn.execute(text("COMMIT"))
-    conn.execute(
+
+    # Guard: skip if already created (retry after partial failure)
+    exists = conn.execute(
         text(
-            """
-            CREATE MATERIALIZED VIEW agg.observation_daily_to_monthly
-            WITH (timescaledb.continuous) AS
-            SELECT
-                series_id,
-                time_bucket('1 month', ts) AS month,
-                last(value, ts) AS month_end_value,
-                avg(value) AS month_avg_value,
-                min(value) AS month_min,
-                max(value) AS month_max,
-                count(*) AS n_obs
-            FROM ts.observation
-            WHERE value IS NOT NULL
-            GROUP BY series_id, month
-            """
+            "SELECT 1 FROM timescaledb_information.continuous_aggregates "
+            "WHERE view_schema = 'agg' "
+            "AND view_name = 'observation_daily_to_monthly'"
         )
-    )
-    conn.execute(
+    ).scalar()
+    if not exists:
+        conn.execute(
+            text(
+                """
+                CREATE MATERIALIZED VIEW agg.observation_daily_to_monthly
+                WITH (timescaledb.continuous) AS
+                SELECT
+                    series_id,
+                    time_bucket('1 month', ts) AS month,
+                    last(value, ts) AS month_end_value,
+                    avg(value) AS month_avg_value,
+                    min(value) AS month_min,
+                    max(value) AS month_max,
+                    count(*) AS n_obs
+                FROM ts.observation
+                WHERE value IS NOT NULL
+                GROUP BY series_id, month
+                """
+            )
+        )
+
+    # Guard: skip policy if already registered
+    policy_exists = conn.execute(
         text(
-            """
-            SELECT add_continuous_aggregate_policy('agg.observation_daily_to_monthly',
-                start_offset => INTERVAL '1 year',
-                end_offset   => INTERVAL '1 day',
-                schedule_interval => INTERVAL '1 hour')
-            """
+            "SELECT 1 FROM timescaledb_information.jobs "
+            "WHERE hypertable_schema = 'agg' "
+            "AND hypertable_name = 'observation_daily_to_monthly'"
         )
-    )
+    ).scalar()
+    if not policy_exists:
+        conn.execute(
+            text(
+                """
+                SELECT add_continuous_aggregate_policy('agg.observation_daily_to_monthly',
+                    start_offset => INTERVAL '1 year',
+                    end_offset   => INTERVAL '1 day',
+                    schedule_interval => INTERVAL '1 hour')
+                """
+            )
+        )
+
     conn.execute(text("GRANT SELECT ON agg.observation_daily_to_monthly TO aslan_dashboard"))
     conn.execute(text("BEGIN"))
 

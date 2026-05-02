@@ -24,6 +24,7 @@ async def refresh_entity_snapshot(session: AsyncSession) -> int:
     Returns the row count after refresh.
     """
     await session.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY agg.entity_latest_snapshot"))
+    await session.commit()
     result = await session.execute(text("SELECT count(*) FROM agg.entity_latest_snapshot"))
     return result.scalar() or 0
 
@@ -91,7 +92,7 @@ async def upsert_restatement_config(
     ).returning(RestatementConfig)
     result = await session.execute(stmt)
     row = result.scalar_one()
-    await session.commit()
+    await session.flush()
     return RestatementConfigSchema(
         config_id=row.config_id,
         name=row.name,
