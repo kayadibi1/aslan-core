@@ -16,6 +16,7 @@ repos:
           - click>=8.1
           - pytest>=8.3
           - pytest-asyncio>=0.24
+          - redis>=5.0
           - types-PyYAML
           - structlog>=24.4
         args: [--strict, src, tests]

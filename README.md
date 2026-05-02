@@ -36,3 +36,18 @@ The canonical aslan local stack uses these ports:
 | 9001 | MinIO console |
 
 If you also run other Aslan-Terminal scrapers' local stacks (e.g. an older `kap-scraper` Compose that bundles its own Postgres on 5432), bring them down before starting the aslan stack. Per spec §11, consumer scrapers should `extends:` this Compose rather than ship their own DB services — that work happens repo-by-repo as each consumer migrates.
+
+## Dashboard (v0.6.0)
+
+Read-only operator UI for the data plane — outbox, streams,
+deadletter, ingestion, audit, redactions. Install with the
+`[dashboard]` extra:
+
+```
+uv pip install -e '.[dashboard]'
+alembic upgrade head
+export ASLAN_DASHBOARD_DSN=postgresql://aslan_dashboard:<password>@localhost/aslan
+aslan dashboard serve
+```
+
+Full runbook + reverse-proxy deployment guide: [`docs/dashboard.md`](docs/dashboard.md).

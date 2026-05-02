@@ -4,6 +4,9 @@ from aslan_core.testing.fixtures import (  # noqa: F401
     object_storage_fake,
     pg_container,
     pg_dsn,
+    redis_client,
+    redis_container,
+    redis_url,
     session,
     session_factory,
 )
