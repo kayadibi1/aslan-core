@@ -15,6 +15,7 @@ class Base(DeclarativeBase):
 
 
 # Module imports register tables on Base.metadata; must run after Base is defined.
+from aslan_core.models import agg as _agg  # noqa: F401, E402
 from aslan_core.models import doc as _doc  # noqa: F401, E402
 from aslan_core.models import streams as _streams  # noqa: F401, E402
 from aslan_core.models import ts as _ts  # noqa: F401, E402
