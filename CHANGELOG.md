@@ -60,11 +60,22 @@
 - 0022 — REVOKE raw `client_ip` + `user_agent` from
   `aslan_dashboard` on 4 tables; `audit.event_client_ip_truncated`
   SECURITY DEFINER helper for the rendered CIDR.
+- 0023 — REVOKE `metadata` SELECT from `aslan_dashboard` on
+  `src.ingestion_run` + `doc.filing`; static-SQL scanner allowlist
+  tightened with two new forbidden-column pairs (codex post-impl
+  HIGH).
+- 0024 — Dedicated NOLOGIN `aslan_audit_helpers` role owns both
+  `audit.event_metadata_key_count` + `audit.event_client_ip_truncated`
+  SECURITY DEFINER helpers; raw `metadata` and `client_ip` SELECT
+  REVOKEd from `aslan_app`; helper-owner-isolated test pins the
+  contract (codex post-impl HIGH).
 
 ### Codex adversarial review history
 
-Spec + plan rounds caught 39 findings (34 spec/plan + 5
-branch-state). Highlights closed:
+Forty-four findings absorbed across four phases (34 spec/plan + 5
+branch-state + 3 post-implementation + 2 ultrareview).
+
+**Spec/plan + branch-state highlights:**
 
 - F-1 CRITICAL: raw `client_ip` / `user_agent` were granted to the
   dashboard role; revoked in migration 0022 + truncated CIDR helper.
@@ -77,6 +88,30 @@ branch-state). Highlights closed:
   LOGIN-as-aslan_dashboard SQLAlchemy engine.
 - F-5 MEDIUM: lint rejects f-string `op.execute` whose source
   contains `SECURITY DEFINER`.
+
+**Post-implementation review (3 findings):**
+
+- HIGH: `metadata` was still readable by `aslan_dashboard` on
+  `src.ingestion_run` + `doc.filing` (the dashboard never selected
+  it, but the GRANT layer permitted it) — closed by migration 0023.
+- HIGH: SECURITY DEFINER audit helpers ran as `aslan_app`, so
+  `aslan_app` retained a transitive read path to raw `metadata` and
+  `client_ip` — closed by migration 0024 (dedicated NOLOGIN owner
+  role).
+- MEDIUM: `prometheus-client` was an undeclared transitive of
+  `python-fasthtml`; pinned `>=0.21` in the `[dashboard]` extra so
+  `/metrics` cannot silently empty under a documented install.
+
+**Ultrareview (2 in-scope findings — full repo squashed snapshot
+review):**
+
+- bug_003 (normal): `StreamRowVM.xlen: int | None`; failed Redis
+  probes now render as `?` instead of being collapsed to `0` (which
+  was indistinguishable from a successfully empty stream).
+- bug_005 (nit): dropped the broken `--reload` flag from `aslan
+  dashboard serve` and the operator runbook — uvicorn's
+  `--reload` requires an import string + worker startup hook that
+  v0.6.0 does not ship, so the flag exited with a warning when used.
 
 ### Compatibility
 
