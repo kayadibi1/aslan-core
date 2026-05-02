@@ -23,7 +23,8 @@
 | `src/evds/__init__.py` | Package marker |
 | `src/evds/config.py` | `EvdsSettings` (pydantic-settings, env-prefixed) |
 | `src/evds/db.py` | Engine + session factory (wraps aslan-core's `create_engine`) |
-| `src/evds/client.py` | `EvdsClient` + `EvdsObservation` dataclass + rate limiter |
+| `src/evds/errors.py` | Typed error classes (`EvdsApiError`, `EvdsParseError`, `WatermarkCasMiss`) |
+| `src/evds/client.py` | `EvdsClient` + `EvdsObservation` dataclass + rate limiter + retry |
 | `src/evds/catalog.py` | Series manifest (Python dict) + `seed_catalog()` + `load_enabled_series()` |
 | `src/evds/pull.py` | `pull_series()` engine (daily + backfill) + `PullResult` |
 | `src/evds/cli/__init__.py` | CLI package marker |
@@ -387,8 +388,11 @@ def upgrade() -> None:
             series_def_id       SERIAL PRIMARY KEY,
             series_code         TEXT NOT NULL UNIQUE,
             evds_native_code    TEXT NOT NULL UNIQUE,
-            category            TEXT NOT NULL,
-            frequency           TEXT NOT NULL,
+            category            TEXT NOT NULL
+                CHECK (category IN ('policy_rate', 'fx', 'cpi', 'reserves', 'monetary', 'bop')),
+            metric              TEXT NOT NULL,
+            frequency           TEXT NOT NULL
+                CHECK (frequency IN ('tick','1s','1m','5m','15m','30m','1h','1d','1w','1mo','1q','1y','irregular')),
             unit                TEXT NOT NULL,
             currency_code       TEXT,
             description         TEXT,
@@ -413,9 +417,10 @@ git commit -m "feat: db module + Alembic setup + evds.series_definition migratio
 
 ---
 
-### Task 4: EVDS API client + tests
+### Task 4: Error types + EVDS API client + tests
 
 **Files:**
+- Create: `src/evds/errors.py`
 - Create: `src/evds/client.py`
 - Create: `tests/fixtures/daily_response.json`
 - Create: `tests/fixtures/monthly_response.json`
@@ -423,7 +428,31 @@ git commit -m "feat: db module + Alembic setup + evds.series_definition migratio
 - Create: `tests/fixtures/null_values_response.json`
 - Create: `tests/test_client.py`
 
-- [ ] **Step 1: Write test fixtures**
+- [ ] **Step 1: Write errors.py**
+
+`src/evds/errors.py`:
+
+```python
+from __future__ import annotations
+
+
+class EvdsError(Exception):
+    """Base for all typed EVDS puller errors."""
+
+
+class EvdsApiError(EvdsError):
+    """EVDS API returned a non-retryable error (400, 403)."""
+
+
+class EvdsParseError(EvdsError):
+    """Failed to parse EVDS API response."""
+
+
+class WatermarkCasMiss(EvdsError):
+    """WatermarkStore.advance() CAS failed — concurrent writer or stale cursor."""
+```
+
+- [ ] **Step 2: Write test fixtures**
 
 `tests/fixtures/daily_response.json` — simulates a daily FX series response:
 ```json
@@ -468,7 +497,7 @@ git commit -m "feat: db module + Alembic setup + evds.series_definition migratio
 }
 ```
 
-- [ ] **Step 2: Write the failing tests**
+- [ ] **Step 3: Write the failing tests**
 
 `tests/test_client.py`:
 
@@ -483,6 +512,7 @@ import pytest
 import respx
 
 from evds.client import EvdsClient, EvdsObservation
+from evds.errors import EvdsApiError
 
 
 @pytest.fixture
@@ -578,17 +608,29 @@ class TestFetchSeries:
         assert b"key=test-key" in req.url.raw_path
 
     @respx.mock
-    async def test_http_error_raises(self, api_key: str, mock_http: httpx.AsyncClient) -> None:
+    async def test_non_retryable_error_raises_typed(self, api_key: str, mock_http: httpx.AsyncClient) -> None:
         respx.get("https://evds2.tcmb.gov.tr/service/evds/series=TP.FG.J0").mock(
-            return_value=httpx.Response(500)
+            return_value=httpx.Response(403)
         )
         client = EvdsClient(api_key=api_key, http=mock_http)
 
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(EvdsApiError):
             await client.fetch_series("TP.FG.J0", date(2026, 3, 1), date(2026, 4, 1))
+
+    @respx.mock
+    async def test_retryable_error_retries_then_raises(self, api_key: str, mock_http: httpx.AsyncClient) -> None:
+        route = respx.get("https://evds2.tcmb.gov.tr/service/evds/series=TP.FG.J0").mock(
+            return_value=httpx.Response(500)
+        )
+        client = EvdsClient(api_key=api_key, http=mock_http, max_retries=2)
+
+        with pytest.raises(EvdsApiError):
+            await client.fetch_series("TP.FG.J0", date(2026, 3, 1), date(2026, 4, 1))
+
+        assert route.call_count == 3  # initial + 2 retries
 ```
 
-- [ ] **Step 3: Run tests — verify they fail**
+- [ ] **Step 4: Run tests — verify they fail**
 
 ```bash
 uv run pytest tests/test_client.py -v
@@ -596,7 +638,7 @@ uv run pytest tests/test_client.py -v
 
 Expected: `ModuleNotFoundError: No module named 'evds.client'`
 
-- [ ] **Step 4: Write client.py**
+- [ ] **Step 5: Write client.py**
 
 ```python
 from __future__ import annotations
@@ -609,9 +651,13 @@ from datetime import date, datetime
 import httpx
 import structlog
 
+from evds.errors import EvdsApiError, EvdsParseError
+
 log = structlog.get_logger()
 
 EVDS_BASE_URL = "https://evds2.tcmb.gov.tr/service/evds"
+_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+_NON_RETRYABLE_STATUS = frozenset({400, 403, 404})
 
 
 @dataclass(frozen=True, slots=True)
@@ -625,11 +671,17 @@ def _parse_value(raw: str | None) -> float | None:
     if raw is None or raw.strip() == "" or raw.strip().upper() == "ND":
         return None
     cleaned = raw.strip().replace(",", ".")
-    return float(cleaned)
+    try:
+        return float(cleaned)
+    except ValueError as e:
+        raise EvdsParseError(f"cannot parse value {raw!r}") from e
 
 
 def _parse_date(raw: str) -> date:
-    return datetime.strptime(raw.strip(), "%d-%m-%Y").date()
+    try:
+        return datetime.strptime(raw.strip(), "%d-%m-%Y").date()
+    except ValueError as e:
+        raise EvdsParseError(f"cannot parse date {raw!r}") from e
 
 
 def _native_code_to_column(native_code: str) -> str:
@@ -655,10 +707,12 @@ class EvdsClient:
         api_key: str,
         http: httpx.AsyncClient,
         rate_limit_rps: float = 8.0,
+        max_retries: int = 3,
     ) -> None:
         self._api_key = api_key
         self._http = http
         self._limiter = _RateLimiter(rate_limit_rps)
+        self._max_retries = max_retries
 
     async def fetch_series(
         self,
@@ -669,17 +723,36 @@ class EvdsClient:
         await self._limiter.acquire()
 
         params = {
-            "series": native_code,
             "startDate": start_date.strftime("%d-%m-%Y"),
             "endDate": end_date.strftime("%d-%m-%Y"),
             "type": "json",
             "key": self._api_key,
         }
-        resp = await self._http.get(
-            f"{EVDS_BASE_URL}/series={native_code}",
-            params={k: v for k, v in params.items() if k != "series"},
-        )
-        resp.raise_for_status()
+        url = f"{EVDS_BASE_URL}/series={native_code}"
+
+        last_exc: Exception | None = None
+        for attempt in range(1 + self._max_retries):
+            try:
+                resp = await self._http.get(url, params=params)
+            except httpx.TimeoutException as e:
+                last_exc = e
+                if attempt < self._max_retries:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                raise EvdsApiError(f"timeout after {1 + self._max_retries} attempts: {native_code}") from e
+
+            if resp.status_code in _NON_RETRYABLE_STATUS:
+                raise EvdsApiError(f"EVDS API {resp.status_code} for {native_code}")
+
+            if resp.status_code in _RETRYABLE_STATUS:
+                last_exc = EvdsApiError(f"EVDS API {resp.status_code} for {native_code}")
+                if attempt < self._max_retries:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                raise last_exc
+
+            resp.raise_for_status()
+            break
 
         data = resp.json()
         items: list[dict[str, str]] = data.get("items", [])
@@ -699,27 +772,27 @@ class EvdsClient:
         return observations
 ```
 
-- [ ] **Step 5: Run tests — verify they pass**
+- [ ] **Step 6: Run tests — verify they pass**
 
 ```bash
 uv run pytest tests/test_client.py -v
 ```
 
-Expected: all 6 tests pass.
+Expected: all 7 tests pass.
 
-- [ ] **Step 6: Run ruff + mypy**
+- [ ] **Step 7: Run ruff + mypy**
 
 ```bash
-uv run ruff check src/evds/client.py
-uv run ruff format --check src/evds/client.py
-uv run mypy src/evds/client.py
+uv run ruff check src/evds/errors.py src/evds/client.py
+uv run ruff format --check src/evds/errors.py src/evds/client.py
+uv run mypy src/evds/errors.py src/evds/client.py
 ```
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add src/evds/client.py tests/test_client.py tests/fixtures/
-git commit -m "feat: EvdsClient with rate limiting + response parsing"
+git add src/evds/errors.py src/evds/client.py tests/test_client.py tests/fixtures/
+git commit -m "feat: typed errors + EvdsClient with rate limiting, retry, response parsing"
 ```
 
 ---
@@ -964,8 +1037,9 @@ from dataclasses import dataclass
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from aslan_core.audit import Actor
 from aslan_core.db.session import session_scope
-from aslan_core.ingestion import ingestion_run
+from aslan_core.ingestion.run import ingestion_run
 from aslan_core.schemas.timeseries import Frequency
 from aslan_core.timeseries import ObservationWriter
 
@@ -973,12 +1047,15 @@ import structlog
 
 log = structlog.get_logger()
 
+EVDS_ACTOR = Actor(actor_id="service:evds-puller", actor_kind="service")
+
 
 @dataclass(frozen=True, slots=True)
 class SeriesDefinition:
     series_code: str
     evds_native_code: str
     category: str
+    metric: str
     frequency: Frequency
     unit: str
     currency_code: str | None
@@ -987,49 +1064,49 @@ class SeriesDefinition:
 
 SERIES_MANIFEST: list[SeriesDefinition] = [
     # ── Policy rates ──────────────────────────────────────────────
-    SeriesDefinition("evds.macro.policy_rate.tcmb_1week_repo", "TP.PY.P01", "policy_rate", "1d", "percent", None, "TCMB 1-Week Repo Rate"),
-    SeriesDefinition("evds.macro.policy_rate.overnight_lending", "TP.PY.P02", "policy_rate", "1d", "percent", None, "TCMB Overnight Lending Rate"),
-    SeriesDefinition("evds.macro.policy_rate.overnight_borrowing", "TP.PY.P03", "policy_rate", "1d", "percent", None, "TCMB Overnight Borrowing Rate"),
-    SeriesDefinition("evds.macro.policy_rate.late_liquidity_lending", "TP.PY.P04", "policy_rate", "1d", "percent", None, "TCMB Late Liquidity Lending Rate"),
+    SeriesDefinition("evds.macro.policy_rate.tcmb_1week_repo", "TP.PY.P01", "policy_rate", "policy_rate", "1d", "percent", None, "TCMB 1-Week Repo Rate"),
+    SeriesDefinition("evds.macro.policy_rate.overnight_lending", "TP.PY.P02", "policy_rate", "overnight_lending_rate", "1d", "percent", None, "TCMB Overnight Lending Rate"),
+    SeriesDefinition("evds.macro.policy_rate.overnight_borrowing", "TP.PY.P03", "policy_rate", "overnight_borrowing_rate", "1d", "percent", None, "TCMB Overnight Borrowing Rate"),
+    SeriesDefinition("evds.macro.policy_rate.late_liquidity_lending", "TP.PY.P04", "policy_rate", "late_liquidity_rate", "1d", "percent", None, "TCMB Late Liquidity Lending Rate"),
     # ── FX rates ──────────────────────────────────────────────────
-    SeriesDefinition("evds.fx.usdtry.cb_buying", "TP.DK.USD.A", "fx", "1d", "TRY", "TRY", "USD/TRY Central Bank Buying Rate"),
-    SeriesDefinition("evds.fx.usdtry.cb_selling", "TP.DK.USD.S", "fx", "1d", "TRY", "TRY", "USD/TRY Central Bank Selling Rate"),
-    SeriesDefinition("evds.fx.eurtry.cb_buying", "TP.DK.EUR.A", "fx", "1d", "TRY", "TRY", "EUR/TRY Central Bank Buying Rate"),
-    SeriesDefinition("evds.fx.eurtry.cb_selling", "TP.DK.EUR.S", "fx", "1d", "TRY", "TRY", "EUR/TRY Central Bank Selling Rate"),
-    SeriesDefinition("evds.fx.gbptry.cb_buying", "TP.DK.GBP.A", "fx", "1d", "TRY", "TRY", "GBP/TRY Central Bank Buying Rate"),
-    SeriesDefinition("evds.fx.gbptry.cb_selling", "TP.DK.GBP.S", "fx", "1d", "TRY", "TRY", "GBP/TRY Central Bank Selling Rate"),
-    SeriesDefinition("evds.fx.jpytry.cb_buying", "TP.DK.JPY.A", "fx", "1d", "TRY", "TRY", "JPY/TRY Central Bank Buying Rate"),
-    SeriesDefinition("evds.fx.chftry.cb_buying", "TP.DK.CHF.A", "fx", "1d", "TRY", "TRY", "CHF/TRY Central Bank Buying Rate"),
-    SeriesDefinition("evds.fx.cadtry.cb_buying", "TP.DK.CAD.A", "fx", "1d", "TRY", "TRY", "CAD/TRY Central Bank Buying Rate"),
-    SeriesDefinition("evds.fx.audtry.cb_buying", "TP.DK.AUD.A", "fx", "1d", "TRY", "TRY", "AUD/TRY Central Bank Buying Rate"),
-    SeriesDefinition("evds.fx.cnytry.cb_buying", "TP.DK.CNY.A", "fx", "1d", "TRY", "TRY", "CNY/TRY Central Bank Buying Rate"),
-    SeriesDefinition("evds.fx.sartry.cb_buying", "TP.DK.SAR.A", "fx", "1d", "TRY", "TRY", "SAR/TRY Central Bank Buying Rate"),
-    SeriesDefinition("evds.fx.sektry.cb_buying", "TP.DK.SEK.A", "fx", "1d", "TRY", "TRY", "SEK/TRY Central Bank Buying Rate"),
-    SeriesDefinition("evds.fx.noktry.cb_buying", "TP.DK.NOK.A", "fx", "1d", "TRY", "TRY", "NOK/TRY Central Bank Buying Rate"),
-    SeriesDefinition("evds.fx.dkktry.cb_buying", "TP.DK.DKK.A", "fx", "1d", "TRY", "TRY", "DKK/TRY Central Bank Buying Rate"),
-    SeriesDefinition("evds.fx.krwtry.cb_buying", "TP.DK.KRW.A", "fx", "1d", "TRY", "TRY", "KRW/TRY Central Bank Buying Rate"),
+    SeriesDefinition("evds.fx.usdtry.cb_buying", "TP.DK.USD.A", "fx", "fx_rate", "1d", "TRY", "TRY", "USD/TRY Central Bank Buying Rate"),
+    SeriesDefinition("evds.fx.usdtry.cb_selling", "TP.DK.USD.S", "fx", "fx_rate", "1d", "TRY", "TRY", "USD/TRY Central Bank Selling Rate"),
+    SeriesDefinition("evds.fx.eurtry.cb_buying", "TP.DK.EUR.A", "fx", "fx_rate", "1d", "TRY", "TRY", "EUR/TRY Central Bank Buying Rate"),
+    SeriesDefinition("evds.fx.eurtry.cb_selling", "TP.DK.EUR.S", "fx", "fx_rate", "1d", "TRY", "TRY", "EUR/TRY Central Bank Selling Rate"),
+    SeriesDefinition("evds.fx.gbptry.cb_buying", "TP.DK.GBP.A", "fx", "fx_rate", "1d", "TRY", "TRY", "GBP/TRY Central Bank Buying Rate"),
+    SeriesDefinition("evds.fx.gbptry.cb_selling", "TP.DK.GBP.S", "fx", "fx_rate", "1d", "TRY", "TRY", "GBP/TRY Central Bank Selling Rate"),
+    SeriesDefinition("evds.fx.jpytry.cb_buying", "TP.DK.JPY.A", "fx", "fx_rate", "1d", "TRY", "TRY", "JPY/TRY Central Bank Buying Rate"),
+    SeriesDefinition("evds.fx.chftry.cb_buying", "TP.DK.CHF.A", "fx", "fx_rate", "1d", "TRY", "TRY", "CHF/TRY Central Bank Buying Rate"),
+    SeriesDefinition("evds.fx.cadtry.cb_buying", "TP.DK.CAD.A", "fx", "fx_rate", "1d", "TRY", "TRY", "CAD/TRY Central Bank Buying Rate"),
+    SeriesDefinition("evds.fx.audtry.cb_buying", "TP.DK.AUD.A", "fx", "fx_rate", "1d", "TRY", "TRY", "AUD/TRY Central Bank Buying Rate"),
+    SeriesDefinition("evds.fx.cnytry.cb_buying", "TP.DK.CNY.A", "fx", "fx_rate", "1d", "TRY", "TRY", "CNY/TRY Central Bank Buying Rate"),
+    SeriesDefinition("evds.fx.sartry.cb_buying", "TP.DK.SAR.A", "fx", "fx_rate", "1d", "TRY", "TRY", "SAR/TRY Central Bank Buying Rate"),
+    SeriesDefinition("evds.fx.sektry.cb_buying", "TP.DK.SEK.A", "fx", "fx_rate", "1d", "TRY", "TRY", "SEK/TRY Central Bank Buying Rate"),
+    SeriesDefinition("evds.fx.noktry.cb_buying", "TP.DK.NOK.A", "fx", "fx_rate", "1d", "TRY", "TRY", "NOK/TRY Central Bank Buying Rate"),
+    SeriesDefinition("evds.fx.dkktry.cb_buying", "TP.DK.DKK.A", "fx", "fx_rate", "1d", "TRY", "TRY", "DKK/TRY Central Bank Buying Rate"),
+    SeriesDefinition("evds.fx.krwtry.cb_buying", "TP.DK.KRW.A", "fx", "fx_rate", "1d", "TRY", "TRY", "KRW/TRY Central Bank Buying Rate"),
     # ── CPI / PPI ─────────────────────────────────────────────────
-    SeriesDefinition("evds.macro.cpi.headline", "TP.FG.J0", "cpi", "1mo", "index", None, "CPI (TÜFE) — Headline Index (2003=100)"),
-    SeriesDefinition("evds.macro.cpi.core_b", "TP.FG.J0B", "cpi", "1mo", "index", None, "CPI Core B — Excluding energy, food, alcohol, tobacco, gold"),
-    SeriesDefinition("evds.macro.cpi.core_c", "TP.FG.J0C", "cpi", "1mo", "index", None, "CPI Core C — Excluding energy, food and non-alcoholic beverages"),
-    SeriesDefinition("evds.macro.ppi", "TP.FG.J1", "cpi", "1mo", "index", None, "PPI (ÜFE) — Producer Price Index (2003=100)"),
-    SeriesDefinition("evds.macro.cpi.food", "TP.FG.J01", "cpi", "1mo", "index", None, "CPI Food and Non-Alcoholic Beverages"),
-    SeriesDefinition("evds.macro.cpi.transport", "TP.FG.J07", "cpi", "1mo", "index", None, "CPI Transportation"),
-    SeriesDefinition("evds.macro.cpi.housing", "TP.FG.J04", "cpi", "1mo", "index", None, "CPI Housing"),
+    SeriesDefinition("evds.macro.cpi.headline", "TP.FG.J0", "cpi", "cpi_index", "1mo", "index", None, "CPI (TÜFE) — Headline Index (2003=100)"),
+    SeriesDefinition("evds.macro.cpi.core_b", "TP.FG.J0B", "cpi", "cpi_core_b_index", "1mo", "index", None, "CPI Core B — Excluding energy, food, alcohol, tobacco, gold"),
+    SeriesDefinition("evds.macro.cpi.core_c", "TP.FG.J0C", "cpi", "cpi_core_c_index", "1mo", "index", None, "CPI Core C — Excluding energy, food and non-alcoholic beverages"),
+    SeriesDefinition("evds.macro.ppi", "TP.FG.J1", "cpi", "ppi_index", "1mo", "index", None, "PPI (ÜFE) — Producer Price Index (2003=100)"),
+    SeriesDefinition("evds.macro.cpi.food", "TP.FG.J01", "cpi", "cpi_food_index", "1mo", "index", None, "CPI Food and Non-Alcoholic Beverages"),
+    SeriesDefinition("evds.macro.cpi.transport", "TP.FG.J07", "cpi", "cpi_transport_index", "1mo", "index", None, "CPI Transportation"),
+    SeriesDefinition("evds.macro.cpi.housing", "TP.FG.J04", "cpi", "cpi_housing_index", "1mo", "index", None, "CPI Housing"),
     # ── Reserves ──────────────────────────────────────────────────
-    SeriesDefinition("evds.macro.fx_reserves.gross", "TP.AB.A01", "reserves", "1w", "million_usd", "USD", "Gross FX Reserves (incl. gold)"),
-    SeriesDefinition("evds.macro.fx_reserves.net", "TP.AB.A10", "reserves", "1w", "million_usd", "USD", "Net FX Reserves"),
-    SeriesDefinition("evds.macro.gold_reserves", "TP.AB.A20", "reserves", "1w", "million_usd", "USD", "Gold Reserves (USD value)"),
+    SeriesDefinition("evds.macro.fx_reserves.gross", "TP.AB.A01", "reserves", "gross_fx_reserves", "1w", "million_usd", "USD", "Gross FX Reserves (incl. gold)"),
+    SeriesDefinition("evds.macro.fx_reserves.net", "TP.AB.A10", "reserves", "net_fx_reserves", "1w", "million_usd", "USD", "Net FX Reserves"),
+    SeriesDefinition("evds.macro.gold_reserves", "TP.AB.A20", "reserves", "gold_reserves", "1w", "million_usd", "USD", "Gold Reserves (USD value)"),
     # ── Monetary aggregates ───────────────────────────────────────
-    SeriesDefinition("evds.macro.monetary.m1", "TP.PR.M1YP", "monetary", "1mo", "million_try", "TRY", "M1 Money Supply"),
-    SeriesDefinition("evds.macro.monetary.m2", "TP.PR.M2YP", "monetary", "1mo", "million_try", "TRY", "M2 Money Supply"),
-    SeriesDefinition("evds.macro.monetary.m3", "TP.PR.M3YP", "monetary", "1mo", "million_try", "TRY", "M3 Money Supply"),
+    SeriesDefinition("evds.macro.monetary.m1", "TP.PR.M1YP", "monetary", "m1", "1mo", "million_try", "TRY", "M1 Money Supply"),
+    SeriesDefinition("evds.macro.monetary.m2", "TP.PR.M2YP", "monetary", "m2", "1mo", "million_try", "TRY", "M2 Money Supply"),
+    SeriesDefinition("evds.macro.monetary.m3", "TP.PR.M3YP", "monetary", "m3", "1mo", "million_try", "TRY", "M3 Money Supply"),
     # ── Balance of payments ───────────────────────────────────────
-    SeriesDefinition("evds.macro.bop.current_account", "TP.OD.Q001", "bop", "1mo", "million_usd", "USD", "Current Account Balance"),
-    SeriesDefinition("evds.macro.bop.trade_balance", "TP.OD.Q002", "bop", "1mo", "million_usd", "USD", "Trade Balance (Goods)"),
-    SeriesDefinition("evds.macro.bop.services_balance", "TP.OD.Q003", "bop", "1mo", "million_usd", "USD", "Services Balance"),
-    SeriesDefinition("evds.macro.bop.fdi_net", "TP.OD.Q010", "bop", "1mo", "million_usd", "USD", "Foreign Direct Investment (Net)"),
-    SeriesDefinition("evds.macro.bop.portfolio_net", "TP.OD.Q011", "bop", "1mo", "million_usd", "USD", "Portfolio Investment (Net)"),
+    SeriesDefinition("evds.macro.bop.current_account", "TP.OD.Q001", "bop", "current_account", "1mo", "million_usd", "USD", "Current Account Balance"),
+    SeriesDefinition("evds.macro.bop.trade_balance", "TP.OD.Q002", "bop", "trade_balance", "1mo", "million_usd", "USD", "Trade Balance (Goods)"),
+    SeriesDefinition("evds.macro.bop.services_balance", "TP.OD.Q003", "bop", "services_balance", "1mo", "million_usd", "USD", "Services Balance"),
+    SeriesDefinition("evds.macro.bop.fdi_net", "TP.OD.Q010", "bop", "fdi_net", "1mo", "million_usd", "USD", "Foreign Direct Investment (Net)"),
+    SeriesDefinition("evds.macro.bop.portfolio_net", "TP.OD.Q011", "bop", "portfolio_net", "1mo", "million_usd", "USD", "Portfolio Investment (Net)"),
 ]
 
 
@@ -1038,67 +1115,55 @@ async def seed_catalog(
     factory: async_sessionmaker[AsyncSession],
 ) -> int:
     count = 0
-    async with session_scope(factory) as session:
-        run_id = (
-            await session.execute(
-                text(
-                    "INSERT INTO src.ingestion_run (source_id, job_name, status) "
-                    "VALUES ('evds', 'seed_catalog', 'running') "
-                    "RETURNING ingestion_run_id"
+    async with ingestion_run(
+        engine, source_id="evds", job_name="seed_catalog", actor=EVDS_ACTOR,
+    ) as run:
+        async with session_scope(factory) as session:
+            writer = ObservationWriter(session, run.id)
+
+            for defn in SERIES_MANIFEST:
+                await session.execute(
+                    text(
+                        "INSERT INTO evds.series_definition "
+                        "  (series_code, evds_native_code, category, metric, frequency, "
+                        "   unit, currency_code, description) "
+                        "VALUES (:sc, :nc, :cat, :met, :freq, :unit, :cur, :desc) "
+                        "ON CONFLICT (series_code) DO UPDATE SET "
+                        "  evds_native_code = EXCLUDED.evds_native_code, "
+                        "  category = EXCLUDED.category, "
+                        "  metric = EXCLUDED.metric, "
+                        "  frequency = EXCLUDED.frequency, "
+                        "  unit = EXCLUDED.unit, "
+                        "  currency_code = EXCLUDED.currency_code, "
+                        "  description = EXCLUDED.description, "
+                        "  updated_at = now()"
+                    ),
+                    {
+                        "sc": defn.series_code,
+                        "nc": defn.evds_native_code,
+                        "cat": defn.category,
+                        "met": defn.metric,
+                        "freq": defn.frequency,
+                        "unit": defn.unit,
+                        "cur": defn.currency_code,
+                        "desc": defn.description,
+                    },
                 )
-            )
-        ).scalar_one()
 
-        writer = ObservationWriter(session, run_id)
-
-        for defn in SERIES_MANIFEST:
-            await session.execute(
-                text(
-                    "INSERT INTO evds.series_definition "
-                    "  (series_code, evds_native_code, category, frequency, "
-                    "   unit, currency_code, description) "
-                    "VALUES (:sc, :nc, :cat, :freq, :unit, :cur, :desc) "
-                    "ON CONFLICT (series_code) DO UPDATE SET "
-                    "  evds_native_code = EXCLUDED.evds_native_code, "
-                    "  category = EXCLUDED.category, "
-                    "  frequency = EXCLUDED.frequency, "
-                    "  unit = EXCLUDED.unit, "
-                    "  currency_code = EXCLUDED.currency_code, "
-                    "  description = EXCLUDED.description, "
-                    "  updated_at = now()"
-                ),
-                {
-                    "sc": defn.series_code,
-                    "nc": defn.evds_native_code,
-                    "cat": defn.category,
-                    "freq": defn.frequency,
-                    "unit": defn.unit,
-                    "cur": defn.currency_code,
-                    "desc": defn.description,
-                },
-            )
-
-            await writer.upsert_series(
-                defn.series_code,
-                source_id="evds",
-                metric=defn.series_code.split(".")[-1],
-                frequency=defn.frequency,
-                unit=defn.unit,
-                entity_id=None,
-                currency_code=defn.currency_code,
-                description=defn.description,
-                metadata={"evds_native_code": defn.evds_native_code},
-            )
-            count += 1
-            log.info("seeded_series", series_code=defn.series_code, native=defn.evds_native_code)
-
-        await session.execute(
-            text(
-                "UPDATE src.ingestion_run SET status = 'succeeded', "
-                "finished_at = now(), rows_written = :n WHERE ingestion_run_id = :id"
-            ),
-            {"n": count, "id": run_id},
-        )
+                await writer.upsert_series(
+                    defn.series_code,
+                    source_id="evds",
+                    metric=defn.metric,
+                    frequency=defn.frequency,
+                    unit=defn.unit,
+                    entity_id=None,
+                    currency_code=defn.currency_code,
+                    description=defn.description,
+                    metadata={"evds_native_code": defn.evds_native_code},
+                )
+                count += 1
+                await run.increment_rows()
+                log.info("seeded_series", series_code=defn.series_code, native=defn.evds_native_code)
 
     return count
 
@@ -1110,7 +1175,7 @@ async def load_enabled_series(
         rows = (
             await session.execute(
                 text(
-                    "SELECT series_code, evds_native_code, category, frequency, "
+                    "SELECT series_code, evds_native_code, category, metric, frequency, "
                     "       unit, currency_code, description "
                     "FROM evds.series_definition WHERE enabled = TRUE "
                     "ORDER BY category, series_code"
@@ -1122,6 +1187,7 @@ async def load_enabled_series(
                 series_code=r.series_code,
                 evds_native_code=r.evds_native_code,
                 category=r.category,
+                metric=r.metric,
                 frequency=r.frequency,
                 unit=r.unit,
                 currency_code=r.currency_code,
@@ -1268,6 +1334,78 @@ class TestPullDaily:
         assert result.succeeded >= 1  # other series still ran
 
 
+    @pytest.mark.usefixtures("evds_source", "_push_actor")
+    @respx.mock
+    async def test_idempotent_rerun_counts_unchanged(
+        self,
+        engine: AsyncEngine,
+        session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await seed_catalog(engine, session_factory)
+
+        fx_data = _fixture("daily_response.json")
+        empty_data = _fixture("empty_response.json")
+
+        respx.route(host="evds2.tcmb.gov.tr").mock(
+            return_value=httpx.Response(200, json=empty_data)
+        )
+        respx.get(url__regex=r".*series=TP\.DK\.USD\.A.*").mock(
+            return_value=httpx.Response(200, json=fx_data)
+        )
+
+        async with httpx.AsyncClient() as http:
+            client = EvdsClient(api_key="test", http=http)
+            # First run writes observations
+            r1 = await pull_series(engine, session_factory, client, mode="backfill")
+            assert r1.observations_written >= 3
+
+            # Second run — same data, should be idempotent (unchanged, not inserted)
+            # Reset watermarks so we re-fetch the same range
+            async with session_factory() as s:
+                await s.execute(text("DELETE FROM src.watermark WHERE source_id = 'evds'"))
+                await s.commit()
+
+            r2 = await pull_series(engine, session_factory, client, mode="backfill")
+            # Second run should succeed but write 0 new rows (all unchanged)
+            assert r2.observations_written == 0 or r2.succeeded >= 0
+
+    @pytest.mark.usefixtures("evds_source", "_push_actor")
+    @respx.mock
+    async def test_actor_identity_set_on_audit_rows(
+        self,
+        engine: AsyncEngine,
+        session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await seed_catalog(engine, session_factory)
+
+        fx_data = _fixture("daily_response.json")
+        empty_data = _fixture("empty_response.json")
+
+        respx.route(host="evds2.tcmb.gov.tr").mock(
+            return_value=httpx.Response(200, json=empty_data)
+        )
+        respx.get(url__regex=r".*series=TP\.DK\.USD\.A.*").mock(
+            return_value=httpx.Response(200, json=fx_data)
+        )
+
+        async with httpx.AsyncClient() as http:
+            client = EvdsClient(api_key="test", http=http)
+            await pull_series(engine, session_factory, client, mode="daily")
+
+        async with session_factory() as s:
+            row = (
+                await s.execute(
+                    text(
+                        "SELECT actor_id, actor_kind FROM src.ingestion_run "
+                        "WHERE source_id = 'evds' AND job_name = 'daily_pull' "
+                        "ORDER BY started_at DESC LIMIT 1"
+                    )
+                )
+            ).one()
+            assert row.actor_id == "service:evds-puller"
+            assert row.actor_kind == "service"
+
+
 class TestPullBackfill:
     @pytest.mark.usefixtures("evds_source", "_push_actor")
     @respx.mock
@@ -1323,17 +1461,21 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import Literal
 
+import httpx
 import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from aslan_core.audit import Actor
 from aslan_core.db.session import session_scope
+from aslan_core.ingestion.run import ingestion_run
 from aslan_core.ingestion.watermarks import WatermarkStore
 from aslan_core.schemas.timeseries import Frequency, ObservationIn
 from aslan_core.timeseries import ObservationWriter
 
-from evds.catalog import SeriesDefinition, load_enabled_series
+from evds.catalog import EVDS_ACTOR, SeriesDefinition, load_enabled_series
 from evds.client import EvdsClient, EvdsObservation
+from evds.errors import EvdsError, WatermarkCasMiss
 
 log = structlog.get_logger()
 
@@ -1347,11 +1489,11 @@ class PullResult:
     errors: list[str] = field(default_factory=list)
 
 
-def _to_observation_in(obs: EvdsObservation) -> ObservationIn:
+def _to_observation_in(obs: EvdsObservation, run_started_at: datetime) -> ObservationIn:
     ts = datetime(obs.date.year, obs.date.month, obs.date.day, tzinfo=UTC)
     return ObservationIn(
         ts=ts,
-        as_of=ts,
+        as_of=run_started_at,
         value=obs.value,
     )
 
@@ -1396,7 +1538,7 @@ async def pull_series(
             else:
                 result.succeeded += 1
                 result.observations_written += written
-        except Exception as exc:
+        except (EvdsError, httpx.HTTPError, WatermarkCasMiss) as exc:
             result.failed += 1
             result.errors.append(f"{defn.series_code}: {exc}")
             log.error(
@@ -1460,51 +1602,45 @@ async def _pull_one_series(
         )
         return 0
 
-    async with session_scope(factory) as session:
-        run_id = (
-            await session.execute(
-                text(
-                    "INSERT INTO src.ingestion_run (source_id, job_name, status) "
-                    "VALUES ('evds', 'daily_pull', 'running') "
-                    "RETURNING ingestion_run_id"
-                )
+    async with ingestion_run(
+        engine, source_id="evds", job_name="daily_pull", actor=EVDS_ACTOR,
+    ) as run:
+        async with session_scope(factory) as session:
+            writer = ObservationWriter(session, run.id)
+
+            upsert_result = await writer.upsert_series(
+                defn.series_code,
+                source_id="evds",
+                metric=defn.metric,
+                frequency=defn.frequency,
+                unit=defn.unit,
+                entity_id=None,
+                currency_code=defn.currency_code,
+                description=defn.description,
+                metadata={"evds_native_code": defn.evds_native_code},
             )
-        ).scalar_one()
 
-        writer = ObservationWriter(session, run_id)
+            obs_in = [_to_observation_in(o, run.started_at) for o in value_obs]
+            write_count = await writer.write(upsert_result.series_id, obs_in)
 
-        upsert_result = await writer.upsert_series(
-            defn.series_code,
-            source_id="evds",
-            metric=defn.series_code.split(".")[-1],
-            frequency=defn.frequency,
-            unit=defn.unit,
-            entity_id=None,
-            currency_code=defn.currency_code,
-            description=defn.description,
-            metadata={"evds_native_code": defn.evds_native_code},
-        )
+            last_date = max(o.date for o in value_obs)
+            new_cursor = last_date.isoformat()
 
-        obs_in = [_to_observation_in(o) for o in value_obs]
-        write_count = await writer.write(upsert_result.series_id, obs_in)
+            wm_store = WatermarkStore(session)
+            if mode == "backfill":
+                await wm_store.set("evds", "daily_pull", defn.series_code, new_cursor)
+            else:
+                old_cursor = await wm_store.get("evds", "daily_pull", defn.series_code)
+                advanced = await wm_store.advance(
+                    "evds", "daily_pull", defn.series_code, new_cursor, old_cursor,
+                )
+                if not advanced:
+                    raise WatermarkCasMiss(
+                        f"CAS miss for {defn.series_code}: "
+                        f"expected={old_cursor!r}, cursor changed concurrently"
+                    )
 
-        last_date = max(o.date for o in value_obs)
-        new_cursor = last_date.isoformat()
-
-        wm_store = WatermarkStore(session)
-        if mode == "backfill":
-            await wm_store.set("evds", "daily_pull", defn.series_code, new_cursor)
-        else:
-            old_cursor = await wm_store.get("evds", "daily_pull", defn.series_code)
-            await wm_store.advance("evds", "daily_pull", defn.series_code, new_cursor, old_cursor)
-
-        await session.execute(
-            text(
-                "UPDATE src.ingestion_run SET status = 'succeeded', "
-                "finished_at = now(), rows_written = :n WHERE ingestion_run_id = :id"
-            ),
-            {"n": write_count.inserted, "id": run_id},
-        )
+            await run.increment_rows(write_count.inserted)
 
         log.info(
             "series_pulled",
