@@ -221,7 +221,6 @@ async def test_direct_insert_to_redaction_registry_rejected_for_app_role(
             redacted_payload=payload,
             redacted_payload_hash=canonical_payload_hash(payload),
             original_payload_hash=canonical_payload_hash({"x": 0}),
-            redis=redis_client,
         )
         await s.commit()
     async with session_factory() as s:

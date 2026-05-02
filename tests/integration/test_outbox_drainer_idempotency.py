@@ -213,9 +213,35 @@ async def test_drainer_crash_loop_10x_still_one_ack(
     entries = await redis_client.xrange("aslan.kap.filings.new", min="-", max="+")
     assert len(entries) == 11
     seen: set[str] = set()
-    for _, fields in entries:
+    redis_ids: set[str] = set()
+    for entry_id, fields in entries:
         seen.add(fields["event_id"])
+        redis_ids.add(entry_id)
     assert len(seen) == 1, "all 11 entries share the same event_id"
+
+    # F8 (codex post-merge): every Redis copy MUST have a matching
+    # ``streams.event_id_to_redis`` row so the GDPR Art. 17 redaction
+    # path can find every in-Redis copy of the event. Without this
+    # invariant, a crash between XADD and the index INSERT leaves an
+    # unredactable orphan. The drainer now indexes each XADD in an
+    # independent transaction precisely so every row above is reachable.
+    indexed_rows = (
+        (
+            await session.execute(
+                text(
+                    "SELECT redis_message_id FROM streams.event_id_to_redis "
+                    "WHERE stream_name = 'aslan.kap.filings.new'"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert set(indexed_rows) == redis_ids, (
+        f"event_id_to_redis must have one row per Redis entry: "
+        f"missing={redis_ids - set(indexed_rows)!r}, "
+        f"extra={set(indexed_rows) - redis_ids!r}"
+    )
 
 
 @pytest.mark.asyncio(loop_scope="session")

@@ -1,6 +1,6 @@
 [project]
 name = "aslan-core"
-version = "0.5.0"
+version = "0.6.0"
 description = "Shared Python package for the Aslan Terminal data-plane services."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -39,6 +39,22 @@ obs = [
     "opentelemetry-instrumentation-asyncpg>=0.48b0",
     "prometheus-client>=0.21",
 ]
+# v0.6.0 dashboard extra. Consumers that want the read-only operator
+# web UI install ``aslan-core[dashboard]``. The base install runs
+# without these — ``aslan_core.dashboard`` imports at signature level
+# only; ``serve()`` calls ``uvicorn.run`` lazily so a missing dep
+# raises ``ImportError`` only at start-up time, never at import time.
+dashboard = [
+    "python-fasthtml >=0.6,<1.0",
+    "uvicorn[standard] >=0.30",
+    # Codex post-implementation review: /metrics + the Dashboard
+    # request counter / duration histogram are operator-facing
+    # signals, not optional. Pinning ``prometheus-client`` here
+    # (rather than only in [obs]) ensures every documented
+    # ``aslan-core[dashboard]`` install ships non-empty metrics so
+    # 500-spike alerts work out of the box.
+    "prometheus-client >=0.21",
+]
 
 [dependency-groups]
 dev = [
@@ -50,6 +66,11 @@ dev = [
     "mypy>=1.20",
     "pre-commit>=3.8",
     "types-PyYAML>=6.0",
+    # v0.6.0 dashboard lint dep (codex F-3): the static-SQL scanner
+    # parses queries.py text() literals via sqlglot's PostgreSQL
+    # dialect and enforces the column-allowlist from migrations
+    # 0020/0021/0022. Lint-only; the dashboard runtime never imports it.
+    "sqlglot>=25.0",
 ]
 
 [project.scripts]
@@ -98,7 +119,28 @@ warn_unused_ignores = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["asyncpg.*", "alembic.*", "testcontainers.*", "aioboto3.*", "botocore.*"]
+module = [
+    "asyncpg.*",
+    "alembic.*",
+    "testcontainers.*",
+    "aioboto3.*",
+    "botocore.*",
+    # v0.6.0 [dashboard] extra. python-fasthtml + its starlette
+    # transitive dep ship without py.typed markers under uv's lock;
+    # mypy can't analyse them under strict.
+    "fasthtml.*",
+    "starlette.*",
+    # v0.6.0 dashboard runtime dep — uvicorn[standard] ships without
+    # py.typed; only ``serve()`` imports it (lazy) so runtime callers
+    # without the [dashboard] extra are unaffected.
+    "uvicorn.*",
+    # v0.6.0 codex F-3 lint dep (dev-group). sqlglot ships without
+    # a py.typed marker.
+    "sqlglot.*",
+    # v0.6.0 dashboard test dep. httpx is a transitive of starlette
+    # (used in tests via httpx.AsyncClient + ASGITransport).
+    "httpx.*",
+]
 ignore_missing_imports = true
 
 # v0.3.0 [obs] extra — sentry-sdk, opentelemetry, prometheus_client are

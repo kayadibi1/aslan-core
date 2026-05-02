@@ -37,7 +37,10 @@ from aslan_core.observability.metrics import (
     aslan_stream_deadletter_orphans_reconciled_total,
     aslan_stream_deadletter_total,
 )
-from aslan_core.streams.deadletter import acquire_or_adopt_intent
+from aslan_core.streams.deadletter import (
+    acquire_or_adopt_intent,
+    find_orphan_in_deadletter_stream,
+)
 from aslan_core.streams.heartbeat import heartbeat_active_intents
 from aslan_core.streams.names import normalize_bist_ticks_label
 
@@ -463,6 +466,77 @@ async def _reconcile_pass4_entry(
             )
 
 
+async def _resolve_canonical_orphan(
+    *,
+    session: AsyncSession,
+    redis: Redis,
+    stream_name: str,
+    failure_id: int,
+) -> str | None:
+    """Find an existing dead-letter Redis entry for ``failure_id``.
+
+    Returns the canonical Redis message id if a prior attempt's XADD
+    survived (either durably indexed in ``streams.deadletter_redis_index``
+    or only present in the dead-letter stream because the consumer
+    crashed between XADD and the index INSERT). Returns ``None`` if no
+    prior copy exists; the caller must XADD a fresh entry.
+
+    When an unindexed orphan is found via the dead-letter stream
+    scan, this function ALSO inserts the matching
+    ``streams.deadletter_redis_index`` row. Without that insert, pass 2
+    would mark routing complete with ``deadletter_log.redis_message_id``
+    pointing at the orphan but no durable index row, leaving the
+    Redis entry invisible to pass 3's verification — and pass 4 only
+    rescues such orphans inside its bounded recent window, so an
+    older orphan would stay un-indexed forever (codex round-2
+    follow-up to F2).
+
+    F2 (codex post-merge) — without this lookup, ``_pass_2_stuck_row_scan``
+    XADDs a duplicate when an indexed prior copy already exists, which
+    pass 4 then XDELs as an orphan and leaves ``deadletter_log`` pointing
+    at a deleted Redis id.
+    """
+    indexed = (
+        await session.execute(
+            text(
+                "SELECT redis_message_id FROM streams.deadletter_redis_index "
+                "WHERE failure_id = :fid"
+            ),
+            {"fid": failure_id},
+        )
+    ).scalar_one_or_none()
+    if indexed is not None:
+        # Trust the durable index even if the underlying Redis entry has
+        # since been trimmed — pass 3 emits the orphan-in-redis audit
+        # for that case so an operator can intervene.
+        return str(indexed)
+
+    # No durable index row. Walk the dead-letter stream for an unindexed
+    # XADD orphan (consumer crashed between XADD and the index INSERT
+    # before pass 4's bounded window picked it up).
+    orphan = await find_orphan_in_deadletter_stream(
+        redis,
+        stream_name,
+        lower_bound="0-0",
+        target_failure_id=failure_id,
+    )
+    if orphan is None:
+        return None
+    # Codex round-2 follow-up: index the orphan now so pass 3 can
+    # verify it and pass 4 can find it after the bounded window has
+    # rolled past. ``ON CONFLICT DO NOTHING`` keeps the call idempotent.
+    await session.execute(
+        text(
+            "INSERT INTO streams.deadletter_redis_index "
+            "(failure_id, redis_message_id) "
+            "VALUES (:fid, :rid) "
+            "ON CONFLICT DO NOTHING"
+        ),
+        {"fid": failure_id, "rid": orphan},
+    )
+    return orphan
+
+
 async def _finish_routing_after_adoption(
     *,
     session: AsyncSession,
@@ -485,28 +559,45 @@ async def _finish_routing_after_adoption(
     ).one()
     stream_name = str(row.stream_name)
     group_name = str(row.group_name)
-    xadd_fields = {
-        "event_id": str(row.event_id),
-        "failure_id": str(failure_id),
-        "stream_name": stream_name,
-        "group_name": group_name,
-        "failure_count": str(row.failure_count),
-        "last_error": str(row.last_error or ""),
-        "payload": json.dumps(row.payload_excerpt),
-        "recovered_by": "stream_deadletter_janitor",
-    }
-    redis_message_id = _decode(
-        await _aw(redis.xadd(f"{stream_name}.deadletter", cast(Any, xadd_fields)))
+
+    # F2 (codex post-merge): reconcile-before-overwrite. If a prior
+    # attempt's XADD survived (either indexed durably or only present
+    # in the dead-letter stream because the consumer crashed before
+    # the index INSERT), reuse that canonical message id. Otherwise
+    # pass 2 would XADD a duplicate; pass 4 would later XDEL the
+    # mismatched one and leave deadletter_log pointing at a deleted
+    # Redis entry.
+    canonical_id = await _resolve_canonical_orphan(
+        session=session,
+        redis=redis,
+        stream_name=stream_name,
+        failure_id=failure_id,
     )
-    await session.execute(
-        text(
-            "INSERT INTO streams.deadletter_redis_index "
-            "(failure_id, redis_message_id) "
-            "VALUES (:fid, :rid) "
-            "ON CONFLICT DO NOTHING"
-        ),
-        {"fid": failure_id, "rid": redis_message_id},
-    )
+    if canonical_id is None:
+        xadd_fields = {
+            "event_id": str(row.event_id),
+            "failure_id": str(failure_id),
+            "stream_name": stream_name,
+            "group_name": group_name,
+            "failure_count": str(row.failure_count),
+            "last_error": str(row.last_error or ""),
+            "payload": json.dumps(row.payload_excerpt),
+            "recovered_by": "stream_deadletter_janitor",
+        }
+        canonical_id = _decode(
+            await _aw(redis.xadd(f"{stream_name}.deadletter", cast(Any, xadd_fields)))
+        )
+        await session.execute(
+            text(
+                "INSERT INTO streams.deadletter_redis_index "
+                "(failure_id, redis_message_id) "
+                "VALUES (:fid, :rid) "
+                "ON CONFLICT DO NOTHING"
+            ),
+            {"fid": failure_id, "rid": canonical_id},
+        )
+
+    redis_message_id = canonical_id
     await session.execute(
         text(
             "UPDATE streams.deadletter_log "

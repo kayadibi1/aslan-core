@@ -179,10 +179,19 @@ async def find_orphan_in_deadletter_stream(
         across the FULL pagination.
     """
     deadletter_stream = f"{stream}.deadletter"
+    # F5 (codex post-merge): propagate transient Redis errors. The
+    # original ``except RedisError: return None`` masked connection
+    # failures as "orphan absent", causing callers to redrive a
+    # duplicate or audit ``stream.deadletter_orphan_lost``. We still
+    # treat the "stream key does not exist" case as a legitimate empty
+    # state so the new pass-2 reconciliation path doesn't fail when
+    # the dead-letter stream has yet to receive its first XADD.
     try:
         info = await redis.xinfo_stream(deadletter_stream)
-    except RedisError:
-        return None
+    except RedisError as exc:
+        if "no such key" in str(exc).lower():
+            return None
+        raise
     last_entry = info.get("last-entry") if info else None
     if not last_entry:
         return None  # empty stream

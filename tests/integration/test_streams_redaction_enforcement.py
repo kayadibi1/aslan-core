@@ -61,7 +61,6 @@ async def test_consumer_yields_registry_payload_when_event_redacted(
         redacted_payload=redacted_payload,
         redacted_payload_hash=canonical_payload_hash(redacted_payload),
         original_payload_hash=canonical_payload_hash(event.model_dump(mode="json")),
-        redis=redis_client,
     )
     await session.commit()
 

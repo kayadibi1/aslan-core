@@ -1,5 +1,128 @@
 # CHANGELOG
 
+## v0.6.0 — 2026-05-01 — Internal ops dashboard
+
+### Added
+
+- **Read-only operator dashboard** behind the dedicated
+  `aslan_dashboard` PostgreSQL role. Nine pages: `/`, `/outbox`,
+  `/streams`, `/ingestion`, `/documents`, `/timeseries`,
+  `/deadletter`, `/audit`, `/redactions`. POST/PUT/DELETE on every
+  route returns 405. The role has `default_transaction_read_only=on`
+  and column-allowlist `SELECT` GRANTs only — forbidden columns
+  (`outbox.payload`, `filing.body_text`, `audit.events.metadata`,
+  `redaction_registry.redacted_payload`, raw `last_error`,
+  `client_ip`, `user_agent`) are revoked at the privilege layer.
+- **Standing compliance banner** (`Network-edge logging only — not
+  compliance evidence`) on `/audit` and `/redactions`.
+  Server-rendered, non-dismissible (no client-side JS hooks). Spec
+  §6.2: until `aslan-service` ships authenticated per-request
+  identity in v0.7.x, the dashboard makes no per-view-attribution
+  claim.
+- **404 + 500 error handlers**: 404 does NOT echo the requested
+  path; 500 emits a fresh UUID `incident_id` and structured-logs
+  the exception under that id (no exception text in the rendered
+  page).
+- **Static asset routes**: three-element allowlist
+  (`/static/dashboard.css`, `/static/htmx.min.js`,
+  `/static/favicon.ico`). Vendored htmx 1.9.12 with SHA-256 sidecar
+  pinned via `<script integrity=...>`. Fixed paths in the route
+  table — no path-traversal possible.
+- **CLI**: `aslan dashboard serve` with loopback-bind by default;
+  non-loopback hosts require `--i-know-this-is-unsafe`. Reads
+  `ASLAN_DASHBOARD_DSN`; missing env var exits with a usage error
+  naming migration 0020.
+- **Bounded Redis probes** with circuit breaker: 200 ms per-call
+  timeout, 5-errors-in-60s circuit trip, 30 s open period. Per-page
+  budget caps probe count at `1 + len(STREAMS)` so the deadletter
+  page renders the same Redis-call count whether the table holds 10
+  rows or 100k.
+- **Closed-enum metrics**:
+  `aslan_dashboard_requests_total{path, status}` with
+  `/audit` + `/redactions` collapsed to `path="<sensitive>"`;
+  `aslan_dashboard_request_duration_seconds` (no labels — per-route
+  timing is a side-channel).
+- **Sentinel matrix tests**: every (page × forbidden_field) pair
+  seeds a unique sentinel under the privileged role and asserts it
+  is absent from the rendered HTML AND the `/metrics` body.
+- **Operator runbook**: `docs/dashboard.md` — install,
+  localhost vs reverse-proxy deployment, the
+  `aslan deadletter inspect` / `aslan ingestion show` /
+  `aslan audit show` workflow for inspecting forbidden bytes,
+  Redis circuit-breaker recovery.
+
+### Migrations
+
+- 0020 — `aslan_dashboard` role + column-allowlist GRANTs +
+  `audit.event_metadata_key_count` SECURITY DEFINER helper.
+- 0021 — `aslan_app` SELECT on `audit.events.metadata` (companion
+  for the v0.6.0 helper).
+- 0022 — REVOKE raw `client_ip` + `user_agent` from
+  `aslan_dashboard` on 4 tables; `audit.event_client_ip_truncated`
+  SECURITY DEFINER helper for the rendered CIDR.
+- 0023 — REVOKE `metadata` SELECT from `aslan_dashboard` on
+  `src.ingestion_run` + `doc.filing`; static-SQL scanner allowlist
+  tightened with two new forbidden-column pairs (codex post-impl
+  HIGH).
+- 0024 — Dedicated NOLOGIN `aslan_audit_helpers` role owns both
+  `audit.event_metadata_key_count` + `audit.event_client_ip_truncated`
+  SECURITY DEFINER helpers; raw `metadata` and `client_ip` SELECT
+  REVOKEd from `aslan_app`; helper-owner-isolated test pins the
+  contract (codex post-impl HIGH).
+
+### Codex adversarial review history
+
+Forty-four findings absorbed across four phases (34 spec/plan + 5
+branch-state + 3 post-implementation + 2 ultrareview).
+
+**Spec/plan + branch-state highlights:**
+
+- F-1 CRITICAL: raw `client_ip` / `user_agent` were granted to the
+  dashboard role; revoked in migration 0022 + truncated CIDR helper.
+- F-2 HIGH: scanner walked only module-scope imports; rewritten to
+  walk every `Import` / `ImportFrom` with 4 EVIL_STUBS for
+  function-local imports.
+- F-3 MEDIUM: column-allowlist enforcement on `queries.py` text()
+  literals via sqlglot's PostgreSQL dialect.
+- F-4 MEDIUM: parallel test runs every query helper under a real
+  LOGIN-as-aslan_dashboard SQLAlchemy engine.
+- F-5 MEDIUM: lint rejects f-string `op.execute` whose source
+  contains `SECURITY DEFINER`.
+
+**Post-implementation review (3 findings):**
+
+- HIGH: `metadata` was still readable by `aslan_dashboard` on
+  `src.ingestion_run` + `doc.filing` (the dashboard never selected
+  it, but the GRANT layer permitted it) — closed by migration 0023.
+- HIGH: SECURITY DEFINER audit helpers ran as `aslan_app`, so
+  `aslan_app` retained a transitive read path to raw `metadata` and
+  `client_ip` — closed by migration 0024 (dedicated NOLOGIN owner
+  role).
+- MEDIUM: `prometheus-client` was an undeclared transitive of
+  `python-fasthtml`; pinned `>=0.21` in the `[dashboard]` extra so
+  `/metrics` cannot silently empty under a documented install.
+
+**Ultrareview (2 in-scope findings — full repo squashed snapshot
+review):**
+
+- bug_003 (normal): `StreamRowVM.xlen: int | None`; failed Redis
+  probes now render as `?` instead of being collapsed to `0` (which
+  was indistinguishable from a successfully empty stream).
+- bug_005 (nit): dropped the broken `--reload` flag from `aslan
+  dashboard serve` and the operator runbook — uvicorn's
+  `--reload` requires an import string + worker startup hook that
+  v0.6.0 does not ship, so the flag exited with a warning when used.
+
+### Compatibility
+
+- No public API changes outside the new `aslan_core.dashboard`
+  package and `aslan dashboard` CLI. Existing consumers continue to
+  import from `streams`, `documents`, `registry`, `timeseries`,
+  `audit`, `cli` unchanged.
+- The `[dashboard]` extra is opt-in
+  (`uv pip install -e '.[dashboard]'`); base installs do not pull
+  `python-fasthtml` or `uvicorn`.
+
 ## v0.5.0 — 2026-04-29 — Streams (StreamProducer + outbox + StreamConsumer + GDPR redaction)
 
 ### Added
