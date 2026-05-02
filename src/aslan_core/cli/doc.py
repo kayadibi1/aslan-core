@@ -468,9 +468,9 @@ def release_cmd(filing_id: str, keep_row: bool) -> None:
     rollback path that runs against the put_filing manifest in memory — this
     CLI command queries the DB for the manifest, so it is safe to call any
     time after the put_filing transaction has committed. ``DELETE FROM
-    doc.filing`` cascades through ``doc.filing_attachment`` (FK ON DELETE
-    CASCADE) and ``doc.filing_body`` (no cascade declared but ``filing_id``
-    is the PK there so the row is eligible — see migration 0007).
+    doc.filing`` cascades through ``doc.filing_attachment`` and
+    ``doc.filing_body`` (both declare ``ON DELETE CASCADE`` on ``filing_id``
+    — see migrations 0006 and 0007).
     """
     asyncio.run(_release_impl(UUID(filing_id), keep_row))
 
@@ -551,10 +551,11 @@ async def _release_impl(filing_id: UUID, keep_row: bool) -> None:
                 )
 
             if not keep_row:
-                await s.execute(
-                    text("DELETE FROM doc.filing_body WHERE filing_id = :fid"),
-                    {"fid": filing_id},
-                )
+                # doc.filing_body and doc.filing_attachment both declare
+                # ON DELETE CASCADE on filing_id (migrations 0006 + 0007),
+                # so a single DELETE on doc.filing tears down the full row
+                # set. The previous explicit DELETE on doc.filing_body was
+                # redundant.
                 await s.execute(
                     text("DELETE FROM doc.filing WHERE filing_id = :fid"),
                     {"fid": filing_id},

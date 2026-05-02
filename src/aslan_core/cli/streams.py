@@ -154,9 +154,9 @@ def publish_cmd(
     try:
         payload = json.loads(payload_json_str)
     except json.JSONDecodeError as e:
-        raise click.BadParameter(f"--json must be valid JSON: {e}") from e
+        raise click.BadParameter(f"--payload must be valid JSON: {e}") from e
     if not isinstance(payload, dict):
-        raise click.BadParameter("--json must be a JSON object")
+        raise click.BadParameter("--payload must be a JSON object")
 
     # Auto-stamp boilerplate fields if the operator omitted them.
     payload.setdefault("schema_version", 1)
@@ -648,7 +648,14 @@ async def _processed_clear_impl(
     redis = _redis_from_settings()
     try:
         processed_key = f"stream:{stream_name}:{group_name}:processed"
-        removed = await _aw(redis.srem(processed_key, event_id_str))
+        # Audit-first ordering: the docstring promises that the action is
+        # discoverable on the audit trail. If the destructive SREM ran
+        # before the audit row committed, any failure in between (DB blip,
+        # session_scope commit failure, audit insert error) would leave
+        # Redis mutated with no audit trail — a compliance hole. Commit
+        # the audit row first; SREM after. The actual ``removed`` count
+        # is reported on stdout but not in the audit metadata since it
+        # isn't known at audit time.
         async with session_scope(factory) as s:
             await audit_record(
                 s,
@@ -663,10 +670,10 @@ async def _processed_clear_impl(
                         "stream_name": stream_name,
                         "group_name": group_name,
                         "cause": "cli:processed_clear",
-                        "removed": int(removed),
                     },
                 ),
             )
+        removed = await _aw(redis.srem(processed_key, event_id_str))
         out = {
             "stream": stream_name,
             "group": group_name,

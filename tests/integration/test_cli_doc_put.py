@@ -186,6 +186,82 @@ async def test_doc_release_deletes_blob_and_row(
     assert row_count == 0
 
 
+async def test_doc_release_cascades_filing_body_via_fk(
+    session: AsyncSession,
+    object_storage_fake: InMemoryFake,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """`aslan doc release` only issues `DELETE FROM doc.filing` — the
+    `doc.filing_body` row must be cleaned up via the ON DELETE CASCADE
+    declared in migration 0007. Locks in the cascade so a future change
+    to migration 0007 (or a re-introduction of an explicit DELETE) gets
+    flagged."""
+    from aslan_core.cli.main import cli
+
+    await _seed_sources(session)
+    _patch_factory(monkeypatch, object_storage_fake)
+
+    primary = tmp_path / "cascade.html"
+    primary.write_bytes(b"<html>cascade-test</html>")
+
+    put_result = await _invoke(
+        cli,
+        [
+            "doc",
+            "put",
+            "--source-id",
+            "manual",
+            "--source-ref",
+            "CASCADE-1",
+            "--kind",
+            "news",
+            "--title",
+            "Cascade test",
+            "--published-at",
+            "2026-04-28T12:00:00Z",
+            "--primary-file",
+            str(primary),
+            "--json",
+        ],
+    )
+    assert put_result.exit_code == 0, f"output={put_result.output}\nexc={put_result.exception!r}"
+    filing_id = json.loads(put_result.output)["filing_id"]
+
+    await session.execute(
+        text(
+            "INSERT INTO doc.filing_body (filing_id, body_text, body_lang) "
+            "VALUES (:fid, :body, 'en') "
+            "ON CONFLICT (filing_id) DO UPDATE SET body_text = EXCLUDED.body_text"
+        ),
+        {"fid": UUID(filing_id), "body": "extracted body text"},
+    )
+    await session.commit()
+
+    body_before = await session.scalar(
+        text("SELECT COUNT(*) FROM doc.filing_body WHERE filing_id = :fid"),
+        {"fid": UUID(filing_id)},
+    )
+    assert body_before == 1
+
+    release_result = await _invoke(cli, ["doc", "release", filing_id])
+    assert release_result.exit_code == 0, (
+        f"output={release_result.output}\nexc={release_result.exception!r}"
+    )
+
+    await session.rollback()
+    body_after = await session.scalar(
+        text("SELECT COUNT(*) FROM doc.filing_body WHERE filing_id = :fid"),
+        {"fid": UUID(filing_id)},
+    )
+    filing_after = await session.scalar(
+        text("SELECT COUNT(*) FROM doc.filing WHERE filing_id = :fid"),
+        {"fid": UUID(filing_id)},
+    )
+    assert body_after == 0, "doc.filing_body row should have been cleaned up via FK cascade"
+    assert filing_after == 0
+
+
 async def test_doc_release_unknown_filing_id_exits_nonzero(
     session: AsyncSession,
     object_storage_fake: InMemoryFake,

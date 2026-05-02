@@ -129,19 +129,10 @@ async def test_deadletter_redis_index_present(engine: AsyncEngine) -> None:
             )
         ).all()
     assert {r[0] for r in pk_rows} == {"failure_id"}
-    # UNIQUE on redis_message_id
-    async with engine.connect() as conn:
-        uniques = (
-            await conn.execute(
-                text(
-                    "SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c "
-                    "JOIN pg_class t ON t.oid=c.conrelid "
-                    "WHERE t.relname='deadletter_redis_index' "
-                    "AND c.contype='u'"
-                )
-            )
-        ).all()
-    assert any("redis_message_id" in r[0] for r in uniques)
+    # The original 0017 inline UNIQUE on redis_message_id was dropped
+    # by migration 0025 — see test_migration_0025_deadletter_drop_global_unique
+    # for the absence assertion + behavioral coverage. Cross-stream
+    # <unix_ms>-<seq> collisions are legitimate, not a defect to guard.
 
 
 @pytest.mark.asyncio(loop_scope="session")
