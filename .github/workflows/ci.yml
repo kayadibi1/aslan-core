@@ -22,7 +22,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
-      - run: uv sync --all-groups
+      # --all-extras pulls in [obs] + [dashboard]. The dashboard tests
+      # import starlette / fasthtml / prometheus_client at module scope,
+      # which collection cannot defer; without --all-extras pytest aborts
+      # at collection with ModuleNotFoundError.
+      - run: uv sync --all-groups --all-extras
       # testcontainers needs the docker socket, which GHA provides by default.
       - run: uv run pytest -ra
         env:
