@@ -6,6 +6,7 @@ import socket
 import click
 
 from aslan_core.audit import Actor, set_actor
+from aslan_core.cli.agg import agg
 from aslan_core.cli.dashboard import dashboard
 from aslan_core.cli.doc import doc
 from aslan_core.cli.migrate import migrate
@@ -45,6 +46,7 @@ cli.add_command(doc)
 cli.add_command(ts)
 cli.add_command(streams)
 cli.add_command(dashboard)
+cli.add_command(agg)
 
 
 if __name__ == "__main__":

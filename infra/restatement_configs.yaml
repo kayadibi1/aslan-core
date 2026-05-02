@@ -1,0 +1,8 @@
+restatement_configs:
+  - name: tas29_tr_2022_onwards
+    cpi_series_code: evds.macro.cpi.headline
+    base_date: "2022-01-01"
+    applies_from: "2022-01-01"
+    applies_to: "9999-12-31"
+    method: tas29_monthly_cpi
+    description: TAS 29 simple monthly CPI restatement for TR equities
