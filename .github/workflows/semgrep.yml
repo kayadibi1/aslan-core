@@ -1,0 +1,46 @@
+# .github/workflows/semgrep.yml
+# Static-analysis security gate. Replaces the previous CodeQL workflow.
+#
+# Why Semgrep instead of CodeQL: GitHub's Code Scanning UI (where CodeQL
+# uploads SARIF) is gated on GitHub Advanced Security, which is not
+# available on private personal-account repos. CodeQL was running but
+# the upload step failed on every PR. Semgrep runs as a normal CI job,
+# uses public-registry rule packs, and exits non-zero locally on any
+# ERROR-severity finding — no SARIF upload, no GHAS dependency.
+
+name: semgrep
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  semgrep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Semgrep
+        run: pip install --no-cache-dir 'semgrep>=1.90,<2.0'
+
+      - name: Semgrep — ERROR-severity gate
+        # `--severity=ERROR` filters rules down to ERROR-severity only
+        # (WARNING/INFO findings are skipped entirely on this gate).
+        # `--error` makes Semgrep exit non-zero if any ERROR finding
+        # is hit. `--metrics=off` opts out of anonymous metrics.
+        run: |
+          semgrep scan \
+            --config=p/python \
+            --config=p/security-audit \
+            --severity=ERROR \
+            --error \
+            --metrics=off
