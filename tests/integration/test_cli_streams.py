@@ -147,6 +147,42 @@ async def test_streams_publish_creates_outbox_row(session: AsyncSession) -> None
     assert row.stream_name == STREAM
 
 
+async def test_streams_publish_invalid_payload_error_names_payload_flag() -> None:
+    """``publish_cmd`` BadParameter messages must reference ``--payload``,
+    not the unrelated ``--json`` output toggle."""
+    from aslan_core.cli.main import cli
+
+    bad_json = await _invoke(
+        cli,
+        [
+            "streams",
+            "publish",
+            "--kind",
+            "filing.new",
+            "--payload",
+            "not-json",
+        ],
+    )
+    assert bad_json.exit_code != 0
+    assert "--payload" in bad_json.output
+    assert "--json" not in bad_json.output
+
+    not_object = await _invoke(
+        cli,
+        [
+            "streams",
+            "publish",
+            "--kind",
+            "filing.new",
+            "--payload",
+            json.dumps([1, 2, 3]),
+        ],
+    )
+    assert not_object.exit_code != 0
+    assert "--payload" in not_object.output
+    assert "--json" not in not_object.output
+
+
 # ─── tail ────────────────────────────────────────────────────────────────
 
 
@@ -449,6 +485,67 @@ async def test_streams_processed_clear_drops_processed_member(
         )
     ).scalar_one()
     assert audit_n == 1
+
+
+async def test_streams_processed_clear_does_not_orphan_redis_when_audit_fails(
+    session: AsyncSession,
+    redis_client: Redis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compliance contract: the docstring promises the action is
+    discoverable on the audit trail. The destructive SREM must NOT run
+    until the audit row has committed — otherwise an audit-side failure
+    leaves Redis state changed with no audit row to discover.
+
+    Pre-fix this test would observe ``sismember == False`` (SREM ran
+    first, then the audit raise) and zero matching audit rows — exactly
+    the orphan Redis mutation the contract forbids."""
+    from aslan_core.cli.main import cli
+
+    eid = str(uuid4())
+    processed_key = f"stream:{STREAM}:{GROUP}:processed"
+    await _aw(redis_client.sadd(processed_key, eid))
+    assert await _aw(redis_client.sismember(processed_key, eid))
+
+    async def _boom(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("simulated audit failure")
+
+    monkeypatch.setattr("aslan_core.cli.streams.audit_record", _boom)
+
+    result = await _invoke(
+        cli,
+        [
+            "streams",
+            "processed-clear",
+            STREAM,
+            "--group",
+            GROUP,
+            "--event-id",
+            eid,
+            "--json",
+        ],
+    )
+    assert result.exit_code != 0
+
+    # Compliance invariant: SREM must not have run.
+    assert await _aw(redis_client.sismember(processed_key, eid)), (
+        "SREM ran before audit committed — orphan Redis mutation with no audit row"
+    )
+
+    await session.rollback()
+    audit_n = (
+        await session.execute(
+            text(
+                """
+                SELECT count(*) FROM audit.events
+                WHERE operation = 'stream.entry_redacted'
+                  AND target_pk->>'event_id' = :eid
+                """
+            ),
+            {"eid": eid},
+        )
+    ).scalar_one()
+    assert audit_n == 0
 
 
 # ─── known (sanity helper) ───────────────────────────────────────────────

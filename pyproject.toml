@@ -1,6 +1,6 @@
 [project]
 name = "aslan-core"
-version = "0.6.0"
+version = "0.6.1"
 description = "Shared Python package for the Aslan Terminal data-plane services."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"

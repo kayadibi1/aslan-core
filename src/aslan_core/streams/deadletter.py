@@ -648,10 +648,14 @@ async def route_to_deadletter(
                 {"fid": failure_id, "rid": redis_message_id},
             )
         except SQLAlchemyError:
-            # The only legitimate path here is a concurrent worker
-            # winning the race AFTER our XADD. Roll back our XADD,
-            # delete our (potentially-inserted) index row, and read
-            # the winner's redis_message_id.
+            # Post-migration 0025 the only conflict source is the PK
+            # on failure_id — a concurrent worker for the SAME failure_id
+            # winning the race after our XADD. The pre-0025 path also
+            # triggered on cross-stream <ms>-<seq> collisions against
+            # a since-removed global UNIQUE on redis_message_id, which
+            # caused silent dead-letter loss when XDEL'd here. Now safe.
+            # Roll back our XADD, delete our (potentially-inserted)
+            # index row, and read the winner's redis_message_id.
             await session.rollback()
             try:
                 await _aw(redis.xdel(deadletter_stream, redis_message_id))
