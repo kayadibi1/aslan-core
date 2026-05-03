@@ -10,7 +10,7 @@ currency_code, accounting_standard, restatement_basis, cpi_base_date,
 mapping_version, as_of) with a 0-100 score, an insufficient_data flag, and
 a JSONB checks payload carrying per-check detail.
 
-The sentinel cpi_base_date value '9999-12-31' represents the absence of a
+The sentinel cpi_base_date value '9999-01-01' represents the absence of a
 CPI base date for as_reported rows, matching the convention used in
 ts.canonical_financial.
 """
@@ -40,7 +40,7 @@ def upgrade() -> None:
                 REFERENCES ref.currency(currency_code),
             accounting_standard TEXT NOT NULL,
             restatement_basis   TEXT NOT NULL,
-            cpi_base_date       DATE NOT NULL DEFAULT '9999-12-31',
+            cpi_base_date       DATE NOT NULL DEFAULT '9999-01-01',
             score               SMALLINT NOT NULL
                 CHECK (score BETWEEN 0 AND 100),
             insufficient_data   BOOLEAN NOT NULL DEFAULT FALSE,

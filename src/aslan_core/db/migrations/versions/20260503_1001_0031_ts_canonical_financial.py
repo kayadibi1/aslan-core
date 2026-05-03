@@ -10,7 +10,7 @@ currency_code, accounting_standard, restatement_basis, cpi_base_date,
 mapping_version, as_of) with full source-contribution provenance and
 quality-flag metadata.
 
-The sentinel cpi_base_date value '9999-12-31' represents the absence of a
+The sentinel cpi_base_date value '9999-01-01' represents the absence of a
 CPI base date for as_reported rows.  A CHECK constraint enforces that
 cpi_normalized rows carry a non-sentinel cpi_base_date and a
 measuring_unit_date, while as_reported rows carry the sentinel and no
@@ -49,7 +49,7 @@ def upgrade() -> None:
             source_contributions JSONB NOT NULL,
             computed            BOOLEAN NOT NULL DEFAULT FALSE,
             quality_flags       JSONB NOT NULL DEFAULT '{}',
-            cpi_base_date       DATE NOT NULL DEFAULT '9999-12-31',
+            cpi_base_date       DATE NOT NULL DEFAULT '9999-01-01',
             measuring_unit_date DATE,
             mapping_version     INT NOT NULL,
             manifest_hash       CHAR(64) NOT NULL,
@@ -62,11 +62,11 @@ def upgrade() -> None:
                          mapping_version, as_of),
             CHECK (
                 (restatement_basis = 'cpi_normalized'
-                    AND cpi_base_date <> '9999-12-31'
+                    AND cpi_base_date <> '9999-01-01'
                     AND measuring_unit_date IS NOT NULL)
                 OR
                 (restatement_basis = 'as_reported'
-                    AND cpi_base_date = '9999-12-31')
+                    AND cpi_base_date = '9999-01-01')
             )
         )
     """)
