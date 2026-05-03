@@ -9,10 +9,10 @@ primary key. KAP filings contain both consolidated and unconsolidated
 variants of every statement; without ``consolidation`` in the PK,
 ``ON CONFLICT DO NOTHING`` silently drops one variant.
 
-FK to ``doc.filing`` is ``NOT VALID`` — the financial parser may write
-line items before the filing row exists in a concurrent pipeline.
-Validated by a later ``ALTER ... VALIDATE CONSTRAINT`` once data
-converges.
+No FK to ``doc.filing`` — the financial parser may write line items
+before the filing row exists in a concurrent pipeline.  A NOT VALID FK
+was attempted in production and dropped; the column is intentionally
+unconstrained.
 """
 
 from __future__ import annotations
@@ -54,11 +54,6 @@ def upgrade() -> None:
                          consolidation, period_end, as_of)
         )
     """)
-    op.execute(
-        "ALTER TABLE ts.financial_line_item "
-        "ADD CONSTRAINT fli_filing_fk FOREIGN KEY (filing_id) "
-        "REFERENCES doc.filing(filing_id) NOT VALID"
-    )
     op.execute(
         "CREATE INDEX fli_entity_period "
         "ON ts.financial_line_item(entity_id, period_end DESC, line_code)"
