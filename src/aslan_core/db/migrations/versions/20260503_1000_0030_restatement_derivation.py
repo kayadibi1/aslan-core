@@ -50,6 +50,8 @@ def upgrade() -> None:
     """)
 
     # 3. CHECK constraint on restatement_basis (none existed before)
+    #    NOT VALID: acquire lock instantly without scanning existing rows.
+    #    VALIDATE CONSTRAINT runs after all UPDATEs (end of upgrade()).
     op.execute("""
         ALTER TABLE ts.financial_line_item
             ADD CONSTRAINT financial_line_item_restatement_basis_check
@@ -57,6 +59,7 @@ def upgrade() -> None:
                 'nominal', 'as_reported', 'restated',
                 'adjusted', 'cpi_normalized'
             ))
+            NOT VALID
     """)
 
     # 4. Backfill measuring_unit_date = MAX(period_end) per filing_id
@@ -131,6 +134,13 @@ def upgrade() -> None:
         SET    restatement_basis = 'nominal',
                derivation_reason = 'no_evidence'
         WHERE  fli.derivation_reason IS NULL
+    """)
+
+    # 6. Now validate the CHECK constraint added with NOT VALID above.
+    #    VALIDATE CONSTRAINT takes SHARE UPDATE EXCLUSIVE (allows concurrent reads).
+    op.execute("""
+        ALTER TABLE ts.financial_line_item
+            VALIDATE CONSTRAINT financial_line_item_restatement_basis_check
     """)
 
 

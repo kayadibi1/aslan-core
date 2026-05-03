@@ -280,6 +280,19 @@ _DERIVATION_SQL_P1 = """
       )
 """
 
+_DERIVATION_SQL_P2 = """
+    UPDATE ts.financial_line_item fli
+    SET    restatement_basis = 'as_reported',
+           derivation_reason = 'inflation_tags'
+    WHERE  fli.derivation_reason IS NULL
+      AND  EXISTS (
+          SELECT 1 FROM ts.financial_line_item p2
+          WHERE  p2.filing_id = fli.filing_id
+            AND  (p2.line_code LIKE 'kap-fr_Inflation%'
+                  OR p2.line_code = 'kap-fr_InflationAdjustmentsOnCapital')
+      )
+"""
+
 _DERIVATION_SQL_P3 = """
     UPDATE ts.financial_line_item fli
     SET    restatement_basis = 'as_reported',
@@ -303,6 +316,8 @@ _DERIVATION_SQL_P4 = """
 _FILING_DERIV = "dddddddd-0030-0030-0030-000000000001"
 _FILING_DERIV_2 = "dddddddd-0030-0030-0030-000000000002"
 _FILING_DERIV_3 = "dddddddd-0030-0030-0030-000000000003"
+_FILING_DERIV_4 = "dddddddd-0030-0030-0030-000000000004"
+_FILING_DERIV_5 = "dddddddd-0030-0030-0030-000000000005"
 
 
 async def test_measuring_unit_date_backfill(session: AsyncSession) -> None:
@@ -389,6 +404,106 @@ async def test_derivation_p1_monetary_gl_line(session: AsyncSession) -> None:
     await _wipe_test_data(session)
 
 
+async def test_derivation_p0_exemption(session: AsyncSession) -> None:
+    """P0: Entity in ref.tas29_exemption -> nominal + exemption (blocks P3)."""
+    await _wipe_test_data(session)
+    await _seed_fk_deps(session, run_id=99030)
+    await _seed_entity(session, _ENTITY_ID_B, run_id=99030)
+    await session.commit()
+
+    # Register entity B as exempt
+    await session.execute(
+        text(
+            "INSERT INTO ref.tas29_exemption (entity_id, reason) "
+            "VALUES (:eid, 'voluntary opt-out') ON CONFLICT DO NOTHING"
+        ),
+        {"eid": _ENTITY_ID_B},
+    )
+
+    # Seed an FLI row that *would* match P3 (IFRS, period_end >= 2023-12-31)
+    await _insert_fli(
+        session,
+        entity_id=_ENTITY_ID_B,
+        filing_id=_FILING_DERIV_4,
+        line_code="ifrs-full_Revenue",
+        period_end=datetime.date(2024, 12, 31),
+        accounting_standard="ifrs",
+    )
+    await session.commit()
+
+    # Run the full cascade — P0 must fire first and block P3
+    await session.execute(text(_DERIVATION_SQL_P0))
+    await session.execute(text(_DERIVATION_SQL_P1))
+    await session.execute(text(_DERIVATION_SQL_P2))
+    await session.execute(text(_DERIVATION_SQL_P3))
+    await session.execute(text(_DERIVATION_SQL_P4))
+    await session.commit()
+
+    result = await session.execute(
+        text(
+            "SELECT restatement_basis, derivation_reason "
+            "FROM ts.financial_line_item "
+            "WHERE filing_id = :fid"
+        ),
+        {"fid": _FILING_DERIV_4},
+    )
+    row = result.fetchone()
+    assert row is not None
+    assert row[0] == "nominal"
+    assert row[1] == "exemption"
+
+    await _wipe_test_data(session)
+
+
+async def test_derivation_p2_inflation_tags(session: AsyncSession) -> None:
+    """P2: kap-fr_Inflation* tag, no monetary GL -> as_reported + inflation_tags."""
+    await _wipe_test_data(session)
+    await _seed_fk_deps(session, run_id=99030)
+    await _seed_entity(session, _ENTITY_ID_A, run_id=99030)
+    await session.commit()
+
+    # Normal line
+    await _insert_fli(
+        session,
+        entity_id=_ENTITY_ID_A,
+        filing_id=_FILING_DERIV_5,
+        line_code="ifrs-full_Revenue",
+        period_end=datetime.date(2022, 6, 30),
+        accounting_standard="local_gaap",
+    )
+    # Inflation tag line in the same filing (no monetary GL line)
+    await _insert_fli(
+        session,
+        entity_id=_ENTITY_ID_A,
+        filing_id=_FILING_DERIV_5,
+        line_code="kap-fr_InflationEffectOnOperatingActivities",
+        period_end=datetime.date(2022, 6, 30),
+        accounting_standard="local_gaap",
+    )
+    await session.commit()
+
+    # Run P0, P1 (both no-op), then P2
+    await session.execute(text(_DERIVATION_SQL_P0))
+    await session.execute(text(_DERIVATION_SQL_P1))
+    await session.execute(text(_DERIVATION_SQL_P2))
+    await session.commit()
+
+    result = await session.execute(
+        text(
+            "SELECT restatement_basis, derivation_reason "
+            "FROM ts.financial_line_item "
+            "WHERE filing_id = :fid"
+        ),
+        {"fid": _FILING_DERIV_5},
+    )
+    rows = result.fetchall()
+    for row in rows:
+        assert row[0] == "as_reported"
+        assert row[1] == "inflation_tags"
+
+    await _wipe_test_data(session)
+
+
 async def test_derivation_p3_period_mandate(session: AsyncSession) -> None:
     """P3: IFRS filing with period_end >= 2023-12-31 -> as_reported + period_mandate."""
     await _wipe_test_data(session)
@@ -407,9 +522,10 @@ async def test_derivation_p3_period_mandate(session: AsyncSession) -> None:
     await session.commit()
 
     # Run P0 first (no-op since no exemption), then P1 (no-op since no
-    # monetary GL line), then P3.
+    # monetary GL line), P2 (no-op since no inflation tags), then P3.
     await session.execute(text(_DERIVATION_SQL_P0))
     await session.execute(text(_DERIVATION_SQL_P1))
+    await session.execute(text(_DERIVATION_SQL_P2))
     await session.execute(text(_DERIVATION_SQL_P3))
     await session.commit()
 
@@ -450,6 +566,7 @@ async def test_derivation_p4_no_evidence(session: AsyncSession) -> None:
     # Run the full cascade so P4 is the last to fire
     await session.execute(text(_DERIVATION_SQL_P0))
     await session.execute(text(_DERIVATION_SQL_P1))
+    await session.execute(text(_DERIVATION_SQL_P2))
     await session.execute(text(_DERIVATION_SQL_P3))
     await session.execute(text(_DERIVATION_SQL_P4))
     await session.commit()
