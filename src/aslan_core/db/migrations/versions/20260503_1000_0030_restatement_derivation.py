@@ -77,7 +77,8 @@ def upgrade() -> None:
     # P0: Entity in ref.tas29_exemption → stays nominal, 'exemption'
     op.execute("""
         UPDATE ts.financial_line_item fli
-        SET    derivation_reason = 'exemption'
+        SET    restatement_basis = 'nominal',
+               derivation_reason = 'exemption'
         FROM   ref.tas29_exemption ex
         WHERE  fli.entity_id = ex.entity_id
           AND  fli.derivation_reason IS NULL
@@ -127,7 +128,8 @@ def upgrade() -> None:
     # P4: No evidence — stays nominal
     op.execute("""
         UPDATE ts.financial_line_item fli
-        SET    derivation_reason = 'no_evidence'
+        SET    restatement_basis = 'nominal',
+               derivation_reason = 'no_evidence'
         WHERE  fli.derivation_reason IS NULL
     """)
 
