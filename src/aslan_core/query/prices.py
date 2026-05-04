@@ -75,11 +75,11 @@ async def get_stock_prices(
     return [
         PricePoint(
             ts=d,
-            open=vals.get("price.open"),
-            high=vals.get("price.high"),
-            low=vals.get("price.low"),
-            close=vals.get("price.close"),
-            volume=vals.get("price.volume"),
+            open=vals.get("price_open"),
+            high=vals.get("price_high"),
+            low=vals.get("price_low"),
+            close=vals.get("price_close"),
+            volume=vals.get("volume"),
         )
         for d, vals in sorted(by_date.items(), reverse=True)
     ]
