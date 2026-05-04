@@ -16,6 +16,9 @@ pytestmark = pytest.mark.integration
 async def _wipe(session: AsyncSession) -> None:
     for stmt in [
         "DELETE FROM audit.events",
+        "DELETE FROM ts.entity_quality_score",
+        "DELETE FROM ts.canonical_financial",
+        "DELETE FROM ts.financial_line_item",
         "DELETE FROM ref.entity_sector",
         "DELETE FROM ref.entity_relationship",
         "DELETE FROM ref.identifier",

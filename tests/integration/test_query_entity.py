@@ -23,6 +23,9 @@ from aslan_core.query.schemas import (
 
 pytestmark = pytest.mark.integration
 
+# Module-unique source_id avoids FK collisions with other test modules
+# (e.g. document-store tests that seed doc.filing with source_id='kap').
+_SRC = "test_qe_0099"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -30,17 +33,47 @@ pytestmark = pytest.mark.integration
 
 
 async def _wipe(session: AsyncSession) -> None:
-    """Delete seeded rows in FK-safe order."""
-    for stmt in [
-        "DELETE FROM ts.entity_quality_score",
-        "DELETE FROM ts.canonical_financial",
-        "DELETE FROM ref.identifier",
-        "DELETE FROM ref.entity",
-        "DELETE FROM ref.currency",
-        "DELETE FROM src.ingestion_run",
-        "DELETE FROM src.source",
-    ]:
-        await session.execute(text(stmt))
+    """Delete rows seeded by ``_seed`` in FK-safe order.
+
+    Scoped to ``source_id = _SRC`` so rows from other test modules
+    are left untouched. A bare ``DELETE FROM src.ingestion_run`` fails
+    with a FK violation when other modules' ``doc.filing`` rows still
+    reference the same ingestion run.
+    """
+    # Leaf tables first (FK children), then parents.
+    await session.execute(
+        text(
+            "DELETE FROM ts.entity_quality_score WHERE entity_id IN "
+            "(SELECT entity_id FROM ref.entity WHERE source_id = :sid)"
+        ),
+        {"sid": _SRC},
+    )
+    await session.execute(
+        text(
+            "DELETE FROM ts.canonical_financial WHERE entity_id IN "
+            "(SELECT entity_id FROM ref.entity WHERE source_id = :sid)"
+        ),
+        {"sid": _SRC},
+    )
+    await session.execute(
+        text(
+            "DELETE FROM ref.identifier WHERE entity_id IN "
+            "(SELECT entity_id FROM ref.entity WHERE source_id = :sid)"
+        ),
+        {"sid": _SRC},
+    )
+    await session.execute(
+        text("DELETE FROM ref.entity WHERE source_id = :sid"),
+        {"sid": _SRC},
+    )
+    await session.execute(
+        text("DELETE FROM src.ingestion_run WHERE source_id = :sid"),
+        {"sid": _SRC},
+    )
+    await session.execute(
+        text("DELETE FROM src.source WHERE source_id = :sid"),
+        {"sid": _SRC},
+    )
     await session.commit()
 
 
@@ -52,15 +85,17 @@ async def _seed(session: AsyncSession) -> tuple[UUID, UUID, int]:
     await session.execute(
         text(
             "INSERT INTO src.source (source_id, name, kind, license_status) "
-            "VALUES ('kap', 'KAP', 'scraper', 'open') ON CONFLICT DO NOTHING"
-        )
+            "VALUES (:sid, 'TestQE', 'scraper', 'open') ON CONFLICT DO NOTHING"
+        ),
+        {"sid": _SRC},
     )
     run_id: int = (
         await session.execute(
             text(
                 "INSERT INTO src.ingestion_run (source_id, job_name, status) "
-                "VALUES ('kap', 'seed', 'succeeded') RETURNING ingestion_run_id"
-            )
+                "VALUES (:sid, 'seed', 'succeeded') RETURNING ingestion_run_id"
+            ),
+            {"sid": _SRC},
         )
     ).scalar_one()
 
@@ -78,19 +113,19 @@ async def _seed(session: AsyncSession) -> tuple[UUID, UUID, int]:
             text(
                 "INSERT INTO ref.entity "
                 "  (entity_type, legal_name, short_name, status, source_id, ingestion_run_id) "
-                "VALUES ('company', 'Aselsan A.Ş.', 'Aselsan', 'active', 'kap', :run) "
+                "VALUES ('company', 'Aselsan A.Ş.', 'Aselsan', 'active', :sid, :run) "
                 "RETURNING entity_id"
             ),
-            {"run": run_id},
+            {"sid": _SRC, "run": run_id},
         )
     ).scalar_one()
     await session.execute(
         text(
             "INSERT INTO ref.identifier "
             "  (entity_id, namespace, value, is_primary, source_id, ingestion_run_id) "
-            "VALUES (:eid, 'bist_ticker', 'ASELS', true, 'kap', :run)"
+            "VALUES (:eid, 'bist_ticker', 'ASELS', true, :sid, :run)"
         ),
-        {"eid": eid1, "run": run_id},
+        {"eid": eid1, "sid": _SRC, "run": run_id},
     )
 
     # Entity 2: Turkcell — has financials
@@ -100,19 +135,19 @@ async def _seed(session: AsyncSession) -> tuple[UUID, UUID, int]:
                 "INSERT INTO ref.entity "
                 "  (entity_type, legal_name, short_name, status, source_id, ingestion_run_id) "
                 "VALUES ('company', 'Turkcell İletişim Hiz. A.Ş.', 'Turkcell', 'active', "
-                "        'kap', :run) "
+                "        :sid, :run) "
                 "RETURNING entity_id"
             ),
-            {"run": run_id},
+            {"sid": _SRC, "run": run_id},
         )
     ).scalar_one()
     await session.execute(
         text(
             "INSERT INTO ref.identifier "
             "  (entity_id, namespace, value, is_primary, source_id, ingestion_run_id) "
-            "VALUES (:eid, 'bist_ticker', 'TCELL', true, 'kap', :run)"
+            "VALUES (:eid, 'bist_ticker', 'TCELL', true, :sid, :run)"
         ),
-        {"eid": eid2, "run": run_id},
+        {"eid": eid2, "sid": _SRC, "run": run_id},
     )
 
     # Canonical financials for entity 1
@@ -163,8 +198,8 @@ async def _seed(session: AsyncSession) -> tuple[UUID, UUID, int]:
 
     # Quality scores for entity 1
     checks_json = (
-        '{"balance_check": {"state": "pass", "delta_pct": 0.01, '
-        '"coverage_pct": 0.95, "internal_detail": "do_not_expose"}}'
+        '{"checks": {"balance_check": {"state": "pass", "delta_pct": 0.01, '
+        '"coverage_pct": 0.95, "internal_detail": "do_not_expose"}}}'
     )
     await session.execute(
         text(
@@ -257,9 +292,9 @@ async def test_list_entities_has_financials_false(session: AsyncSession) -> None
         text(
             "INSERT INTO ref.entity "
             "  (entity_type, legal_name, status, source_id, ingestion_run_id) "
-            "VALUES ('company', 'No Financials Co', 'active', 'kap', :run)"
+            "VALUES ('company', 'No Financials Co', 'active', :sid, :run)"
         ),
-        {"run": run_id},
+        {"sid": _SRC, "run": run_id},
     )
     await session.commit()
 

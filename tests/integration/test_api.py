@@ -44,8 +44,22 @@ def _api_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture()
-def app(engine: AsyncEngine) -> Any:
-    """Build the FastAPI app, injecting the test engine via lifespan override."""
+def app(pg_dsn: str) -> Iterator[Any]:
+    """Build the FastAPI app with an isolated engine for the TestClient.
+
+    Starlette's synchronous ``TestClient`` spins up its own event loop
+    internally.  If we reuse the session-scoped ``engine`` fixture here,
+    asyncpg connections get checked out on the TestClient's loop but
+    returned to a pool whose other consumers (``_wipe_streams_tables_after``,
+    ``session``, etc.) run on pytest-asyncio's session loop, causing
+    ``RuntimeError: Task got Future attached to a different loop``.
+
+    Creating a dedicated engine per test avoids cross-loop pool pollution.
+    The engine is disposed synchronously inside the TestClient's own loop
+    via a FastAPI shutdown event, so no connections leak.
+    """
+    from contextlib import asynccontextmanager
+
     from fastapi import FastAPI
 
     from aslan_core.api.middleware import register_exception_handlers
@@ -53,17 +67,24 @@ def app(engine: AsyncEngine) -> Any:
     from aslan_core.api.routes.catalog import router as catalog_router
     from aslan_core.api.routes.entities import router as entities_router
     from aslan_core.api.routes.financials import router as financials_router
+    from aslan_core.db.engine import create_engine as _create_engine
 
-    # Build a fresh app with NO lifespan (we manage state manually).
-    app = FastAPI(title="Aslan Financial API", version="0.10.0")
+    @asynccontextmanager
+    async def _lifespan(a: FastAPI) -> AsyncIterator[None]:
+        a.state.engine = _create_engine(pg_dsn)
+        try:
+            yield
+        finally:
+            await a.state.engine.dispose()
+
+    app = FastAPI(title="Aslan Financial API", version="0.10.0", lifespan=_lifespan)
     app.include_router(auth_router, prefix="/auth", tags=["auth"])
     app.include_router(entities_router, prefix="/entities", tags=["entities"])
     app.include_router(financials_router, prefix="/financials", tags=["financials"])
     app.include_router(catalog_router, tags=["catalog"])
     register_exception_handlers(app)
 
-    # Inject test engine + empty catalog directly into app.state.
-    app.state.engine = engine
+    # Inject catalog (read-only, no loop affinity).
     app.state.canonical_lines = [
         CanonicalLineInfo(
             canonical_code="revenue",
@@ -83,7 +104,7 @@ def app(engine: AsyncEngine) -> Any:
         ),
     ]
     app.state.canonical_codes = {li.canonical_code for li in app.state.canonical_lines}
-    return app
+    yield app
 
 
 @pytest.fixture()
@@ -100,19 +121,63 @@ def client(app: Any) -> Iterator[Any]:
 # ---------------------------------------------------------------------------
 
 
+_API_SOURCE_ID = "test_api_seed"
+_API_RUN_ID = 99_999
+_PHASH = "a" * 64
+_MHASH = "b" * 64
+
+
 @pytest_asyncio.fixture(loop_scope="session")
 async def _seed_entity(
     engine: AsyncEngine,
 ) -> AsyncIterator[UUID]:
-    """Insert a test entity + some canonical financial rows for query tests."""
+    """Insert a test entity + some canonical financial rows for query tests.
+
+    Creates the full FK dependency chain (source -> ingestion_run ->
+    currency -> entity -> canonical_financial / entity_quality_score)
+    so all NOT NULL columns are satisfied.
+    """
     factory = create_session_factory(engine)
     entity_id = uuid4()
 
     async with factory() as session:
+        # FK dependencies
+        await session.execute(
+            text(
+                "INSERT INTO src.source (source_id, name, kind, license_status) "
+                "VALUES (:sid, 'TestAPI', 'scraper', 'open') ON CONFLICT DO NOTHING"
+            ),
+            {"sid": _API_SOURCE_ID},
+        )
+        await session.execute(
+            text(
+                "INSERT INTO src.ingestion_run "
+                "(ingestion_run_id, source_id, job_name, status) "
+                "VALUES (:run, :sid, 'seed', 'succeeded') ON CONFLICT DO NOTHING"
+            ),
+            {"run": _API_RUN_ID, "sid": _API_SOURCE_ID},
+        )
+        await session.execute(
+            text(
+                "INSERT INTO ref.currency (currency_code, name) "
+                "VALUES ('TRY', 'Turkish Lira') ON CONFLICT DO NOTHING"
+            )
+        )
+
         # Entity
         await session.execute(
-            text("INSERT INTO ref.entity (entity_id, legal_name) VALUES (:eid, :name)"),
-            {"eid": entity_id, "name": "Test Corp API"},
+            text(
+                "INSERT INTO ref.entity "
+                "(entity_id, entity_type, legal_name, status, "
+                " source_id, ingestion_run_id) "
+                "VALUES (:eid, 'company', :name, 'active', :sid, :run)"
+            ),
+            {
+                "eid": entity_id,
+                "name": "Test Corp API",
+                "sid": _API_SOURCE_ID,
+                "run": _API_RUN_ID,
+            },
         )
         # Canonical financial rows
         for i, code in enumerate(["revenue", "net_income"]):
@@ -120,8 +185,12 @@ async def _seed_entity(
                 text(
                     "INSERT INTO ts.canonical_financial "
                     "(entity_id, canonical_code, period_end, period_type, "
-                    " consolidation, restatement_basis, mapping_version, value) "
-                    "VALUES (:eid, :code, :pe, :pt, :con, :rb, :mv, :val)"
+                    " consolidation, restatement_basis, currency_code, "
+                    " accounting_standard, payload_hash, source_contributions, "
+                    " mapping_version, manifest_hash, as_of, "
+                    " ingestion_run_id, value) "
+                    "VALUES (:eid, :code, :pe, :pt, :con, :rb, 'TRY', "
+                    " 'ifrs', :phash, :sc, :mv, :mhash, now(), :run, :val)"
                 ),
                 {
                     "eid": entity_id,
@@ -130,7 +199,11 @@ async def _seed_entity(
                     "pt": "q",
                     "con": "consolidated",
                     "rb": "as_reported",
+                    "phash": _PHASH,
+                    "sc": "{}",
                     "mv": 1,
+                    "mhash": _MHASH,
+                    "run": _API_RUN_ID,
                     "val": Decimal("1000000") + i * Decimal("500000"),
                 },
             )
@@ -139,8 +212,11 @@ async def _seed_entity(
             text(
                 "INSERT INTO ts.entity_quality_score "
                 "(entity_id, period_end, period_type, consolidation, "
-                " restatement_basis, mapping_version, score, insufficient_data, checks) "
-                "VALUES (:eid, :pe, :pt, :con, :rb, :mv, :sc, :isd, :ch)"
+                " currency_code, accounting_standard, restatement_basis, "
+                " mapping_version, manifest_hash, as_of, "
+                " ingestion_run_id, score, insufficient_data, checks) "
+                "VALUES (:eid, :pe, :pt, :con, 'TRY', 'ifrs', :rb, "
+                " :mv, :mhash, now(), :run, :sc, :isd, :ch)"
             ),
             {
                 "eid": entity_id,
@@ -149,6 +225,8 @@ async def _seed_entity(
                 "con": "consolidated",
                 "rb": "as_reported",
                 "mv": 1,
+                "mhash": _MHASH,
+                "run": _API_RUN_ID,
                 "sc": 85,
                 "isd": False,
                 "ch": '{"completeness": {"state": "pass", "coverage_pct": 0.95}}',
@@ -158,7 +236,7 @@ async def _seed_entity(
 
     yield entity_id
 
-    # Cleanup
+    # Cleanup (reverse FK order)
     async with factory() as session:
         await session.execute(
             text("DELETE FROM ts.entity_quality_score WHERE entity_id = :eid"),

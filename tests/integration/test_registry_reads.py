@@ -17,6 +17,9 @@ async def _wipe(session: AsyncSession) -> None:
     """Test isolation: tests commit mid-flow so the function-scoped session's
     rollback can't undo their writes. Clean state up front."""
     for stmt in [
+        "DELETE FROM ts.entity_quality_score",
+        "DELETE FROM ts.canonical_financial",
+        "DELETE FROM ts.financial_line_item",
         "DELETE FROM ref.entity_sector",
         "DELETE FROM ref.entity_relationship",
         "DELETE FROM ref.identifier",
