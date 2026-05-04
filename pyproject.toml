@@ -55,6 +55,12 @@ dashboard = [
     # 500-spike alerts work out of the box.
     "prometheus-client >=0.21",
 ]
+api = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "python-jose[cryptography]>=3.3",
+    "passlib[bcrypt]>=1.7",
+]
 
 [dependency-groups]
 dev = [
@@ -152,6 +158,15 @@ module = [
     "sentry_sdk.*",
     "opentelemetry.*",
     "prometheus_client.*",
+]
+ignore_missing_imports = true
+
+# [api] extra — python-jose and passlib do not ship py.typed markers;
+# mypy strict mode cannot analyse them on a base venv install.
+[[tool.mypy.overrides]]
+module = [
+    "jose.*",
+    "passlib.*",
 ]
 ignore_missing_imports = true
 
