@@ -10,7 +10,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock README.md alembic.ini ./
 COPY src/ src/
 
-RUN uv sync --frozen --no-dev --extra dashboard
+RUN uv sync --frozen --no-dev --extra dashboard --extra api
 
 COPY infra/deploy/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
