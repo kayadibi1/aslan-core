@@ -134,7 +134,7 @@ class QualityCheckPublic(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="ignore")
 
-    state: str
+    state: str = "unknown"
     delta_pct: float | None = None
     coverage_pct: float | None = None
 
