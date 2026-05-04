@@ -38,26 +38,49 @@ def _dt(d: date) -> datetime:
     return datetime(d.year, d.month, d.day, tzinfo=UTC)
 
 
-_PRICE_BASE = (
-    "SELECT o.ts::date AS d, sc.metric, o.value "
-    "FROM ts.observation o "
-    "JOIN ts.series_catalog sc ON sc.series_id = o.series_id "
-    "WHERE sc.entity_id = :eid AND sc.source_id = 'bist' "
-)
+_PRICE_SQL = text("""\
+SELECT o.ts::date AS d, sc.metric, o.value
+FROM ts.observation o
+JOIN ts.series_catalog sc ON sc.series_id = o.series_id
+WHERE sc.entity_id = :eid AND sc.source_id = 'bist'
+  AND (:start::timestamptz IS NULL OR o.ts >= :start)
+  AND (:end::timestamptz IS NULL OR o.ts <= :end)
+ORDER BY o.ts DESC
+LIMIT :lim
+""")
 
-_NAV_BASE = (
-    "SELECT o.ts::date AS d, o.value "
-    "FROM ts.observation o "
-    "JOIN ts.series_catalog sc ON sc.series_id = o.series_id "
-    "WHERE sc.entity_id = :eid AND sc.source_id = 'tefas' AND sc.metric = 'nav' "
-)
+_NAV_SQL = text("""\
+SELECT o.ts::date AS d, o.value
+FROM ts.observation o
+JOIN ts.series_catalog sc ON sc.series_id = o.series_id
+WHERE sc.entity_id = :eid AND sc.source_id = 'tefas' AND sc.metric = 'nav'
+  AND (:start::timestamptz IS NULL OR o.ts >= :start)
+  AND (:end::timestamptz IS NULL OR o.ts <= :end)
+ORDER BY o.ts DESC
+LIMIT :lim
+""")
 
-_SERIES_BASE = (
-    "SELECT o.ts::date AS d, o.value "
-    "FROM ts.observation o "
-    "JOIN ts.series_catalog sc ON sc.series_id = o.series_id "
-    "WHERE sc.series_code = :sc "
-)
+_FUNDAMENTALS_SQL = text("""\
+SELECT DISTINCT ON (sc.metric)
+  sc.metric, o.value, o.ts::date AS d
+FROM ts.observation o
+JOIN ts.series_catalog sc ON sc.series_id = o.series_id
+WHERE sc.entity_id = :eid
+  AND sc.source_id = 'bist'
+  AND sc.metric LIKE 'fundamental_%'
+ORDER BY sc.metric, o.ts DESC
+""")
+
+_SERIES_SQL = text("""\
+SELECT o.ts::date AS d, o.value
+FROM ts.observation o
+JOIN ts.series_catalog sc ON sc.series_id = o.series_id
+WHERE sc.series_code = :sc
+  AND (:start::timestamptz IS NULL OR o.ts >= :start)
+  AND (:end::timestamptz IS NULL OR o.ts <= :end)
+ORDER BY o.ts DESC
+LIMIT :lim
+""")
 
 
 async def get_stock_prices(
@@ -68,22 +91,17 @@ async def get_stock_prices(
     end: date | None = None,
     limit: int = 500,
 ) -> list[PricePoint]:
-    params: dict[str, object] = {"eid": entity_id, "lim": min(limit, 2000)}
-
-    if start and end:
-        q = text(_PRICE_BASE + "AND o.ts >= :start AND o.ts <= :end ORDER BY o.ts DESC LIMIT :lim")
-        params["start"] = _dt(start)
-        params["end"] = _dt(end)
-    elif start:
-        q = text(_PRICE_BASE + "AND o.ts >= :start ORDER BY o.ts DESC LIMIT :lim")
-        params["start"] = _dt(start)
-    elif end:
-        q = text(_PRICE_BASE + "AND o.ts <= :end ORDER BY o.ts DESC LIMIT :lim")
-        params["end"] = _dt(end)
-    else:
-        q = text(_PRICE_BASE + "ORDER BY o.ts DESC LIMIT :lim")
-
-    rows = (await session.execute(q, params)).all()
+    rows = (
+        await session.execute(
+            _PRICE_SQL,
+            {
+                "eid": entity_id,
+                "start": _dt(start) if start else None,
+                "end": _dt(end) if end else None,
+                "lim": min(limit, 2000),
+            },
+        )
+    ).all()
 
     by_date: dict[date, dict[str, Decimal]] = {}
     for r in rows:
@@ -113,22 +131,17 @@ async def get_fund_nav(
     end: date | None = None,
     limit: int = 500,
 ) -> list[NavPoint]:
-    params: dict[str, object] = {"eid": entity_id, "lim": min(limit, 2000)}
-
-    if start and end:
-        q = text(_NAV_BASE + "AND o.ts >= :start AND o.ts <= :end ORDER BY o.ts DESC LIMIT :lim")
-        params["start"] = _dt(start)
-        params["end"] = _dt(end)
-    elif start:
-        q = text(_NAV_BASE + "AND o.ts >= :start ORDER BY o.ts DESC LIMIT :lim")
-        params["start"] = _dt(start)
-    elif end:
-        q = text(_NAV_BASE + "AND o.ts <= :end ORDER BY o.ts DESC LIMIT :lim")
-        params["end"] = _dt(end)
-    else:
-        q = text(_NAV_BASE + "ORDER BY o.ts DESC LIMIT :lim")
-
-    rows = (await session.execute(q, params)).all()
+    rows = (
+        await session.execute(
+            _NAV_SQL,
+            {
+                "eid": entity_id,
+                "start": _dt(start) if start else None,
+                "end": _dt(end) if end else None,
+                "lim": min(limit, 2000),
+            },
+        )
+    ).all()
     return [NavPoint(ts=r.d, price=Decimal(str(r.value))) for r in rows if r.value is not None]
 
 
@@ -136,22 +149,7 @@ async def get_entity_fundamentals(
     session: AsyncSession,
     entity_id: UUID,
 ) -> list[FundamentalSnapshot]:
-    rows = (
-        await session.execute(
-            text(
-                "SELECT DISTINCT ON (sc.metric) "
-                "  sc.metric, o.value, o.ts::date AS d "
-                "FROM ts.observation o "
-                "JOIN ts.series_catalog sc ON sc.series_id = o.series_id "
-                "WHERE sc.entity_id = :eid "
-                "  AND sc.source_id = 'bist' "
-                "  AND sc.metric LIKE 'fundamental_%' "
-                "ORDER BY sc.metric, o.ts DESC"
-            ),
-            {"eid": entity_id},
-        )
-    ).all()
-
+    rows = (await session.execute(_FUNDAMENTALS_SQL, {"eid": entity_id})).all()
     return [
         FundamentalSnapshot(
             metric=r.metric.removeprefix("fundamental_"),
@@ -171,20 +169,15 @@ async def get_observation_series(
     end: date | None = None,
     limit: int = 500,
 ) -> list[tuple[date, Decimal]]:
-    params: dict[str, object] = {"sc": series_code, "lim": min(limit, 2000)}
-
-    if start and end:
-        q = text(_SERIES_BASE + "AND o.ts >= :start AND o.ts <= :end ORDER BY o.ts DESC LIMIT :lim")
-        params["start"] = _dt(start)
-        params["end"] = _dt(end)
-    elif start:
-        q = text(_SERIES_BASE + "AND o.ts >= :start ORDER BY o.ts DESC LIMIT :lim")
-        params["start"] = _dt(start)
-    elif end:
-        q = text(_SERIES_BASE + "AND o.ts <= :end ORDER BY o.ts DESC LIMIT :lim")
-        params["end"] = _dt(end)
-    else:
-        q = text(_SERIES_BASE + "ORDER BY o.ts DESC LIMIT :lim")
-
-    rows = (await session.execute(q, params)).all()
+    rows = (
+        await session.execute(
+            _SERIES_SQL,
+            {
+                "sc": series_code,
+                "start": _dt(start) if start else None,
+                "end": _dt(end) if end else None,
+                "lim": min(limit, 2000),
+            },
+        )
+    ).all()
     return [(r.d, Decimal(str(r.value))) for r in rows if r.value is not None]
