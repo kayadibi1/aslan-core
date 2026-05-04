@@ -36,26 +36,26 @@ from aslan_core.query.schemas import (
 
 
 def test_statement_type_values() -> None:
-    assert StatementType.IS.value == "is"
-    assert StatementType.BS.value == "bs"
-    assert StatementType.CF.value == "cf"
+    assert str(StatementType.IS) == "is"
+    assert str(StatementType.BS) == "bs"
+    assert str(StatementType.CF) == "cf"
 
 
 def test_period_type_values() -> None:
-    assert PeriodType.QUARTERLY.value == "q"
-    assert PeriodType.HALF_YEAR.value == "h"
-    assert PeriodType.ANNUAL.value == "y"
-    assert PeriodType.YTD.value == "ytd"
+    assert str(PeriodType.QUARTERLY) == "q"
+    assert str(PeriodType.HALF_YEAR) == "h"
+    assert str(PeriodType.ANNUAL) == "y"
+    assert str(PeriodType.YTD) == "ytd"
 
 
 def test_restatement_basis_values() -> None:
-    assert RestatementBasis.AS_REPORTED.value == "as_reported"
-    assert RestatementBasis.CPI_NORMALIZED.value == "cpi_normalized"
+    assert str(RestatementBasis.AS_REPORTED) == "as_reported"
+    assert str(RestatementBasis.CPI_NORMALIZED) == "cpi_normalized"
 
 
 def test_consolidation_values() -> None:
-    assert Consolidation.CONSOLIDATED.value == "consolidated"
-    assert Consolidation.UNCONSOLIDATED.value == "unconsolidated"
+    assert str(Consolidation.CONSOLIDATED) == "consolidated"
+    assert str(Consolidation.UNCONSOLIDATED) == "unconsolidated"
 
 
 # ---------------------------------------------------------------------------
