@@ -126,6 +126,51 @@ async def get_fund_nav(
     return [NavPoint(ts=r.d, price=Decimal(str(r.value))) for r in rows if r.value is not None]
 
 
+@dataclass(frozen=True)
+class FundamentalSnapshot:
+    metric: str
+    value: Decimal
+    as_of: date
+
+
+async def get_entity_fundamentals(
+    session: AsyncSession,
+    entity_id: UUID,
+) -> list[FundamentalSnapshot]:
+    """Get latest fundamental metrics for an entity (P/E, P/B, market cap, etc.).
+
+    Queries ``ts.observation`` joined with ``ts.series_catalog`` for rows
+    where ``source_id='bist'`` and the metric starts with ``fundamental_``.
+    Uses ``DISTINCT ON`` to return only the most recent value per metric.
+    The ``fundamental_`` prefix is stripped for cleaner output names.
+    """
+    rows = (
+        await session.execute(
+            text(
+                "SELECT DISTINCT ON (sc.metric) "
+                "  sc.metric, o.value, o.ts::date AS d "
+                "FROM ts.observation o "
+                "JOIN ts.series_catalog sc ON sc.series_id = o.series_id "
+                "WHERE sc.entity_id = :eid "
+                "  AND sc.source_id = 'bist' "
+                "  AND sc.metric LIKE 'fundamental_%' "
+                "ORDER BY sc.metric, o.ts DESC"
+            ),
+            {"eid": entity_id},
+        )
+    ).all()
+
+    return [
+        FundamentalSnapshot(
+            metric=r.metric.removeprefix("fundamental_"),
+            value=Decimal(str(r.value)),
+            as_of=r.d,
+        )
+        for r in rows
+        if r.value is not None
+    ]
+
+
 async def get_observation_series(
     session: AsyncSession,
     series_code: str,

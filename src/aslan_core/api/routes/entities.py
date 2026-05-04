@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from aslan_core.api.deps import get_current_user, get_session
 from aslan_core.query.entity import get_entity_quality, list_entities
 from aslan_core.query.financials import get_entity_financials
-from aslan_core.query.prices import get_fund_nav, get_stock_prices
+from aslan_core.query.prices import get_entity_fundamentals, get_fund_nav, get_stock_prices
 from aslan_core.query.schemas import (
     Consolidation,
     EntitySummary,
@@ -52,6 +52,13 @@ class NavPointResponse(BaseModel):
     model_config = ConfigDict(frozen=True)
     ts: date
     price: Decimal
+
+
+class FundamentalSnapshotResponse(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    metric: str
+    value: Decimal
+    as_of: date
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +186,28 @@ async def entity_nav_endpoint(
     uid = _parse_uuid(entity_id)
     points = await get_fund_nav(session, uid, start=start, end=end, limit=limit)
     return [NavPointResponse(ts=p.ts, price=p.price) for p in points]
+
+
+@router.get(
+    "/{entity_id}/fundamentals-snapshot",
+    response_model=list[FundamentalSnapshotResponse],
+)
+async def entity_fundamentals_snapshot_endpoint(
+    entity_id: str,
+    current_user: Principal = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> list[FundamentalSnapshotResponse]:
+    """Latest fundamental metrics snapshot (P/E, P/B, ROE, market cap, etc.)."""
+    uid = _parse_uuid(entity_id)
+    snapshots = await get_entity_fundamentals(session, uid)
+    return [
+        FundamentalSnapshotResponse(
+            metric=s.metric,
+            value=s.value,
+            as_of=s.as_of,
+        )
+        for s in snapshots
+    ]
 
 
 __all__ = ["router"]
