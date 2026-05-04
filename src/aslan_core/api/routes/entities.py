@@ -1,16 +1,19 @@
-"""Entity routes: listing, financials, quality scores."""
+"""Entity routes: listing, financials, quality scores, prices, NAV."""
 
 from __future__ import annotations
 
+from datetime import date
+from decimal import Decimal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aslan_core.api.deps import get_current_user, get_session
 from aslan_core.query.entity import get_entity_quality, list_entities
 from aslan_core.query.financials import get_entity_financials
+from aslan_core.query.prices import get_fund_nav, get_stock_prices
 from aslan_core.query.schemas import (
     Consolidation,
     EntitySummary,
@@ -33,6 +36,22 @@ router = APIRouter()
 class EntityListResponse(BaseModel):
     items: list[EntitySummary]
     total: int
+
+
+class PricePointResponse(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    ts: date
+    open: Decimal | None
+    high: Decimal | None
+    low: Decimal | None
+    close: Decimal | None
+    volume: Decimal | None
+
+
+class NavPointResponse(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    ts: date
+    price: Decimal
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +144,41 @@ async def entity_quality_endpoint(
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@router.get("/{entity_id}/prices", response_model=list[PricePointResponse])
+async def entity_prices_endpoint(
+    entity_id: str,
+    start: date | None = Query(default=None),
+    end: date | None = Query(default=None),
+    limit: int = Query(default=250, ge=1, le=2000),
+    current_user: Principal = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> list[PricePointResponse]:
+    """Daily OHLCV price history for a BIST-listed entity."""
+    uid = _parse_uuid(entity_id)
+    points = await get_stock_prices(session, uid, start=start, end=end, limit=limit)
+    return [
+        PricePointResponse(
+            ts=p.ts, open=p.open, high=p.high, low=p.low, close=p.close, volume=p.volume
+        )
+        for p in points
+    ]
+
+
+@router.get("/{entity_id}/nav", response_model=list[NavPointResponse])
+async def entity_nav_endpoint(
+    entity_id: str,
+    start: date | None = Query(default=None),
+    end: date | None = Query(default=None),
+    limit: int = Query(default=250, ge=1, le=2000),
+    current_user: Principal = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> list[NavPointResponse]:
+    """Daily NAV history for a TEFAS fund entity."""
+    uid = _parse_uuid(entity_id)
+    points = await get_fund_nav(session, uid, start=start, end=end, limit=limit)
+    return [NavPointResponse(ts=p.ts, price=p.price) for p in points]
 
 
 __all__ = ["router"]
