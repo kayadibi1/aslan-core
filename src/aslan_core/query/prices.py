@@ -1,8 +1,4 @@
-"""Query functions for price and NAV time-series data.
-
-Reads from ts.observation + ts.series_catalog for BIST stock prices
-and TEFAS fund NAV data.
-"""
+"""Query functions for price, NAV, and fundamentals time-series data."""
 
 from __future__ import annotations
 
@@ -31,6 +27,39 @@ class NavPoint:
     price: Decimal
 
 
+@dataclass(frozen=True)
+class FundamentalSnapshot:
+    metric: str
+    value: Decimal
+    as_of: date
+
+
+def _dt(d: date) -> datetime:
+    return datetime(d.year, d.month, d.day, tzinfo=UTC)
+
+
+_PRICE_BASE = (
+    "SELECT o.ts::date AS d, sc.metric, o.value "
+    "FROM ts.observation o "
+    "JOIN ts.series_catalog sc ON sc.series_id = o.series_id "
+    "WHERE sc.entity_id = :eid AND sc.source_id = 'bist' "
+)
+
+_NAV_BASE = (
+    "SELECT o.ts::date AS d, o.value "
+    "FROM ts.observation o "
+    "JOIN ts.series_catalog sc ON sc.series_id = o.series_id "
+    "WHERE sc.entity_id = :eid AND sc.source_id = 'tefas' AND sc.metric = 'nav' "
+)
+
+_SERIES_BASE = (
+    "SELECT o.ts::date AS d, o.value "
+    "FROM ts.observation o "
+    "JOIN ts.series_catalog sc ON sc.series_id = o.series_id "
+    "WHERE sc.series_code = :sc "
+)
+
+
 async def get_stock_prices(
     session: AsyncSession,
     entity_id: UUID,
@@ -40,30 +69,21 @@ async def get_stock_prices(
     limit: int = 500,
 ) -> list[PricePoint]:
     params: dict[str, object] = {"eid": entity_id, "lim": min(limit, 2000)}
-    conditions = ["sc.entity_id = :eid", "sc.source_id = 'bist'"]
 
-    if start:
-        conditions.append("o.ts >= :start")
-        params["start"] = datetime(start.year, start.month, start.day, tzinfo=UTC)
-    if end:
-        conditions.append("o.ts <= :end")
-        params["end"] = datetime(end.year, end.month, end.day, tzinfo=UTC)
+    if start and end:
+        q = text(_PRICE_BASE + "AND o.ts >= :start AND o.ts <= :end ORDER BY o.ts DESC LIMIT :lim")
+        params["start"] = _dt(start)
+        params["end"] = _dt(end)
+    elif start:
+        q = text(_PRICE_BASE + "AND o.ts >= :start ORDER BY o.ts DESC LIMIT :lim")
+        params["start"] = _dt(start)
+    elif end:
+        q = text(_PRICE_BASE + "AND o.ts <= :end ORDER BY o.ts DESC LIMIT :lim")
+        params["end"] = _dt(end)
+    else:
+        q = text(_PRICE_BASE + "ORDER BY o.ts DESC LIMIT :lim")
 
-    where = " AND ".join(conditions)
-
-    rows = (
-        await session.execute(
-            text(
-                f"SELECT o.ts::date AS d, sc.metric, o.value "  # noqa: S608
-                f"FROM ts.observation o "
-                f"JOIN ts.series_catalog sc ON sc.series_id = o.series_id "
-                f"WHERE {where} "
-                f"ORDER BY o.ts DESC "
-                f"LIMIT :lim"
-            ),
-            params,
-        )
-    ).all()
+    rows = (await session.execute(q, params)).all()
 
     by_date: dict[date, dict[str, Decimal]] = {}
     for r in rows:
@@ -94,56 +114,28 @@ async def get_fund_nav(
     limit: int = 500,
 ) -> list[NavPoint]:
     params: dict[str, object] = {"eid": entity_id, "lim": min(limit, 2000)}
-    conditions = [
-        "sc.entity_id = :eid",
-        "sc.source_id = 'tefas'",
-        "sc.metric = 'nav'",
-    ]
 
-    if start:
-        conditions.append("o.ts >= :start")
-        params["start"] = datetime(start.year, start.month, start.day, tzinfo=UTC)
-    if end:
-        conditions.append("o.ts <= :end")
-        params["end"] = datetime(end.year, end.month, end.day, tzinfo=UTC)
+    if start and end:
+        q = text(_NAV_BASE + "AND o.ts >= :start AND o.ts <= :end ORDER BY o.ts DESC LIMIT :lim")
+        params["start"] = _dt(start)
+        params["end"] = _dt(end)
+    elif start:
+        q = text(_NAV_BASE + "AND o.ts >= :start ORDER BY o.ts DESC LIMIT :lim")
+        params["start"] = _dt(start)
+    elif end:
+        q = text(_NAV_BASE + "AND o.ts <= :end ORDER BY o.ts DESC LIMIT :lim")
+        params["end"] = _dt(end)
+    else:
+        q = text(_NAV_BASE + "ORDER BY o.ts DESC LIMIT :lim")
 
-    where = " AND ".join(conditions)
-
-    rows = (
-        await session.execute(
-            text(
-                f"SELECT o.ts::date AS d, o.value "  # noqa: S608
-                f"FROM ts.observation o "
-                f"JOIN ts.series_catalog sc ON sc.series_id = o.series_id "
-                f"WHERE {where} "
-                f"ORDER BY o.ts DESC "
-                f"LIMIT :lim"
-            ),
-            params,
-        )
-    ).all()
-
+    rows = (await session.execute(q, params)).all()
     return [NavPoint(ts=r.d, price=Decimal(str(r.value))) for r in rows if r.value is not None]
-
-
-@dataclass(frozen=True)
-class FundamentalSnapshot:
-    metric: str
-    value: Decimal
-    as_of: date
 
 
 async def get_entity_fundamentals(
     session: AsyncSession,
     entity_id: UUID,
 ) -> list[FundamentalSnapshot]:
-    """Get latest fundamental metrics for an entity (P/E, P/B, market cap, etc.).
-
-    Queries ``ts.observation`` joined with ``ts.series_catalog`` for rows
-    where ``source_id='bist'`` and the metric starts with ``fundamental_``.
-    Uses ``DISTINCT ON`` to return only the most recent value per metric.
-    The ``fundamental_`` prefix is stripped for cleaner output names.
-    """
     rows = (
         await session.execute(
             text(
@@ -180,29 +172,19 @@ async def get_observation_series(
     limit: int = 500,
 ) -> list[tuple[date, Decimal]]:
     params: dict[str, object] = {"sc": series_code, "lim": min(limit, 2000)}
-    conditions = ["sc.series_code = :sc"]
 
-    if start:
-        conditions.append("o.ts >= :start")
-        params["start"] = datetime(start.year, start.month, start.day, tzinfo=UTC)
-    if end:
-        conditions.append("o.ts <= :end")
-        params["end"] = datetime(end.year, end.month, end.day, tzinfo=UTC)
+    if start and end:
+        q = text(_SERIES_BASE + "AND o.ts >= :start AND o.ts <= :end ORDER BY o.ts DESC LIMIT :lim")
+        params["start"] = _dt(start)
+        params["end"] = _dt(end)
+    elif start:
+        q = text(_SERIES_BASE + "AND o.ts >= :start ORDER BY o.ts DESC LIMIT :lim")
+        params["start"] = _dt(start)
+    elif end:
+        q = text(_SERIES_BASE + "AND o.ts <= :end ORDER BY o.ts DESC LIMIT :lim")
+        params["end"] = _dt(end)
+    else:
+        q = text(_SERIES_BASE + "ORDER BY o.ts DESC LIMIT :lim")
 
-    where = " AND ".join(conditions)
-
-    rows = (
-        await session.execute(
-            text(
-                f"SELECT o.ts::date AS d, o.value "  # noqa: S608
-                f"FROM ts.observation o "
-                f"JOIN ts.series_catalog sc ON sc.series_id = o.series_id "
-                f"WHERE {where} "
-                f"ORDER BY o.ts DESC "
-                f"LIMIT :lim"
-            ),
-            params,
-        )
-    ).all()
-
+    rows = (await session.execute(q, params)).all()
     return [(r.d, Decimal(str(r.value))) for r in rows if r.value is not None]
