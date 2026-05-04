@@ -132,7 +132,7 @@ class TimeseriesPoint(BaseModel):
 class QualityCheckPublic(BaseModel):
     """Result of a single data-quality check, safe to expose externally."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="ignore")
 
     state: str
     delta_pct: float | None = None

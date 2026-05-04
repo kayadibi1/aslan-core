@@ -113,12 +113,7 @@ WHERE cf.entity_id          = :entity_id
   AND cf.period_type        = :period_type
   AND cf.restatement_basis  = :restatement_basis
   AND cf.consolidation      = :consolidation
-  AND cf.canonical_code IN (
-      SELECT DISTINCT fli.line_code
-      FROM ts.financial_line_item fli
-      WHERE fli.entity_id       = :entity_id
-        AND fli.statement_type  = :statement_type
-  )
+  AND cf.canonical_code LIKE :statement_prefix
 ORDER BY
     cf.canonical_code,
     cf.period_end,
@@ -155,7 +150,7 @@ async def get_entity_financials(
 
     if statement_type is not None:
         stmt = _ENTITY_FINANCIALS_STMT_SQL
-        params["statement_type"] = statement_type.value
+        params["statement_prefix"] = f"{statement_type.value}.%"
     else:
         stmt = _ENTITY_FINANCIALS_SQL
 

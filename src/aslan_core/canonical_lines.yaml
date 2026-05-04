@@ -1,0 +1,1034 @@
+manifest_version: 1
+mapping_released_at: "2026-05-03T12:00:00Z"
+sector: industrial
+# manifest_hash is computed externally at load time (SHA-256 of the
+# file contents) — not stored inside the YAML to avoid circularity.
+
+lines:
+
+  # ---------------------------------------------------------------------------
+  # Income Statement
+  # ---------------------------------------------------------------------------
+
+  is.revenue:
+    statement_type: is
+    description: "Revenue / Net sales"
+    sign_convention: positive
+    monetary: false
+    computed: false
+    required: true
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_Revenue
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  is.cost_of_sales:
+    statement_type: is
+    description: "Cost of sales"
+    sign_convention: negative
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_CostOfSales
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  is.gross_profit:
+    statement_type: is
+    description: "Gross profit"
+    sign_convention: positive
+    monetary: false
+    computed: false
+    required: true
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_GrossProfit
+    formula: null
+    mutual_exclusion: []
+    derived_check: "is.revenue + is.cost_of_sales"
+
+  is.selling_expense:
+    statement_type: is
+    description: "Selling / marketing expense"
+    sign_convention: negative
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - kap-fr_MarketingExpense
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  is.admin_expense:
+    statement_type: is
+    description: "General & administrative expense"
+    sign_convention: negative
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_AdministrativeExpense
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  is.rd_expense:
+    statement_type: is
+    description: "Research & development expense"
+    sign_convention: negative
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_ResearchAndDevelopmentExpense
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  is.other_income:
+    statement_type: is
+    description: "Other operating income"
+    sign_convention: positive
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_OtherIncome
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  is.other_expense:
+    statement_type: is
+    description: "Other operating expense"
+    sign_convention: negative
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_OtherExpenseByFunction
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  is.operating_profit:
+    statement_type: is
+    description: "Profit from operations (EBIT)"
+    sign_convention: any
+    monetary: false
+    computed: false
+    required: true
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_ProfitLossFromOperatingActivities
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  is.finance_income:
+    statement_type: is
+    description: "Finance income"
+    sign_convention: positive
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_FinanceIncome
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  is.finance_cost:
+    statement_type: is
+    description: "Finance costs"
+    sign_convention: negative
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_FinanceCosts
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  is.fx_gain_loss:
+    statement_type: is
+    description: "FX gains / losses (net)"
+    sign_convention: any
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - kap-fr_ForeignExchangeLosses
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  is.equity_method:
+    statement_type: is
+    description: "Share of profit / loss of associates and JVs (equity method)"
+    sign_convention: any
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_ShareOfProfitLossOfAssociatesAndJointVenturesAccountedForUsingEquityMethod
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  is.monetary_gain_loss:
+    statement_type: is
+    description: "Net monetary gain / loss (TAS 29 / IAS 29)"
+    sign_convention: any
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_GainsLossesOnNetMonetaryPosition
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  is.pbt:
+    statement_type: is
+    description: "Profit before tax"
+    sign_convention: any
+    monetary: false
+    computed: false
+    required: true
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_ProfitLossBeforeTax
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  is.tax_expense:
+    statement_type: is
+    description: "Income tax expense"
+    sign_convention: negative
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_IncomeTaxExpenseContinuingOperations
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  is.net_income_continuing:
+    statement_type: is
+    description: "Net income from continuing operations"
+    sign_convention: any
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_ProfitLossFromContinuingOperations
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  is.net_income_discontinued:
+    statement_type: is
+    description: "Net income from discontinued operations"
+    sign_convention: any
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_ProfitLossFromDiscontinuedOperations
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  is.net_income:
+    statement_type: is
+    description: "Net income (profit / loss for the period)"
+    sign_convention: any
+    monetary: false
+    computed: false
+    required: true
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_ProfitLoss
+    formula: null
+    mutual_exclusion: []
+    derived_check: "is.net_income_parent + is.net_income_nci"
+
+  is.net_income_parent:
+    statement_type: is
+    description: "Net income attributable to owners of the parent"
+    sign_convention: any
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_ProfitLossAttributableToOwnersOfParent
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  is.net_income_nci:
+    statement_type: is
+    description: "Net income attributable to non-controlling interests"
+    sign_convention: any
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_ProfitLossAttributableToNoncontrollingInterests
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  is.basic_eps:
+    statement_type: is
+    description: "Basic earnings per share (continuing operations)"
+    sign_convention: any
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_BasicEarningsLossPerShareFromContinuingOperations
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  is.diluted_eps:
+    statement_type: is
+    description: "Diluted earnings per share (continuing operations)"
+    sign_convention: any
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_DilutedEarningsLossPerShareFromContinuingOperations
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  is.ebitda:
+    statement_type: is
+    description: "EBITDA (computed: operating profit + D&A add-back from CF)"
+    sign_convention: any
+    monetary: false
+    computed: true
+    required: false
+    aggregation_mode: null
+    sources: []
+    # cf.depreciation is normalized to a positive value (add-back) before
+    # applying this formula. If cf.depreciation is missing, result is NULL.
+    formula: "is.operating_profit + cf.depreciation"
+    mutual_exclusion: []
+    derived_check: null
+
+  is.provision_expense:
+    statement_type: is
+    description: "Provision expenses"
+    sign_convention: negative
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - kap-fr_ProvisionExpenses
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  # ---------------------------------------------------------------------------
+  # Balance Sheet
+  # ---------------------------------------------------------------------------
+
+  bs.cash:
+    statement_type: bs
+    description: "Cash and cash equivalents"
+    sign_convention: positive
+    monetary: true
+    computed: false
+    required: true
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_CashAndCashEquivalents
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.trade_receivables_current:
+    statement_type: bs
+    description: "Trade receivables (current)"
+    sign_convention: positive
+    monetary: true
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_CurrentTradeReceivables
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.financial_assets_fvpl_current:
+    statement_type: bs
+    description: "Current financial assets at fair value through profit or loss (FVPL)"
+    sign_convention: positive
+    monetary: true
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_CurrentFinancialAssetsAtFairValueThroughProfitOrLoss
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.financial_assets_fvoci_current:
+    statement_type: bs
+    description: "Current financial assets at fair value through other comprehensive income (FVOCI)"
+    sign_convention: positive
+    monetary: true
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_CurrentFinancialAssetsAtFairValueThroughOtherComprehensiveIncome
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.inventories:
+    statement_type: bs
+    description: "Inventories"
+    sign_convention: positive
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_Inventories
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.current_tax_assets:
+    statement_type: bs
+    description: "Current tax assets"
+    sign_convention: positive
+    monetary: true
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_CurrentTaxAssetsCurrent
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.other_current_assets:
+    statement_type: bs
+    description: "Other current assets (residual: current_assets minus known current asset components)"
+    sign_convention: positive
+    monetary: false
+    computed: false
+    required: false
+    # Residual: parent (bs.current_assets) minus all other known current asset lines.
+    aggregation_mode: residual
+    sources: []
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.current_assets:
+    statement_type: bs
+    description: "Total current assets"
+    sign_convention: positive
+    monetary: false   # mixed monetary/non-monetary components
+    computed: false
+    required: true
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_CurrentAssets
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.ppe:
+    statement_type: bs
+    description: "Property, plant and equipment"
+    sign_convention: positive
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_PropertyPlantAndEquipment
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.intangibles:
+    statement_type: bs
+    description: "Intangible assets and goodwill"
+    sign_convention: positive
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_IntangibleAssetsAndGoodwill
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.investment_property:
+    statement_type: bs
+    description: "Investment property"
+    sign_convention: positive
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_InvestmentProperty
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.investments_associates:
+    statement_type: bs
+    description: "Investments in subsidiaries, joint ventures and associates"
+    sign_convention: positive
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_InvestmentsInSubsidiariesJointVenturesAndAssociates
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.deferred_tax_assets:
+    statement_type: bs
+    description: "Deferred tax assets"
+    sign_convention: positive
+    monetary: true
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_DeferredTaxAssets
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.rou_assets:
+    statement_type: bs
+    description: "Right-of-use assets (IFRS 16)"
+    sign_convention: positive
+    monetary: false
+    computed: false
+    required: false
+    # Source tag to be verified against KAP XBRL taxonomy
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_RightOfUseAssets
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.total_assets:
+    statement_type: bs
+    description: "Total assets"
+    sign_convention: positive
+    monetary: false   # mixed monetary/non-monetary components
+    computed: false
+    required: true
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_Assets
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.trade_payables_current:
+    statement_type: bs
+    description: "Trade payables (current)"
+    sign_convention: positive
+    monetary: true
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - kap-fr_CurrentTradePayables
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.short_term_borrowings:
+    statement_type: bs
+    description: "Short-term borrowings (sum of current portion of non-current borrowings + current borrowings from unrelated and related parties)"
+    sign_convention: positive
+    monetary: true
+    computed: false
+    required: true
+    aggregation_mode: sum_components
+    sources:
+      - kap-fr_CurrentPortionOfNoncurrentBorrowings
+      - kap-fr_CurrentBorrowingsFromUnrelatedParties
+      - kap-fr_CurrentBorrowingsFromRelatedParties
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.current_lease_liabilities:
+    statement_type: bs
+    description: "Current lease liabilities (IFRS 16)"
+    sign_convention: positive
+    monetary: true
+    computed: false
+    required: false
+    # Source tag to be verified against KAP XBRL taxonomy
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_CurrentLeaseLiabilities
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.derivative_liabilities_current:
+    statement_type: bs
+    description: "Current derivative financial liabilities"
+    sign_convention: positive
+    monetary: true
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_CurrentDerivativeFinancialLiabilities
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.current_liabilities:
+    statement_type: bs
+    description: "Total current liabilities"
+    sign_convention: positive
+    monetary: false   # mixed monetary/non-monetary components
+    computed: false
+    required: true
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_CurrentLiabilities
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.deferred_tax_liabilities:
+    statement_type: bs
+    description: "Deferred tax liabilities"
+    sign_convention: positive
+    monetary: true
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_DeferredTaxLiabilities
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.long_term_borrowings:
+    statement_type: bs
+    description: "Long-term borrowings (non-current)"
+    sign_convention: positive
+    monetary: true
+    computed: false
+    required: true
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_LongtermBorrowings
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.noncurrent_lease_liabilities:
+    statement_type: bs
+    description: "Non-current lease liabilities (IFRS 16)"
+    sign_convention: positive
+    monetary: true
+    computed: false
+    required: false
+    # Source tag to be verified against KAP XBRL taxonomy
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_NoncurrentLeaseLiabilities
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.total_liabilities:
+    statement_type: bs
+    description: "Total liabilities"
+    sign_convention: positive
+    monetary: false   # mixed monetary/non-monetary components
+    computed: false
+    required: true
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_Liabilities
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.total_equity:
+    statement_type: bs
+    description: "Total equity"
+    sign_convention: positive
+    monetary: false
+    computed: false
+    required: true
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_Equity
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.issued_capital:
+    statement_type: bs
+    description: "Issued capital"
+    sign_convention: positive
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_IssuedCapital
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.share_premium:
+    statement_type: bs
+    description: "Share premium"
+    sign_convention: positive
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_SharePremium
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.retained_earnings:
+    statement_type: bs
+    description: "Retained earnings (prior years' profits or losses)"
+    sign_convention: any
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - kap-fr_PriorYearsProfitsOrLosses
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.current_period_pnl:
+    statement_type: bs
+    description: "Current period net profit or loss classified in equity"
+    sign_convention: any
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - kap-fr_CurrentPeriodNetProfitOrLossClassifiedInEquity
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.legal_reserves:
+    statement_type: bs
+    description: "Legal reserves"
+    sign_convention: positive
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - kap-fr_LegalReserves
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.inflation_adj_capital:
+    statement_type: bs
+    description: "Inflation adjustments on capital (TAS 29)"
+    sign_convention: any
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - kap-fr_InflationAdjustmentsOnCapital
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.nci:
+    statement_type: bs
+    description: "Non-controlling interests"
+    sign_convention: any
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_NoncontrollingInterests
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.total_equity_and_liabilities:
+    statement_type: bs
+    description: "Total equity and liabilities"
+    sign_convention: positive
+    monetary: false   # mixed monetary/non-monetary components
+    computed: false
+    required: true
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_EquityAndLiabilities
+    formula: null
+    mutual_exclusion: []
+    derived_check: "bs.total_assets"
+
+  bs.total_borrowings:
+    statement_type: bs
+    description: "Total borrowings (computed: short-term + long-term)"
+    sign_convention: positive
+    monetary: true
+    computed: true
+    required: false
+    aggregation_mode: null
+    sources: []
+    formula: "bs.short_term_borrowings + bs.long_term_borrowings"
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.net_debt:
+    statement_type: bs
+    description: "Net debt (computed: total borrowings minus cash)"
+    sign_convention: any
+    monetary: false
+    computed: true
+    required: false
+    aggregation_mode: null
+    sources: []
+    formula: "bs.total_borrowings - bs.cash"
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.net_debt_incl_leases:
+    statement_type: bs
+    description: "Net debt including lease liabilities (computed)"
+    sign_convention: any
+    monetary: false
+    computed: true
+    required: false
+    aggregation_mode: null
+    sources: []
+    formula: "bs.total_borrowings + bs.current_lease_liabilities + bs.noncurrent_lease_liabilities - bs.cash"
+    mutual_exclusion: []
+    derived_check: null
+
+  bs.working_capital:
+    statement_type: bs
+    description: "Working capital (computed: current assets minus current liabilities)"
+    sign_convention: any
+    monetary: false
+    computed: true
+    required: false
+    aggregation_mode: null
+    sources: []
+    formula: "bs.current_assets - bs.current_liabilities"
+    mutual_exclusion: []
+    derived_check: null
+
+  # ---------------------------------------------------------------------------
+  # Cash Flow Statement
+  # ---------------------------------------------------------------------------
+
+  cf.operating:
+    statement_type: cf
+    description: "Net cash from / used in operating activities"
+    sign_convention: any
+    monetary: false
+    computed: false
+    required: true
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_CashFlowsFromUsedInOperatingActivities
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  cf.investing:
+    statement_type: cf
+    description: "Net cash from / used in investing activities"
+    sign_convention: any
+    monetary: false
+    computed: false
+    required: true
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_CashFlowsFromUsedInInvestingActivities
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  cf.financing:
+    statement_type: cf
+    description: "Net cash from / used in financing activities"
+    sign_convention: any
+    monetary: false
+    computed: false
+    required: true
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_CashFlowsFromUsedInFinancingActivities
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  cf.net_change:
+    statement_type: cf
+    description: "Net increase / decrease in cash and cash equivalents"
+    sign_convention: any
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_IncreaseDecreaseInCashAndCashEquivalents
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  cf.depreciation:
+    statement_type: cf
+    description: "Adjustments for depreciation and amortisation (CF add-back)"
+    sign_convention: any
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - ifrs-full_AdjustmentsForDepreciationAndAmortisationExpense
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  cf.monetary_adjustment:
+    statement_type: cf
+    description: "CF adjustment for monetary gain / loss on net monetary position (TAS 29)"
+    sign_convention: any
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - kap-fr_AdjustmentsRelatedtoGainandLossesonNetMonetaryPosition
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  cf.inflation_effect_operating:
+    statement_type: cf
+    description: "Inflation effect on operating activities (TAS 29 CF adjustment)"
+    sign_convention: any
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - kap-fr_InflationEffectOnOperatingActivities
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  cf.inflation_effect_investing:
+    statement_type: cf
+    description: "Inflation effect on investing activities (TAS 29 CF adjustment)"
+    sign_convention: any
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - kap-fr_InflationEffectOnInvestingActivities
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  cf.inflation_effect_financing:
+    statement_type: cf
+    description: "Inflation effect on financing activities (TAS 29 CF adjustment)"
+    sign_convention: any
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - kap-fr_InflationEffectOnFinancingActivities
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  cf.inflation_effect_cash:
+    statement_type: cf
+    description: "Inflation effect on cash and cash equivalents (TAS 29 CF adjustment)"
+    sign_convention: any
+    monetary: false
+    computed: false
+    required: false
+    aggregation_mode: pick_first
+    sources:
+      - kap-fr_InflationEffectOnCashAndCashEquivalents
+    formula: null
+    mutual_exclusion: []
+    derived_check: null
+
+  # cf.capex: TODO — capital expenditure requires sub-line sources
+  # (purchase of PPE + purchase of intangibles from the CF investing section).
+  # These are not yet defined as separate canonical lines. Add cf.capex once
+  # the sub-line sources are identified and added to the manifest.
