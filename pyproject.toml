@@ -106,11 +106,14 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "S105", "S106", "RUF001", "RUF002", "RUF003"]
+"tests/**" = ["S101", "S105", "S106", "S107", "RUF001", "RUF002", "RUF003"]
 "src/aslan_core/db/migrations/versions/*.py" = ["E501"]   # generated migrations may exceed 100
 # PII regex + comments deliberately use Turkish characters (ÇĞİÖŞÜ + lowercase)
 # that ruff flags as ambiguous against ASCII look-alikes.
 "src/aslan_core/timeseries/pii.py" = ["RUF001", "RUF002", "RUF003"]
+# FastAPI Depends() / Query() in default args is the canonical DI pattern;
+# suppress B008 across all API route and dependency modules.
+"src/aslan_core/api/**" = ["B008"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -163,12 +166,25 @@ ignore_missing_imports = true
 
 # [api] extra — python-jose and passlib do not ship py.typed markers;
 # mypy strict mode cannot analyse them on a base venv install.
+# fastapi ships py.typed but its decorator signatures are untyped under
+# strict; suppress via ignore_missing_imports for consistency.
 [[tool.mypy.overrides]]
 module = [
     "jose.*",
     "passlib.*",
+    "fastapi.*",
 ]
 ignore_missing_imports = true
+
+# [api] FastAPI's @router.get / @app.exception_handler decorators are
+# not fully typed under strict; suppress [misc] for decorated route and
+# middleware modules.  The factory + deps are still fully checked.
+[[tool.mypy.overrides]]
+module = [
+    "aslan_core.api.middleware",
+    "aslan_core.api.routes.*",
+]
+disallow_untyped_decorators = false
 
 # opentelemetry-instrumentation-* ships untyped __init__ args
 # (capture_parameters=False without a type annotation), so calling
