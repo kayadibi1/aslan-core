@@ -223,9 +223,12 @@ async def get_entity_quality(
 
     results: list[QualityScorePublic] = []
     for r in rows:
-        raw_checks: dict[str, dict[str, object]] = r.checks or {}
+        full_jsonb: dict[str, object] = r.checks or {}
+        inner_checks: dict[str, object] = full_jsonb.get("checks", {})  # type: ignore[assignment]
         public_checks: dict[str, QualityCheckPublic] = {}
-        for check_name, detail in raw_checks.items():
+        for check_name, detail in inner_checks.items():
+            if not isinstance(detail, dict):
+                continue
             public_checks[check_name] = QualityCheckPublic(
                 **{k: v for k, v in detail.items() if k in _CHECK_PUBLIC_KEYS},
             )
