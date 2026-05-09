@@ -9,8 +9,10 @@ they live in `_sql.py` to keep this module import-light.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from typing import Any
+from uuid import UUID
 
 
 class SyncRunStatus(StrEnum):
@@ -45,3 +47,23 @@ class ValidationFailure:
     detail: dict[str, Any]
     detected_at: str | None = None  # ISO-8601 UTC; default = inserted at now()
     failure_id: int | None = None  # populated by .check() after INSERT
+
+
+@dataclass(frozen=True, slots=True)
+class SpotCheckSample:
+    """One pending or labelled row from `audit.spot_check_sample`.
+
+    `record_pk` is the primary-key shape of the source row (e.g.
+    `{"disclosure_id": 12345}` for KAP), as deserialised JSON.
+    """
+
+    sample_id: UUID
+    source: str
+    drawn_at: datetime
+    record_table: str
+    record_pk: dict[str, Any]
+    stratum: str | None
+    labelled: bool
+    labelled_at: datetime | None
+    labeller: str | None
+    recorded_at: datetime

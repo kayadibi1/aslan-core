@@ -76,3 +76,38 @@ INSERT_RECENCY_OBSERVATION = text(
 SELECT_RECENCY_SLA = text(
     "SELECT source, dimension, sla_seconds FROM audit.recency_sla ORDER BY source, dimension"
 )
+
+# ── dq M2: spot-check workflow ───────────────────────────────────
+
+
+INSERT_SPOT_CHECK_SAMPLE = text(
+    "INSERT INTO audit.spot_check_sample("
+    "  source, drawn_at, record_table, record_pk, stratum"
+    ") VALUES ("
+    "  :source, :drawn_at, :record_table, CAST(:record_pk AS JSONB), :stratum"
+    ") RETURNING sample_id"
+)
+
+INSERT_SPOT_CHECK_RESULT = text(
+    "INSERT INTO audit.spot_check_result("
+    "  sample_id, field, db_value, truth_value, variance_pct, "
+    "  matches, label_note, labeller, label_event_id"
+    ") VALUES ("
+    "  :sample_id, :field, :db_value, :truth_value, :variance_pct, "
+    "  :matches, :label_note, :labeller, :label_event_id"
+    ") RETURNING result_id"
+)
+
+UPDATE_SPOT_CHECK_SAMPLE_LABELLED = text(
+    "UPDATE audit.spot_check_sample SET "
+    "  labelled = true, "
+    "  labelled_at = :labelled_at, "
+    "  labeller = :labeller "
+    "WHERE sample_id = :sample_id AND labelled = false"
+)
+
+SELECT_SPOT_CHECK_SAMPLE_BY_ID = text(
+    "SELECT sample_id, source, drawn_at, record_table, record_pk, "
+    "  stratum, labelled, labelled_at, labeller, recorded_at "
+    "FROM audit.spot_check_sample WHERE sample_id = :sample_id"
+)

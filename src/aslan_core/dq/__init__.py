@@ -7,36 +7,40 @@ module owns the operational tables (`audit.sync_log`,
 `audit.recency_observation`, `audit.coverage_snapshot`, …) that
 observe ingestion freshness, accuracy, and completeness.
 
-Public surface (M0):
+Public surface (M0+M2):
 
   * `sync_log.run(...)` — context manager for a puller invocation
   * `validation.check(table, record)` — in-line per-record validation
   * `coverage.snapshot(...)` — point-in-time roster comparison
   * `event.emit(...)` — catch-all event stream
+  * `spot_check.draw_sample(...)` / `label_field(...)` — manual
+    spot-check workflow (M2)
 
 Forward-deferred to later milestones:
 
-  * `spot_check.label_field(...)` (M2)
   * `regression.set_status(...)` (M5)
   * `bloomberg.record_aslan_value(...)` (M4)
 """
 
 from __future__ import annotations
 
-from aslan_core.dq import coverage, event, recency, sync_log, validation
+from aslan_core.dq import coverage, event, recency, spot_check, sync_log, validation
 from aslan_core.dq.types import (
     Severity,
+    SpotCheckSample,
     SyncRunStatus,
     ValidationFailure,
 )
 
 __all__ = [
     "Severity",
+    "SpotCheckSample",
     "SyncRunStatus",
     "ValidationFailure",
     "coverage",
     "event",
     "recency",
+    "spot_check",
     "sync_log",
     "validation",
 ]
