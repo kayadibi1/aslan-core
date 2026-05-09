@@ -49,3 +49,32 @@ async def test_existing_audit_events_unchanged(engine: AsyncEngine) -> None:
     """
     assert await _table_exists(engine, "audit", "events")
     assert await _table_exists(engine, "audit", "observation_batch_keys")
+
+
+async def test_recency_sla_table_exists(engine: AsyncEngine) -> None:
+    assert await _table_exists(engine, "audit", "recency_sla")
+
+
+async def test_recency_observation_table_exists(engine: AsyncEngine) -> None:
+    assert await _table_exists(engine, "audit", "recency_observation")
+
+
+async def test_evds_release_calendar_table_exists(engine: AsyncEngine) -> None:
+    assert await _table_exists(engine, "audit", "evds_release_calendar")
+
+
+async def test_recency_observation_is_hypertable(engine: AsyncEngine) -> None:
+    """audit.recency_observation must be a Timescale hypertable on observed_at
+    so chunk-based retention/compression can apply at scale (audit.* writes
+    are continuous; sweeps every 5 min × 5 sources = ~525K rows/year).
+    """
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT count(*) FROM timescaledb_information.hypertables "
+                    "WHERE hypertable_schema='audit' AND hypertable_name='recency_observation'"
+                )
+            )
+        ).scalar()
+    assert row == 1
