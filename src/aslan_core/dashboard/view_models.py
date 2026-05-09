@@ -538,6 +538,57 @@ class DqValidationVM(_VMBase):
     xs_skip_rows: list[DqXsRuleSkipRowVM]
 
 
+# ── DQ M6: weekly scorecard ───────────────────────────────────────
+
+
+class DqScorecardRowVM(_VMBase):
+    """One metric row on /dq/scorecard.
+
+    All fields are TEXT in the table so they carry units (``"<= 300s"``,
+    ``">= 95%"``) verbatim. Status is a closed enum so the renderer
+    can colour the cell from a fixed palette.
+    """
+
+    metric_name: str
+    target: str
+    actual: str
+    status: Literal["pass", "warn", "fail"]
+    notes: str | None
+
+
+class DqScorecardWeekSummaryVM(_VMBase):
+    """One historical week's pass/warn/fail roll-up for the history block."""
+
+    week_start: datetime
+    pass_count: int
+    warn_count: int
+    fail_count: int
+    total_count: int
+    recorded_at: datetime
+
+
+class DqScorecardVM(_VMBase):
+    """/dq/scorecard — current week + history + email-preview link."""
+
+    current_week_start: datetime
+    """The most-recent fully-completed week's Monday (UTC). The dashboard
+    shows this week's metrics in the top section."""
+
+    rows: list[DqScorecardRowVM]
+    """Rows for ``current_week_start``. Empty list when no scorecard has
+    been computed yet — the page renders a short prompt instead of the
+    table."""
+
+    pass_pct: float
+    pass_count: int
+    warn_count: int
+    fail_count: int
+
+    history: list[DqScorecardWeekSummaryVM]
+    """Past weeks, newest first. Click-through is a future enhancement;
+    v1 surfaces the roll-up only."""
+
+
 # ── DQ M0 stubs ────────────────────────────────────────────────────
 
 

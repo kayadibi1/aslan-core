@@ -41,6 +41,8 @@ output and constructs the final frozen VM at render time.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
+from datetime import date as date_cls
 from typing import Any
 from uuid import UUID
 
@@ -64,6 +66,9 @@ from aslan_core.dashboard.view_models import (
     DqRecencyRowVM,
     DqRecencyVM,
     DqRegressionFlagRowVM,
+    DqScorecardRowVM,
+    DqScorecardVM,
+    DqScorecardWeekSummaryVM,
     DqSpotCheckQueueVM,
     DqSpotCheckRecordPkPairVM,
     DqSpotCheckResultRowVM,
@@ -1201,6 +1206,153 @@ async def dq_validation(
     )
 
 
+# ── DQ M6: weekly scorecard ───────────────────────────────────────
+
+
+_SCORECARD_LATEST_WEEK_SQL = text(
+    "SELECT max(week_start) AS week_start FROM audit.scorecard_snapshot"
+)
+
+
+_SCORECARD_ROWS_BY_WEEK_SQL = text(
+    "SELECT week_start, metric_name, target, actual, status, notes "
+    "FROM audit.scorecard_snapshot "
+    "WHERE week_start = :week_start "
+    "ORDER BY metric_name"
+)
+
+
+_SCORECARD_HISTORY_SQL = text(
+    "SELECT week_start, "
+    "  count(*) FILTER (WHERE status = 'pass')::int AS pass_count, "
+    "  count(*) FILTER (WHERE status = 'warn')::int AS warn_count, "
+    "  count(*) FILTER (WHERE status = 'fail')::int AS fail_count, "
+    "  count(*)::int AS total_count, "
+    "  max(recorded_at) AS recorded_at "
+    "FROM audit.scorecard_snapshot "
+    "GROUP BY week_start "
+    "ORDER BY week_start DESC "
+    "LIMIT :limit"
+)
+
+
+_SCORECARD_LATEST_EVENT_SQL = text(
+    "SELECT payload, emitted_at FROM audit.event "
+    "WHERE event_type = 'scorecard_generated' "
+    "ORDER BY emitted_at DESC LIMIT 1"
+)
+
+
+def _date_to_dt(value: Any) -> datetime:
+    """Convert a ``DATE`` (or already-``datetime``) to an aware UTC ``datetime``.
+
+    The dashboard VM uses ``datetime`` (per the type-safety allowlist),
+    so we promote DATE columns at the query boundary.
+    """
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value
+    if isinstance(value, date_cls):
+        return datetime(value.year, value.month, value.day, tzinfo=UTC)
+    raise TypeError(f"unexpected week_start type {type(value)!r}")
+
+
+async def dq_scorecard(
+    session: AsyncSession,
+    *,
+    history_limit: int = 12,
+) -> DqScorecardVM:
+    """/dq/scorecard — current-week metrics + history roll-up.
+
+    Spec §10.8. The page is read-only; the cron writes new weeks. When
+    no scorecard rows exist (fresh DB / first deploy), the VM carries
+    an empty ``rows`` list and the renderer shows a short prompt.
+    """
+    latest_row = (await session.execute(_SCORECARD_LATEST_WEEK_SQL)).one_or_none()
+    if latest_row is None or latest_row.week_start is None:
+        # No scorecard yet — placeholder. Dashboard renders a short
+        # "run aslan-core audit scorecard to populate" prompt.
+        placeholder = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        return DqScorecardVM(
+            current_week_start=placeholder,
+            rows=[],
+            pass_pct=0.0,
+            pass_count=0,
+            warn_count=0,
+            fail_count=0,
+            history=[],
+        )
+    week_start_value = latest_row.week_start
+    rows_raw = (
+        await session.execute(
+            _SCORECARD_ROWS_BY_WEEK_SQL,
+            {"week_start": week_start_value},
+        )
+    ).all()
+    rows: list[DqScorecardRowVM] = [
+        DqScorecardRowVM(
+            metric_name=r.metric_name,
+            target=r.target,
+            actual=r.actual,
+            status=r.status,
+            notes=r.notes,
+        )
+        for r in rows_raw
+    ]
+    pass_count = sum(1 for r in rows if r.status == "pass")
+    warn_count = sum(1 for r in rows if r.status == "warn")
+    fail_count = sum(1 for r in rows if r.status == "fail")
+    pass_pct = (100.0 * pass_count / len(rows)) if rows else 0.0
+
+    history_raw = (
+        await session.execute(_SCORECARD_HISTORY_SQL, {"limit": history_limit})
+    ).all()
+    history: list[DqScorecardWeekSummaryVM] = [
+        DqScorecardWeekSummaryVM(
+            week_start=_date_to_dt(h.week_start),
+            pass_count=int(h.pass_count),
+            warn_count=int(h.warn_count),
+            fail_count=int(h.fail_count),
+            total_count=int(h.total_count),
+            recorded_at=h.recorded_at,
+        )
+        for h in history_raw
+    ]
+    return DqScorecardVM(
+        current_week_start=_date_to_dt(week_start_value),
+        rows=rows,
+        pass_pct=pass_pct,
+        pass_count=pass_count,
+        warn_count=warn_count,
+        fail_count=fail_count,
+        history=history,
+    )
+
+
+async def dq_scorecard_latest_email_body(session: AsyncSession) -> str | None:
+    """Latest ``audit.event(event_type='scorecard_generated')`` body_html.
+
+    Used by the /dq/scorecard ``Email preview`` button so the page can
+    render the exact HTML body the cron handed off to the email sink.
+    Returns None when no scorecard event has been emitted yet.
+    """
+    row = (await session.execute(_SCORECARD_LATEST_EVENT_SQL)).one_or_none()
+    if row is None or row.payload is None:
+        return None
+    payload = row.payload
+    if isinstance(payload, str):
+        payload_dict: dict[str, Any] = json.loads(payload)
+    elif isinstance(payload, dict):
+        payload_dict = payload
+    else:
+        return None
+    body = payload_dict.get("body_html")
+    if isinstance(body, str):
+        return body
+    return None
+
+
 __all__ = [
     "audit_recent",
     "deadletter_recent",
@@ -1210,6 +1362,8 @@ __all__ = [
     "dq_coverage",
     "dq_overview",
     "dq_recency",
+    "dq_scorecard",
+    "dq_scorecard_latest_email_body",
     "dq_spot_check_queue",
     "dq_spot_check_sample_detail",
     "dq_validation",

@@ -32,12 +32,7 @@ from aslan_core.dashboard.app import app, configure_app
 pytestmark = pytest.mark.integration
 
 
-# Routes still backed by the M0 stub body (don't touch the DB).
-STUB_ROUTES = [
-    "/dq/scorecard",
-]
-
-# M1 + M2 + M4 + M5 routes that hit audit.* tables. Tested via the configured app.
+# All seven /dq/* routes hit audit.* tables on this branch.
 # /dq/spot-check moved off the stub list in M2 — see
 # tests/integration/dashboard/test_dq_spot_check.py for the
 # pending-queue + sample-form coverage.
@@ -47,6 +42,10 @@ STUB_ROUTES = [
 # /dq/validation moved off the stub list in M5 — see
 # tests/integration/dashboard/test_dq_validation.py for the rule /
 # regression-flag / xs-skip surfaces and the regression review POST.
+# /dq/scorecard moved off the stub list in M6 — backed by
+# audit.scorecard_snapshot via dashboard.queries.dq_scorecard.
+STUB_ROUTES: list[str] = []
+
 M1_M2_ROUTES = [
     "/dq/overview",
     "/dq/recency",
@@ -54,13 +53,19 @@ M1_M2_ROUTES = [
     "/dq/spot-check",
     "/dq/bloomberg",
     "/dq/validation",
+    "/dq/scorecard",
 ]
 
 
 @pytest.mark.parametrize("path", STUB_ROUTES)
 def test_dq_stub_route_returns_200(path: str) -> None:
-    """The four stub routes do not need configure_app — they render
-    a static DqStubVM body without touching the DB."""
+    """The remaining stub routes do not need configure_app — they render
+    a static DqStubVM body without touching the DB.
+
+    Currently empty (M6 moved /dq/scorecard off the stub list). The
+    parametrize keeps this test in the suite as a placeholder; future
+    new /dq/* routes can land here briefly during their stub phase.
+    """
     client = TestClient(app)
     resp = client.get(path)
     assert resp.status_code == 200

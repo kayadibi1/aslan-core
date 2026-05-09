@@ -28,6 +28,14 @@ _STATIC_HANDLER_NAMES: frozenset[str] = frozenset(
         "_serve_htmx_js",
         "_serve_favicon",
         "_metrics_route",
+        # /dq/scorecard/email and /dq/scorecard/export return raw HTML
+        # / file bytes, not a VM-backed page. They route through the
+        # query layer for data, but the response body is the rendered
+        # email or export HTML — there's no VM to deny-check or template
+        # to register. The dq_scorecard module's primary handler still
+        # goes through render().
+        "dq_scorecard_email_preview",
+        "dq_scorecard_export",
     }
 )
 
