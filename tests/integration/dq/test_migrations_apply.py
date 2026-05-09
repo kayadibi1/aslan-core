@@ -78,3 +78,7 @@ async def test_recency_observation_is_hypertable(engine: AsyncEngine) -> None:
             )
         ).scalar()
     assert row == 1
+
+
+async def test_coverage_snapshot_table_exists(engine: AsyncEngine) -> None:
+    assert await _table_exists(engine, "audit", "coverage_snapshot")

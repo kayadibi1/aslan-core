@@ -1,0 +1,22 @@
+[
+  {
+    "series_code": "TP.FE.OKTG01",
+    "expected_at": "2026-06-03T12:30:00Z",
+    "notes": "CPI Mayis 2026 — first business Wednesday following month-end + ~3 PM TR"
+  },
+  {
+    "series_code": "TP.FE.OKTG01",
+    "expected_at": "2026-07-03T12:30:00Z",
+    "notes": "CPI Haziran 2026"
+  },
+  {
+    "series_code": "TP.FE.OKTG01",
+    "expected_at": "2026-08-04T12:30:00Z",
+    "notes": "CPI Temmuz 2026"
+  },
+  {
+    "series_code": "TP.MK.F.GDP",
+    "expected_at": "2026-08-29T07:00:00Z",
+    "notes": "GDP Q2 2026 — typically 60 days post-quarter"
+  }
+]
