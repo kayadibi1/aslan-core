@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any, Protocol
 
 import click
@@ -57,6 +57,7 @@ from aslan_core.dq import (
     event,
     recency,
     regression_detect,
+    scorecard,
     spot_check,
 )
 from aslan_core.dq._sql import SELECT_RECENCY_SLA
@@ -1080,6 +1081,100 @@ async def _run_regression_detect() -> dict[str, int]:
             "v1_flagged": result.v1_flagged,
             "v2_dismissed": result.v2_dismissed,
             "v2_kept_open": result.v2_kept_open,
+        }
+    finally:
+        await engine.dispose()
+
+
+# ── scorecard (M6) ─────────────────────────────────────────────────
+
+
+@audit.command("scorecard")
+@click.option(
+    "--week-start",
+    "week_start",
+    default=None,
+    help=(
+        "ISO-week-Monday (YYYY-MM-DD, UTC) to compute the scorecard for. "
+        "Defaults to the most-recent FULLY-completed week."
+    ),
+)
+def scorecard_cmd(week_start: str | None) -> None:
+    """Compute the weekly DQ scorecard + emit scorecard_generated event.
+
+    Spec §5.10 + §13. Cron schedule: ``55 23 * * 0 audit scorecard``
+    (Sunday 23:55 UTC). Computes ten metrics (recency p95/p99, EVDS
+    freshness, coverage snapshots, validation pass rate, spot-check
+    completion, Bloomberg wins, regression-open count, cross-source
+    clean count), UPSERTs each into ``audit.scorecard_snapshot``, then
+    emits ``audit.event(event_type='scorecard_generated')`` with the
+    rendered HTML body in the payload — the dispatcher's
+    ``weekly_scorecard`` severity rule picks that up and emails sidar.
+
+    Re-runnable for any past week via ``--week-start YYYY-MM-DD`` —
+    the UPSERT overwrites prior rows in place.
+    """
+    if week_start is None:
+        target_week = scorecard.latest_week_start()
+    else:
+        try:
+            target_week = date.fromisoformat(week_start)
+        except ValueError as exc:
+            raise click.UsageError(
+                f"--week-start must be YYYY-MM-DD; got {week_start!r}: {exc}"
+            ) from exc
+        if target_week.isoweekday() != 1:
+            raise click.UsageError(
+                f"--week-start must be a Monday; {target_week.isoformat()} is "
+                f"a {target_week.strftime('%A')}"
+            )
+    summary = asyncio.run(_run_scorecard(target_week))
+    click.echo(
+        f"audit scorecard: week_start={summary['week_start']} "
+        f"rows_written={summary['rows_written']} "
+        f"pass={summary['pass_count']} warn={summary['warn_count']} "
+        f"fail={summary['fail_count']}"
+    )
+
+
+async def _run_scorecard(week_start_value: date) -> dict[str, Any]:
+    engine = create_engine()
+    factory = create_session_factory(engine)
+    try:
+        async with factory() as s:
+            rows = await scorecard.compute(session=s, week_start=week_start_value)
+            written = await scorecard.write(
+                session=s, week_start=week_start_value, rows=rows
+            )
+            subject, body_html = scorecard.render_email(
+                week_start=week_start_value, rows=rows
+            )
+            body_text = scorecard.render_text_fallback(
+                week_start=week_start_value, rows=rows
+            )
+            await event.emit(
+                session=s,
+                event_type="scorecard_generated",
+                emitter="cli:audit-scorecard",
+                severity=Severity.INFO,
+                payload={
+                    "week_start": week_start_value.isoformat(),
+                    "rows_written": written,
+                    "pass_count": sum(1 for r in rows if r.status == "pass"),
+                    "warn_count": sum(1 for r in rows if r.status == "warn"),
+                    "fail_count": sum(1 for r in rows if r.status == "fail"),
+                    "subject": subject,
+                    "body_html": body_html,
+                    "body_text": body_text,
+                },
+            )
+            await s.commit()
+        return {
+            "week_start": week_start_value.isoformat(),
+            "rows_written": written,
+            "pass_count": sum(1 for r in rows if r.status == "pass"),
+            "warn_count": sum(1 for r in rows if r.status == "warn"),
+            "fail_count": sum(1 for r in rows if r.status == "fail"),
         }
     finally:
         await engine.dispose()
