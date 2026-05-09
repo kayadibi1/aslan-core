@@ -49,6 +49,9 @@ from aslan_core.api.research_observability import (
 )
 
 _CLOCK_SKEW_TOLERANCE = timedelta(seconds=60)
+# Per SCOPE.md D19: interval-mode width hard-cap (per-key override TODO).
+_AS_OF_RANGE_MAX_WIDTH = timedelta(days=5 * 365)
+_LIMIT_HARD_CAP = 500
 
 router = APIRouter(prefix="/v1/research", tags=["research"])
 
@@ -99,6 +102,202 @@ def _parse_as_of(raw: str | None) -> datetime | None:
     return dt.astimezone(UTC)
 
 
+def _parse_as_of_range(raw: str | None) -> tuple[datetime, datetime] | None:
+    """Parse an interval ``as_of_range`` query param.
+
+    Per SCOPE.md D2 / OPENAPI.yaml ``AsOfRange``: accepts shapes
+    ``[T1,T2)``, ``[T1,T2]``, ``(T1,T2)``, ``(T1,T2]`` where T1 / T2
+    are ISO-8601 timestamps with explicit timezone. Returns the
+    half-open ``(T1_inclusive, T2_exclusive)`` form regardless of
+    input bracket — closed-on-T1 and open-on-T2 is the canonical
+    interval-mode contract per D2.
+
+    Closed-bracket forms shift their endpoint by one microsecond so
+    the semantics map to half-open without losing rows on the
+    boundary; open-bracket forms shift inward equivalently.
+
+    Raises ``HTTPException(400, BITEMPORAL_INTERVAL_INVALID)`` on
+    malformed input or T1 >= T2.
+    """
+    if raw is None:
+        return None
+    s = raw.strip()
+    if len(s) < 5 or s[0] not in "[(" or s[-1] not in "])":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "type": (
+                    "https://docs.aslanterminal.com/errors/"
+                    "BITEMPORAL_INTERVAL_INVALID"
+                ),
+                "title": "as_of_range malformed",
+                "code": "BITEMPORAL_INTERVAL_INVALID",
+                "extensions": {"received_value": raw},
+            },
+        )
+    open_bracket = s[0]
+    close_bracket = s[-1]
+    inner = s[1:-1]
+    # Split on the first comma not inside a date offset (offset never
+    # contains commas, so a plain split on the first ``,`` is safe).
+    if "," not in inner:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "type": (
+                    "https://docs.aslanterminal.com/errors/"
+                    "BITEMPORAL_INTERVAL_INVALID"
+                ),
+                "title": "as_of_range missing comma separator",
+                "code": "BITEMPORAL_INTERVAL_INVALID",
+                "extensions": {"received_value": raw},
+            },
+        )
+    t1_raw, _, t2_raw = inner.partition(",")
+    try:
+        t1 = datetime.fromisoformat(t1_raw.strip().replace("Z", "+00:00"))
+        t2 = datetime.fromisoformat(t2_raw.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "type": (
+                    "https://docs.aslanterminal.com/errors/"
+                    "BITEMPORAL_INTERVAL_INVALID"
+                ),
+                "title": "as_of_range endpoints not ISO-8601",
+                "code": "BITEMPORAL_INTERVAL_INVALID",
+                "extensions": {"received_value": raw},
+            },
+        ) from exc
+    if t1.tzinfo is None or t2.tzinfo is None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "type": (
+                    "https://docs.aslanterminal.com/errors/"
+                    "BITEMPORAL_INTERVAL_INVALID"
+                ),
+                "title": "as_of_range endpoints must carry an explicit timezone",
+                "code": "BITEMPORAL_INTERVAL_INVALID",
+                "extensions": {"received_value": raw},
+            },
+        )
+    t1 = t1.astimezone(UTC)
+    t2 = t2.astimezone(UTC)
+    # Normalize to half-open [t1, t2).
+    if open_bracket == "(":
+        t1 = t1 + timedelta(microseconds=1)
+    if close_bracket == "]":
+        t2 = t2 + timedelta(microseconds=1)
+    if not (t1 < t2):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "type": (
+                    "https://docs.aslanterminal.com/errors/"
+                    "BITEMPORAL_INTERVAL_INVALID"
+                ),
+                "title": "as_of_range has T1 >= T2",
+                "code": "BITEMPORAL_INTERVAL_INVALID",
+                "extensions": {"received_value": raw},
+            },
+        )
+    return (t1, t2)
+
+
+def _enforce_query_cost(
+    *,
+    as_of_range: tuple[datetime, datetime] | None,
+    limit: int,
+) -> None:
+    """Per SCOPE.md D19: defense-in-depth row / window caps.
+
+    Raises ``HTTPException(413, QUERY_TOO_LARGE)`` when:
+
+    - ``as_of_range`` width exceeds 5 years (per-key override deferred);
+    - ``limit`` exceeds the documented hard cap (``Query(le=500)`` is
+      already enforced by FastAPI; this is belt-and-suspenders).
+    """
+    if as_of_range is not None:
+        width = as_of_range[1] - as_of_range[0]
+        if width > _AS_OF_RANGE_MAX_WIDTH:
+            raise HTTPException(
+                status_code=413,
+                detail={
+                    "type": (
+                        "https://docs.aslanterminal.com/errors/QUERY_TOO_LARGE"
+                    ),
+                    "title": "as_of_range exceeds 5-year cap",
+                    "code": "QUERY_TOO_LARGE",
+                    "extensions": {
+                        "width_seconds": int(width.total_seconds()),
+                        "max_width_seconds": int(
+                            _AS_OF_RANGE_MAX_WIDTH.total_seconds()
+                        ),
+                    },
+                },
+            )
+    if limit > _LIMIT_HARD_CAP:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "type": (
+                    "https://docs.aslanterminal.com/errors/QUERY_TOO_LARGE"
+                ),
+                "title": f"limit exceeds hard cap of {_LIMIT_HARD_CAP}",
+                "code": "QUERY_TOO_LARGE",
+                "extensions": {"limit": limit, "max_limit": _LIMIT_HARD_CAP},
+            },
+        )
+
+
+def _reject_pit_with_interval(
+    *, as_of: str | None, as_of_range: str | None
+) -> None:
+    """Per SCOPE.md D2: ``as_of`` and ``as_of_range`` are mutually exclusive."""
+    if as_of is not None and as_of_range is not None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "type": (
+                    "https://docs.aslanterminal.com/errors/"
+                    "BITEMPORAL_INTERVAL_INVALID"
+                ),
+                "title": "as_of and as_of_range are mutually exclusive",
+                "code": "BITEMPORAL_INTERVAL_INVALID",
+            },
+        )
+
+
+# Mapping from the PIT call shape used in PIT mode to the underlying
+# physical table for interval-mode queries. Per D2: interval mode
+# returns the full version chain, so it must scan the SCD-4 history
+# table directly (the PIT function collapses to latest-per-key via
+# DISTINCT ON).
+_PIT_TO_PHYSICAL_TABLE: dict[str, str] = {
+    "ts.observation_at(:as_of)": "ts.observation",
+    "ts.financial_line_item_at(:as_of)": "ts.financial_line_item",
+    "ts.canonical_financial_at(:as_of)": "ts.canonical_financial",
+    "agg.filing_event_at(:as_of)": "agg.filing_event",
+    "ts.entity_quality_score_at(:as_of)": "ts.entity_quality_score",
+    "ref.entity_at(:as_of)": "ref.entity_version",
+    "kap.disclosures_at(:as_of)": "kap.disclosures_version",
+    # ref.identifier_at uses the daterange contract (valid_from / valid_to);
+    # caller branches on this entry explicitly because the WHERE shape
+    # is not ``as_of >= :lo AND as_of < :hi``.
+    "ref.identifier_at(:as_of)": "ref.identifier",
+}
+
+
+def _physical_table_for(pit_call: str) -> str:
+    """Resolve the physical SCD-4 history table for an interval query.
+
+    Raises ``KeyError`` (caller bug) if the PIT call has no mapping.
+    """
+    return _PIT_TO_PHYSICAL_TABLE[pit_call]
+
+
 def _active_flags(flags: FeatureFlagState) -> list[str]:
     """Snapshot of currently-true flags for the envelope metadata."""
     return sorted(name for name, value in flags.enabled.items() if value)
@@ -112,11 +311,19 @@ def _build_filtered_sql(
     where_parts: list[str],
     order_by: str,
     limit_param: str = ":limit",
+    as_of_range: tuple[datetime, datetime] | None = None,
 ) -> str:
     """Assemble a parameterized SELECT.
 
     Pass exactly one of ``pit_call`` (e.g. ``"ts.observation_at(:as_of)"``)
     or ``from_clause`` (e.g. ``"ref.entity e"``).
+
+    When ``as_of_range`` is supplied, the helper rewrites a ``pit_call``
+    source to its underlying physical SCD-4 history table (via
+    :data:`_PIT_TO_PHYSICAL_TABLE`) and appends an
+    ``as_of >= :as_of_lower AND as_of < :as_of_upper`` predicate so the
+    full version chain is returned, not just the latest per key.
+    The caller is responsible for binding ``as_of_lower`` / ``as_of_upper``.
 
     ``where_parts`` MUST come from a fixed set of literal SQL fragments
     selected by ``if X is not None:`` branches in the caller — never
@@ -125,7 +332,14 @@ def _build_filtered_sql(
     """
     if (pit_call is None) == (from_clause is None):
         raise ValueError("pass exactly one of pit_call / from_clause")
-    source = pit_call if pit_call is not None else from_clause
+    if as_of_range is not None and pit_call is not None:
+        # Interval mode: scan the physical history table directly so
+        # the version chain (every row whose as_of falls in the
+        # half-open interval) is returned.
+        source: str | None = _physical_table_for(pit_call)
+        where_parts = [*where_parts, "as_of >= :as_of_lower AND as_of < :as_of_upper"]
+    else:
+        source = pit_call if pit_call is not None else from_clause
     where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
     return (
         f"{select_clause} FROM {source} {where_clause} {order_by} LIMIT {limit_param}"
@@ -236,6 +450,29 @@ async def verify_moat_2(
 # ---------------------------------------------------------------------
 
 
+async def _resolve_series_code(
+    session: AsyncSession, code: str
+) -> int | None:
+    """Resolve a documented string ``series_code`` to its numeric ``series_id``.
+
+    Per OPENAPI.yaml ``Observation.series_id`` ('BIST.GARAN.close') and
+    README quickstart: clients pass codes; the DB uses BIGINT FKs.
+    Returns None if no match exists.
+    """
+    row = (
+        await session.execute(
+            text(
+                "SELECT series_id FROM ts.series_catalog "
+                "WHERE series_code = :code"
+            ),
+            {"code": code},
+        )
+    ).first()
+    if row is None:
+        return None
+    return int(row.series_id)
+
+
 @router.get("/observations", tags=["research"])
 async def observations(
     request: Request,
@@ -245,33 +482,81 @@ async def observations(
     flags: FeatureFlagState = Depends(require_master_flag),
     ctx: RequestContext = Depends(get_request_context),
     as_of: str | None = Query(default=None),
+    as_of_range: str | None = Query(default=None),
     series_id: int | None = Query(default=None),
+    series_code: str | None = Query(
+        default=None,
+        description="Catalog code (e.g. BIST.GARAN.close) resolved to series_id.",
+    ),
+    ts_from: datetime | None = Query(default=None),
+    ts_to: datetime | None = Query(default=None),
     cursor: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
 ) -> dict[str, Any]:
     """Per SCOPE.md D1: ``ts.observation_at(p_as_of)``.
 
-    D6 rate-limit, D7 cursor pagination, D17 cache headers, D18
-    audit log, D25 metrics are wired via ``enforce_rate_limit`` /
-    ``ctx`` / ``set_cache_headers`` / ``research_audit_middleware``.
+    D2 interval mode (``as_of_range``), D6 rate-limit, D7 cursor
+    pagination, D17 cache headers, D18 audit log, D25 metrics are
+    wired via ``enforce_rate_limit`` / ``ctx`` / ``set_cache_headers``
+    / ``research_audit_middleware``.
     """
+    _reject_pit_with_interval(as_of=as_of, as_of_range=as_of_range)
+    interval = _parse_as_of_range(as_of_range)
+    _enforce_query_cost(as_of_range=interval, limit=limit)
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
     ctx.api_key_id = principal.key_id if principal else None
     ctx.rate_tier = principal.rate_tier if principal else "anonymous"
     ctx.as_of_requested = requested
     ctx.as_of_resolved = resolved
+    ctx.as_of_range = interval
     ctx.feature_flags_active = _active_flags(flags)
 
+    # Resolve series_code -> numeric id at the API boundary (D-finding).
+    if series_code is not None and series_id is None:
+        resolved_id = await _resolve_series_code(session, series_code)
+        if resolved_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "type": (
+                        "https://docs.aslanterminal.com/errors/"
+                        "BITEMPORAL_INTERVAL_INVALID"
+                    ),
+                    "title": "unknown series code",
+                    "code": "BITEMPORAL_INTERVAL_INVALID",
+                    "extensions": {"series_code": series_code},
+                },
+            )
+        series_id = resolved_id
+
     where_parts: list[str] = []
-    params: dict[str, Any] = {"as_of": resolved, "limit": limit}
+    params: dict[str, Any] = {"limit": limit}
+    if interval is None:
+        params["as_of"] = resolved
+    else:
+        params["as_of_lower"] = interval[0]
+        params["as_of_upper"] = interval[1]
     if series_id is not None:
         where_parts.append("series_id = :series_id")
         params["series_id"] = series_id
+    if ts_from is not None:
+        where_parts.append("ts >= :ts_from")
+        params["ts_from"] = ts_from
+    if ts_to is not None:
+        where_parts.append("ts <= :ts_to")
+        params["ts_to"] = ts_to
 
     filters_for_cursor: dict[str, Any] = {
-        "as_of": resolved.isoformat(),
+        "as_of": resolved.isoformat() if interval is None else None,
+        "as_of_range": (
+            [interval[0].isoformat(), interval[1].isoformat()]
+            if interval
+            else None
+        ),
         "series_id": series_id,
+        "ts_from": ts_from.isoformat() if ts_from else None,
+        "ts_to": ts_to.isoformat() if ts_to else None,
     }
     if cursor is not None:
         decode_cursor(cursor, filters_for_cursor)
@@ -282,6 +567,7 @@ async def observations(
         pit_call="ts.observation_at(:as_of)",
         where_parts=where_parts,
         order_by="ORDER BY series_id, ts DESC",
+        as_of_range=interval,
     )
     rows = await session.execute(text(sql), params)
     data = [
@@ -312,6 +598,7 @@ async def observations(
         request_id=ctx.request_id,
         as_of_requested=requested,
         as_of_resolved=resolved,
+        as_of_range=interval,
         feature_flags_active=_active_flags(flags),
         pagination=pagination,
     )
@@ -409,6 +696,7 @@ async def financials_canonical(
     flags: FeatureFlagState = Depends(require_master_flag),
     ctx: RequestContext = Depends(get_request_context),
     as_of: str | None = Query(default=None),
+    as_of_range: str | None = Query(default=None),
     restatement_basis: str | None = Query(
         default=None,
         pattern="^(as_reported|cpi_normalized)$",
@@ -421,28 +709,41 @@ async def financials_canonical(
 
     Returns rows for the requested entity at the requested ``as_of``.
     Both ``as_reported`` and ``cpi_normalized`` bases are returned
-    unless filtered. D6/D7/D17/D18/D25 wired.
+    unless filtered. D2 interval / D6 / D7 / D17 / D18 / D25 wired.
     """
+    _reject_pit_with_interval(as_of=as_of, as_of_range=as_of_range)
+    interval = _parse_as_of_range(as_of_range)
+    _enforce_query_cost(as_of_range=interval, limit=limit)
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
     ctx.api_key_id = principal.key_id if principal else None
     ctx.rate_tier = principal.rate_tier if principal else "anonymous"
     ctx.as_of_requested = requested
     ctx.as_of_resolved = resolved
+    ctx.as_of_range = interval
     ctx.feature_flags_active = _active_flags(flags)
 
     where_parts: list[str] = ["entity_id = :entity_id"]
     params: dict[str, Any] = {
-        "as_of": resolved,
         "entity_id": str(entity_id),
         "limit": limit,
     }
+    if interval is None:
+        params["as_of"] = resolved
+    else:
+        params["as_of_lower"] = interval[0]
+        params["as_of_upper"] = interval[1]
     if restatement_basis is not None:
         where_parts.append("restatement_basis = :rb")
         params["rb"] = restatement_basis
 
     filters_for_cursor: dict[str, Any] = {
-        "as_of": resolved.isoformat(),
+        "as_of": resolved.isoformat() if interval is None else None,
+        "as_of_range": (
+            [interval[0].isoformat(), interval[1].isoformat()]
+            if interval
+            else None
+        ),
         "entity_id": str(entity_id),
         "restatement_basis": restatement_basis,
     }
@@ -460,6 +761,7 @@ async def financials_canonical(
         pit_call="ts.canonical_financial_at(:as_of)",
         where_parts=where_parts,
         order_by="ORDER BY period_end DESC, canonical_code, restatement_basis",
+        as_of_range=interval,
     )
     rows = await session.execute(text(sql), params)
     data = [
@@ -520,6 +822,7 @@ async def financials_canonical(
         request_id=ctx.request_id,
         as_of_requested=requested,
         as_of_resolved=resolved,
+        as_of_range=interval,
         feature_flags_active=_active_flags(flags),
         warnings=warnings,
         pagination=pagination,
@@ -575,6 +878,7 @@ async def financials_line_items(
     flags: FeatureFlagState = Depends(require_master_flag),
     ctx: RequestContext = Depends(get_request_context),
     as_of: str | None = Query(default=None),
+    as_of_range: str | None = Query(default=None),
     entity_id: UUID | None = Query(default=None),
     period_end_from: datetime | None = Query(default=None),
     period_end_to: datetime | None = Query(default=None),
@@ -587,18 +891,28 @@ async def financials_line_items(
 ) -> dict[str, Any]:
     """Per SCOPE.md D1, D8: ``ts.financial_line_item_at(p_as_of)``.
 
-    D6/D7/D17/D18/D25 wired via the cross-cutting observability module.
+    D2 interval, D6/D7/D17/D18/D25 wired via the cross-cutting
+    observability module.
     """
+    _reject_pit_with_interval(as_of=as_of, as_of_range=as_of_range)
+    interval = _parse_as_of_range(as_of_range)
+    _enforce_query_cost(as_of_range=interval, limit=limit)
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
     ctx.api_key_id = principal.key_id if principal else None
     ctx.rate_tier = principal.rate_tier if principal else "anonymous"
     ctx.as_of_requested = requested
     ctx.as_of_resolved = resolved
+    ctx.as_of_range = interval
     ctx.feature_flags_active = _active_flags(flags)
 
     where_parts: list[str] = []
-    params: dict[str, Any] = {"as_of": resolved, "limit": limit}
+    params: dict[str, Any] = {"limit": limit}
+    if interval is None:
+        params["as_of"] = resolved
+    else:
+        params["as_of_lower"] = interval[0]
+        params["as_of_upper"] = interval[1]
     if entity_id is not None:
         where_parts.append("entity_id = :entity_id")
         params["entity_id"] = str(entity_id)
@@ -613,7 +927,12 @@ async def financials_line_items(
         params["restatement_basis"] = restatement_basis
 
     filters_for_cursor: dict[str, Any] = {
-        "as_of": resolved.isoformat(),
+        "as_of": resolved.isoformat() if interval is None else None,
+        "as_of_range": (
+            [interval[0].isoformat(), interval[1].isoformat()]
+            if interval
+            else None
+        ),
         "entity_id": str(entity_id) if entity_id else None,
         "period_end_from": (
             period_end_from.isoformat() if period_end_from else None
@@ -638,6 +957,7 @@ async def financials_line_items(
         pit_call="ts.financial_line_item_at(:as_of)",
         where_parts=where_parts,
         order_by="ORDER BY period_end DESC, line_code, restatement_basis",
+        as_of_range=interval,
     )
     rows = await session.execute(text(sql), params)
     data = [
@@ -688,6 +1008,7 @@ async def financials_line_items(
         request_id=ctx.request_id,
         as_of_requested=requested,
         as_of_resolved=resolved,
+        as_of_range=interval,
         feature_flags_active=_active_flags(flags),
         pagination=pagination,
     )
@@ -704,33 +1025,49 @@ async def entities(
     flags: FeatureFlagState = Depends(require_master_flag),
     ctx: RequestContext = Depends(get_request_context),
     as_of: str | None = Query(default=None),
+    as_of_range: str | None = Query(default=None),
     kind: str | None = Query(default=None),
     cursor: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
 ) -> dict[str, Any]:
     """Per SCOPE.md D1, D10: list entities + lineage events.
 
-    Phase 1 design defers the bitemporal ``ref.entity`` upgrade
-    (per HANDOFF.md). v1 reads ``ref.entity`` directly (current
-    state) and joins ``ref.entity_lineage_at(:as_of)`` to surface
-    merge / split history. D6/D7/D17/D18/D25 wired.
+    Reads via ``ref.entity_at(:as_of)`` (migration 0046, SCD-4
+    bitemporal upgrade) so historical ``as_of`` returns the entity
+    state at that time, not the present-day row. Interval mode (D2)
+    queries ``ref.entity_version`` directly to return the version
+    chain. D6/D7/D17/D18/D25 wired.
     """
+    _reject_pit_with_interval(as_of=as_of, as_of_range=as_of_range)
+    interval = _parse_as_of_range(as_of_range)
+    _enforce_query_cost(as_of_range=interval, limit=limit)
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
     ctx.api_key_id = principal.key_id if principal else None
     ctx.rate_tier = principal.rate_tier if principal else "anonymous"
     ctx.as_of_requested = requested
     ctx.as_of_resolved = resolved
+    ctx.as_of_range = interval
     ctx.feature_flags_active = _active_flags(flags)
 
     where_parts: list[str] = []
-    params: dict[str, Any] = {"as_of": resolved, "limit": limit}
+    params: dict[str, Any] = {"limit": limit}
+    if interval is None:
+        params["as_of"] = resolved
+    else:
+        params["as_of_lower"] = interval[0]
+        params["as_of_upper"] = interval[1]
     if kind:
-        where_parts.append("e.entity_type = :kind")
+        where_parts.append("entity_type = :kind")
         params["kind"] = kind
 
     filters_for_cursor: dict[str, Any] = {
-        "as_of": resolved.isoformat(),
+        "as_of": resolved.isoformat() if interval is None else None,
+        "as_of_range": (
+            [interval[0].isoformat(), interval[1].isoformat()]
+            if interval
+            else None
+        ),
         "kind": kind,
     }
     if cursor is not None:
@@ -739,12 +1076,13 @@ async def entities(
 
     sql = _build_filtered_sql(
         select_clause=(
-            "SELECT e.entity_id, e.legal_name AS name, "
-            "       e.entity_type AS kind, e.created_at"
+            "SELECT entity_id, as_of, event_kind, entity_type, legal_name, "
+            "       country_code, merged_from_entity_ids"
         ),
-        from_clause="ref.entity e",
+        pit_call="ref.entity_at(:as_of)",
         where_parts=where_parts,
-        order_by="ORDER BY e.created_at DESC",
+        order_by="ORDER BY legal_name, entity_id",
+        as_of_range=interval,
     )
     rows = (await session.execute(text(sql), params)).all()
 
@@ -764,12 +1102,30 @@ async def entities(
                 {"as_of": resolved, "entity_id": str(r.entity_id)},
             )
         ).all()
+        merged_from = r.merged_from_entity_ids
+        if merged_from is None:
+            merged_from_list: list[str] = []
+        elif isinstance(merged_from, list):
+            merged_from_list = [str(m) for m in merged_from]
+        else:
+            merged_from_list = [str(merged_from)]
+        # Derive split_from_entity_id from a 'split' lineage event if any.
+        split_from: str | None = None
+        for le in lineage_rows:
+            if le.event_kind == "split" and le.into_entity_id == r.entity_id:
+                split_from = (
+                    str(le.from_entity_id) if le.from_entity_id else None
+                )
+                break
         data.append(
             {
                 "entity_id": str(r.entity_id),
-                "name": r.name,
-                "kind": r.kind,
-                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "canonical_name": r.legal_name,
+                "kind": r.entity_type,
+                "country": r.country_code,
+                "merged_from_entity_ids": merged_from_list,
+                "split_from_entity_id": split_from,
+                "as_of": r.as_of.isoformat() if r.as_of else None,
                 "lineage_events": [
                     {
                         "event_kind": le.event_kind,
@@ -806,6 +1162,7 @@ async def entities(
         request_id=ctx.request_id,
         as_of_requested=requested,
         as_of_resolved=resolved,
+        as_of_range=interval,
         feature_flags_active=_active_flags(flags),
         pagination=pagination,
     )
@@ -839,11 +1196,12 @@ async def get_entity(
     row = (
         await session.execute(
             text(
-                "SELECT entity_id, legal_name AS name, "
-                "       entity_type AS kind, created_at "
-                "FROM ref.entity WHERE entity_id = :entity_id"
+                "SELECT entity_id, as_of, event_kind, entity_type, legal_name, "
+                "       country_code, merged_from_entity_ids "
+                "FROM ref.entity_at(:as_of) "
+                "WHERE entity_id = :entity_id"
             ),
-            {"entity_id": str(entity_id)},
+            {"as_of": resolved, "entity_id": str(entity_id)},
         )
     ).first()
     if row is None:
@@ -874,11 +1232,27 @@ async def get_entity(
         )
     ).all()
 
+    merged_from = row.merged_from_entity_ids
+    if merged_from is None:
+        merged_from_list: list[str] = []
+    elif isinstance(merged_from, list):
+        merged_from_list = [str(m) for m in merged_from]
+    else:
+        merged_from_list = [str(merged_from)]
+    split_from: str | None = None
+    for le in lineage_rows:
+        if le.event_kind == "split" and le.into_entity_id == row.entity_id:
+            split_from = str(le.from_entity_id) if le.from_entity_id else None
+            break
+
     data = {
         "entity_id": str(row.entity_id),
-        "name": row.name,
-        "kind": row.kind,
-        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "canonical_name": row.legal_name,
+        "kind": row.entity_type,
+        "country": row.country_code,
+        "merged_from_entity_ids": merged_from_list,
+        "split_from_entity_id": split_from,
+        "as_of": row.as_of.isoformat() if row.as_of else None,
         "lineage_events": [
             {
                 "event_kind": le.event_kind,
@@ -906,10 +1280,9 @@ async def get_entity(
 _PRE_BITEMPORAL_WARNING = Warning(
     code="PRE_BITEMPORAL_TABLE",
     message=(
-        "This endpoint reads a Class E+G / Class F table that has not yet "
-        "received its bitemporal upgrade migration (0051 follow-up). PIT "
-        "semantics are approximated using the row's published_at / "
-        "received_at column until that migration lands."
+        "This endpoint reads a Class F table that does not yet have a PIT "
+        "function in v1; rows reflect current state regardless of as_of. "
+        "Adding doc.filing_at is a v1.0.0-beta follow-up."
     ),
 )
 
@@ -922,6 +1295,7 @@ async def disclosures(
     flags: FeatureFlagState = Depends(require_master_flag),
     ctx: RequestContext = Depends(get_request_context),
     as_of: str | None = Query(default=None),
+    as_of_range: str | None = Query(default=None),
     entity_id: UUID | None = Query(default=None),
     published_after: datetime | None = Query(default=None),
     published_before: datetime | None = Query(default=None),
@@ -930,22 +1304,32 @@ async def disclosures(
 ) -> dict[str, Any]:
     """Per SCOPE.md D1, D3, D11: list ``kap.disclosures``.
 
-    ``kap.disclosures`` is currently Class E+G (mutable, pre-bitemporal).
-    Phase 2 will land migration 0051 to upgrade it to bitemporal; until
-    then this endpoint queries the table directly and uses
-    ``published_at`` as the as_of proxy (envelope warning
-    ``PRE_BITEMPORAL_TABLE``). D6/D7/D17/D18/D25 wired.
+    Reads via ``kap.disclosures_at(:as_of)`` (migration 0051, SCD-4
+    bitemporal upgrade). ``as_of_provenance`` indicates how the
+    historical row was timestamped (e.g. ``index_fetched_at``,
+    ``body_fetched_at``, or ``pre_bitemporal_unknown`` for backfill).
+    Interval mode (D2) queries ``kap.disclosures_version`` directly to
+    return the version chain. D6/D7/D17/D18/D25 wired.
     """
+    _reject_pit_with_interval(as_of=as_of, as_of_range=as_of_range)
+    interval = _parse_as_of_range(as_of_range)
+    _enforce_query_cost(as_of_range=interval, limit=limit)
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
     ctx.api_key_id = principal.key_id if principal else None
     ctx.rate_tier = principal.rate_tier if principal else "anonymous"
     ctx.as_of_requested = requested
     ctx.as_of_resolved = resolved
+    ctx.as_of_range = interval
     ctx.feature_flags_active = _active_flags(flags)
 
     where_parts: list[str] = []
     params: dict[str, Any] = {"limit": limit}
+    if interval is None:
+        params["as_of"] = resolved
+    else:
+        params["as_of_lower"] = interval[0]
+        params["as_of_upper"] = interval[1]
     if entity_id is not None:
         where_parts.append("entity_id = :entity_id")
         params["entity_id"] = str(entity_id)
@@ -957,7 +1341,12 @@ async def disclosures(
         params["published_before"] = published_before
 
     filters_for_cursor: dict[str, Any] = {
-        "as_of": resolved.isoformat(),
+        "as_of": resolved.isoformat() if interval is None else None,
+        "as_of_range": (
+            [interval[0].isoformat(), interval[1].isoformat()]
+            if interval
+            else None
+        ),
         "entity_id": str(entity_id) if entity_id else None,
         "published_after": (
             published_after.isoformat() if published_after else None
@@ -972,13 +1361,15 @@ async def disclosures(
 
     sql = _build_filtered_sql(
         select_clause=(
-            "SELECT disclosure_id, entity_id, title, category_code, "
-            "       subcategory_code, published_at, body_fetched, "
-            "       body_fetched_at, republished_as"
+            "SELECT disclosure_id, as_of, event_kind, as_of_provenance, "
+            "       entity_id, kap_id, title, category_code, "
+            "       subcategory_code, published_at, is_amendment, "
+            "       body_fetched, body_fetched_at, parent_disclosure_id"
         ),
-        pit_call="kap.disclosures",
+        pit_call="kap.disclosures_at(:as_of)",
         where_parts=where_parts,
         order_by="ORDER BY published_at DESC",
+        as_of_range=interval,
     )
     rows = await session.execute(text(sql), params)
     data = [
@@ -986,20 +1377,33 @@ async def disclosures(
             "disclosure_id": (
                 str(r.disclosure_id) if r.disclosure_id else None
             ),
+            "kap_company_id": r.kap_id,
             "entity_id": str(r.entity_id) if r.entity_id else None,
+            "form_type": r.category_code,
             "title": r.title,
             "category_code": r.category_code,
             "subcategory_code": r.subcategory_code,
             "published_at": (
                 r.published_at.isoformat() if r.published_at else None
             ),
-            "body_fetched": bool(r.body_fetched) if r.body_fetched is not None else None,
+            "is_amendment": (
+                bool(r.is_amendment) if r.is_amendment is not None else None
+            ),
+            "body_fetched": (
+                bool(r.body_fetched) if r.body_fetched is not None else None
+            ),
             "body_fetched_at": (
                 r.body_fetched_at.isoformat() if r.body_fetched_at else None
             ),
             "republished_as": (
-                str(r.republished_as) if r.republished_as else None
+                str(r.parent_disclosure_id) if r.parent_disclosure_id else None
             ),
+            "as_of": r.as_of.isoformat() if r.as_of else None,
+            "as_of_provenance": r.as_of_provenance,
+            "pre_bitemporal": (
+                r.as_of_provenance == "pre_bitemporal_unknown"
+            ),
+            "event_kind": r.event_kind,
         }
         for r in rows
     ]
@@ -1024,8 +1428,8 @@ async def disclosures(
         request_id=ctx.request_id,
         as_of_requested=requested,
         as_of_resolved=resolved,
+        as_of_range=interval,
         feature_flags_active=_active_flags(flags),
-        warnings=[_PRE_BITEMPORAL_WARNING],
         pagination=pagination,
     )
     body_bytes = _json.dumps(env, sort_keys=True, default=str).encode("utf-8")
@@ -1035,7 +1439,7 @@ async def disclosures(
 
 @router.get("/disclosures/{disclosure_id}", tags=["research", "disclosures"])
 async def get_disclosure(
-    disclosure_id: UUID,
+    disclosure_id: str,
     response: Response,
     session: AsyncSession = Depends(get_session),
     principal: ApiKeyPrincipal | None = Depends(enforce_rate_limit),
@@ -1043,7 +1447,10 @@ async def get_disclosure(
     ctx: RequestContext = Depends(get_request_context),
     as_of: str | None = Query(default=None),
 ) -> dict[str, Any]:
-    """Per SCOPE.md D1, D11: single disclosure (PRE_BITEMPORAL_TABLE).
+    """Per SCOPE.md D1, D11: single disclosure.
+
+    KAP `disclosure_id` is TEXT (e.g. ``KAP-2024-1234567``) per the
+    crawl schema, so the path parameter is `str`, not UUID.
 
     D6/D17/D18/D25 wired (single resource: no cursor pagination).
     """
@@ -1058,13 +1465,14 @@ async def get_disclosure(
     row = (
         await session.execute(
             text(
-                "SELECT disclosure_id, entity_id, title, category_code, "
-                "       subcategory_code, published_at, body_fetched, "
-                "       body_fetched_at, republished_as "
-                "FROM kap.disclosures "
+                "SELECT disclosure_id, as_of, event_kind, as_of_provenance, "
+                "       entity_id, kap_id, title, category_code, "
+                "       subcategory_code, published_at, is_amendment, "
+                "       body_fetched, body_fetched_at, parent_disclosure_id "
+                "FROM kap.disclosures_at(:as_of) "
                 "WHERE disclosure_id = :disclosure_id"
             ),
-            {"disclosure_id": str(disclosure_id)},
+            {"as_of": resolved, "disclosure_id": disclosure_id},
         )
     ).first()
     if row is None:
@@ -1082,12 +1490,17 @@ async def get_disclosure(
 
     data = {
         "disclosure_id": str(row.disclosure_id) if row.disclosure_id else None,
+        "kap_company_id": row.kap_id,
         "entity_id": str(row.entity_id) if row.entity_id else None,
+        "form_type": row.category_code,
         "title": row.title,
         "category_code": row.category_code,
         "subcategory_code": row.subcategory_code,
         "published_at": (
             row.published_at.isoformat() if row.published_at else None
+        ),
+        "is_amendment": (
+            bool(row.is_amendment) if row.is_amendment is not None else None
         ),
         "body_fetched": (
             bool(row.body_fetched) if row.body_fetched is not None else None
@@ -1096,8 +1509,12 @@ async def get_disclosure(
             row.body_fetched_at.isoformat() if row.body_fetched_at else None
         ),
         "republished_as": (
-            str(row.republished_as) if row.republished_as else None
+            str(row.parent_disclosure_id) if row.parent_disclosure_id else None
         ),
+        "as_of": row.as_of.isoformat() if row.as_of else None,
+        "as_of_provenance": row.as_of_provenance,
+        "pre_bitemporal": row.as_of_provenance == "pre_bitemporal_unknown",
+        "event_kind": row.event_kind,
     }
     ctx.rows_returned = 1
     env = build_envelope(
@@ -1106,7 +1523,6 @@ async def get_disclosure(
         as_of_requested=requested,
         as_of_resolved=resolved,
         feature_flags_active=_active_flags(flags),
-        warnings=[_PRE_BITEMPORAL_WARNING],
     )
     body_bytes = _json.dumps(env, sort_keys=True, default=str).encode("utf-8")
     set_cache_headers(response, as_of_resolved=resolved, body_bytes=body_bytes)
@@ -1121,24 +1537,31 @@ async def filings(
     flags: FeatureFlagState = Depends(require_master_flag),
     ctx: RequestContext = Depends(get_request_context),
     as_of: str | None = Query(default=None),
+    as_of_range: str | None = Query(default=None),
     entity_id: UUID | None = Query(default=None),
     received_after: datetime | None = Query(default=None),
     received_before: datetime | None = Query(default=None),
     cursor: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
 ) -> dict[str, Any]:
-    """Per SCOPE.md D1: list ``doc.filing`` (Class F, no as_of column).
+    """Per SCOPE.md D1: list ``doc.filing`` (Class F, no PIT function).
 
-    ``doc.filing`` does not yet carry an ``as_of`` column; the API
-    returns the current-state row with a ``PRE_BITEMPORAL_TABLE``
-    warning until migration 0051 lands. D6/D7/D17/D18/D25 wired.
+    ``doc.filing`` does not yet have a ``doc.filing_at`` PIT function in
+    v1; rows reflect current state regardless of ``as_of`` /
+    ``as_of_range``. The envelope carries a ``PRE_BITEMPORAL_TABLE``
+    warning. Adding ``doc.filing_at`` is a v1.0.0-beta follow-up.
+    D6/D7/D17/D18/D25 wired.
     """
+    _reject_pit_with_interval(as_of=as_of, as_of_range=as_of_range)
+    interval = _parse_as_of_range(as_of_range)
+    _enforce_query_cost(as_of_range=interval, limit=limit)
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
     ctx.api_key_id = principal.key_id if principal else None
     ctx.rate_tier = principal.rate_tier if principal else "anonymous"
     ctx.as_of_requested = requested
     ctx.as_of_resolved = resolved
+    ctx.as_of_range = interval
     ctx.feature_flags_active = _active_flags(flags)
 
     where_parts: list[str] = []
@@ -1154,7 +1577,12 @@ async def filings(
         params["received_before"] = received_before
 
     filters_for_cursor: dict[str, Any] = {
-        "as_of": resolved.isoformat(),
+        "as_of": resolved.isoformat() if interval is None else None,
+        "as_of_range": (
+            [interval[0].isoformat(), interval[1].isoformat()]
+            if interval
+            else None
+        ),
         "entity_id": str(entity_id) if entity_id else None,
         "received_after": (
             received_after.isoformat() if received_after else None
@@ -1167,9 +1595,12 @@ async def filings(
         decode_cursor(cursor, filters_for_cursor)
         # TODO(D7): apply keyset WHERE from decoded["anchor"] in v1.0.0-beta.
 
+    # doc.filing has no PIT function and no SCD-4 version table in v1;
+    # both PIT and interval modes return the current-state rows with a
+    # PRE_BITEMPORAL_TABLE warning attached.
     sql = _build_filtered_sql(
         select_clause="SELECT *",
-        pit_call="doc.filing",
+        from_clause="doc.filing",
         where_parts=where_parts,
         order_by="ORDER BY received_at DESC NULLS LAST",
     )
@@ -1208,6 +1639,7 @@ async def filings(
         request_id=ctx.request_id,
         as_of_requested=requested,
         as_of_resolved=resolved,
+        as_of_range=interval,
         feature_flags_active=_active_flags(flags),
         warnings=[_PRE_BITEMPORAL_WARNING],
         pagination=pagination,
@@ -1225,6 +1657,7 @@ async def events(
     flags: FeatureFlagState = Depends(require_master_flag),
     ctx: RequestContext = Depends(get_request_context),
     as_of: str | None = Query(default=None),
+    as_of_range: str | None = Query(default=None),
     entity_id: UUID | None = Query(default=None),
     event_type: str | None = Query(default=None),
     event_after: datetime | None = Query(default=None),
@@ -1234,26 +1667,39 @@ async def events(
 ) -> dict[str, Any]:
     """Per SCOPE.md D1, D30: ``agg.filing_event_at(p_as_of)``.
 
-    Per D30 PII handling: ``payload`` may carry counterparty names;
+    Per D30 PII handling: ``attributes`` may carry counterparty names;
     redact unless the principal carries ``pii_unredacted=true``. The
     envelope ``lineage`` block is populated from the primary
     ``(model_version, prompt_version, input_text_sha256)`` of the
-    first row. D6/D7/D17/D18/D25 wired; ``ctx.pii_unredacted_used``
-    flips when redaction is bypassed so the audit middleware can
-    record the access.
+    first row. D2 interval / D6 / D7 / D17 / D18 / D25 wired;
+    ``ctx.pii_unredacted_used`` flips when redaction is bypassed so the
+    audit middleware can record the access.
+
+    Response shape uses OpenAPI's terms (``event_id``, ``occurred_at``,
+    ``attributes``); these are renames of the underlying physical
+    columns ``filing_event_id``, ``event_ts``, ``payload`` respectively.
     """
+    _reject_pit_with_interval(as_of=as_of, as_of_range=as_of_range)
+    interval = _parse_as_of_range(as_of_range)
+    _enforce_query_cost(as_of_range=interval, limit=limit)
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
     ctx.api_key_id = principal.key_id if principal else None
     ctx.rate_tier = principal.rate_tier if principal else "anonymous"
     ctx.as_of_requested = requested
     ctx.as_of_resolved = resolved
+    ctx.as_of_range = interval
     ctx.feature_flags_active = _active_flags(flags)
     if principal is not None and principal.pii_unredacted:
         ctx.pii_unredacted_used = True
 
     where_parts: list[str] = []
-    params: dict[str, Any] = {"as_of": resolved, "limit": limit}
+    params: dict[str, Any] = {"limit": limit}
+    if interval is None:
+        params["as_of"] = resolved
+    else:
+        params["as_of_lower"] = interval[0]
+        params["as_of_upper"] = interval[1]
     if entity_id is not None:
         where_parts.append("entity_id = :entity_id")
         params["entity_id"] = str(entity_id)
@@ -1268,7 +1714,12 @@ async def events(
         params["event_before"] = event_before
 
     filters_for_cursor: dict[str, Any] = {
-        "as_of": resolved.isoformat(),
+        "as_of": resolved.isoformat() if interval is None else None,
+        "as_of_range": (
+            [interval[0].isoformat(), interval[1].isoformat()]
+            if interval
+            else None
+        ),
         "entity_id": str(entity_id) if entity_id else None,
         "event_type": event_type,
         "event_after": event_after.isoformat() if event_after else None,
@@ -1290,11 +1741,13 @@ async def events(
         pit_call="agg.filing_event_at(:as_of)",
         where_parts=where_parts,
         order_by="ORDER BY event_ts DESC, event_seq",
+        as_of_range=interval,
     )
     rows = (await session.execute(text(sql), params)).all()
     data = [
         {
-            "filing_event_id": (
+            # OpenAPI surface name -> physical column.
+            "event_id": (
                 str(r.filing_event_id) if r.filing_event_id else None
             ),
             "filing_id": str(r.filing_id) if r.filing_id else None,
@@ -1306,12 +1759,12 @@ async def events(
             "counterparty_entity_id": (
                 str(r.counterparty_entity_id) if r.counterparty_entity_id else None
             ),
-            "event_ts": r.event_ts.isoformat() if r.event_ts else None,
+            "occurred_at": r.event_ts.isoformat() if r.event_ts else None,
             "effective_dt": (
                 r.effective_dt.isoformat() if r.effective_dt else None
             ),
             "as_of": r.as_of.isoformat() if r.as_of else None,
-            "payload": _redact_event_payload(r.payload, principal),
+            "attributes": _redact_event_payload(r.payload, principal),
             "primary_confidence": (
                 float(r.primary_confidence)
                 if r.primary_confidence is not None
@@ -1362,6 +1815,7 @@ async def events(
         request_id=ctx.request_id,
         as_of_requested=requested,
         as_of_resolved=resolved,
+        as_of_range=interval,
         lineage=lineage,
         feature_flags_active=_active_flags(flags),
         pagination=pagination,

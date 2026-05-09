@@ -136,6 +136,12 @@ class RequestContext:
     rate_tier: str = "anonymous"
     as_of_requested: datetime | None = None
     as_of_resolved: datetime | None = None
+    # When set, the request was an interval-mode query (D2):
+    # half-open ``[T1, T2)`` UTC bounds. Persisted to audit log and
+    # surfaced in the request-completed log line. The audit table does
+    # not yet carry ``as_of_range_lower`` / ``as_of_range_upper`` columns;
+    # adding them is deferred to a follow-up migration (post-0051).
+    as_of_range: tuple[datetime, datetime] | None = None
     rows_returned: int = 0
     feature_flags_active: list[str] = field(default_factory=list)
     pii_unredacted_used: bool = False
@@ -383,7 +389,14 @@ async def research_audit_middleware(
     Only audits paths that mounted this middleware (the research
     router). Skips other API surfaces transparently.
     """
-    if "/v1/research" not in request.url.path:
+    # Match only the research surface; prefix-match on the URL path with
+    # an explicit trailing slash so unrelated future paths that happen to
+    # contain "/v1/research" as a substring (e.g. /internal/proxy/v1/research-status)
+    # don't get audited / forced through this branch.
+    if not (
+        request.url.path == "/v1/research"
+        or request.url.path.startswith("/v1/research/")
+    ):
         return await call_next(request)
 
     ctx = RequestContext(endpoint=f"{request.method} {request.url.path}")
@@ -423,6 +436,11 @@ async def research_audit_middleware(
                 status_code=response.status_code,
                 latency_ms=int(duration * 1000),
                 rows_returned=ctx.rows_returned,
+                as_of_range=(
+                    [ctx.as_of_range[0].isoformat(), ctx.as_of_range[1].isoformat()]
+                    if ctx.as_of_range
+                    else None
+                ),
             )
 
         # Skip audit-log persistence on a transient failure but never
