@@ -10,6 +10,102 @@ The deployed version is reported by `GET /v1/research/version` and as
 
 ---
 
+## [v1.0.0-alpha.6] — 2026-05-09 (round 6: bug-review sweep)
+
+Closes the comprehensive bug review run by Codex (gpt-5.5 +
+xhigh) against the `BUG_REVIEW.md` spec. **17/17 findings
+resolved** (1 BLOCKER, 4 HIGH, 6 MEDIUM, 6 LOW).
+
+### Fixed
+
+- **BLOCKER** — `scripts/check_bitemporal_invariants.py`:
+  the `ref_identifier_no_overlapping_pairs` invariant referenced
+  nonexistent `a.daterange` / `b.daterange` columns; replaced
+  with `daterange(a.valid_from, a.valid_to, '[)') &&
+  daterange(b.valid_from, b.valid_to, '[)')`. The H2 invariant
+  gate now resolves on the live schema.
+- **HIGH (round-5 regression)** — research RFC 7807 exception
+  handlers were registered before the generic handlers; FastAPI
+  keeps one handler per exception class, so the generic was
+  overwriting the research envelope. Reordered: generic first,
+  research second so research wins.
+- **HIGH** — `/entities`, `/entities/{id}`, `/disclosures`,
+  `/disclosures/{id}` now query `*_at(:as_of)` PIT functions
+  (added in migrations 0046 and 0051) instead of the underlying
+  current-state tables.
+- **HIGH** — `disclosure_id` path parameter typed as `str` (was
+  `UUID`); KAP IDs (`KAP-2024-1234567`) now path-valid.
+- **HIGH** — disclosure SQL aliases `parent_disclosure_id AS
+  republished_as` to match the OpenAPI contract.
+- `_PUBLIC_PATHS` is now an exact-match `frozenset` of full
+  paths; suffix matching let a future `/v1/research/admin/version`
+  bypass auth.
+- Audit middleware uses `path.startswith("/v1/research/")`
+  instead of substring matching.
+- Compose canary entrypoint shell vars escaped as
+  `$${BITEMPORAL_CANARY_INTERVAL_SECONDS:-300}` so the in-container
+  shell expands them at runtime (was Compose-time, often blank,
+  killing the loop after one iteration).
+- CI workflow trigger paths cover `research_observability.py`,
+  `research_logging.py`, all 0043-0051 migrations, the SQL
+  invariant fallback, and the new tests; lint + mypy steps cover
+  the same files; added a `collect-tests` job.
+
+### Added
+
+- **D2 interval mode** — every list endpoint accepts
+  `?as_of_range=[T1,T2)` (mutually exclusive with `as_of`). New
+  helpers `_parse_as_of_range`, `_enforce_query_cost`,
+  `_reject_pit_with_interval`. Width > 5y or page > 500 → 413
+  `QUERY_TOO_LARGE`. Interval-mode SQL routes through SCD-4
+  history tables (`ref.entity_version`, `kap.disclosures_version`)
+  to return the version chain.
+- **`series_code` resolver** on `/observations` — accepts string
+  catalog IDs (`BIST.GARAN.close`); resolved against
+  `ts.series_catalog`. Direct numeric `series_id` still accepted.
+- `RequestContext.as_of_range` field; request-completed log line
+  surfaces it.
+- `tests/research/test_round6.py` — 12 new integration cases
+  covering `as_of_range` parser variants, `QUERY_TOO_LARGE`,
+  `as_of`/`as_of_range` mutual exclusion, `disclosure_id: str`
+  path parameter, RFC 7807 handler ordering (catches the round-5
+  regression), `_PUBLIC_PATHS` exact-match.
+
+### Changed
+
+- **Response shape alignment with OpenAPI:**
+  - `/entities` returns `entity_id, canonical_name, kind,
+    country, merged_from_entity_ids, split_from_entity_id, as_of,
+    lineage_events`.
+  - `/events` renamed `filing_event_id` → `event_id`,
+    `event_ts` → `occurred_at`, `payload` → `attributes`.
+  - `/disclosures` adds `kap_company_id`, `form_type`,
+    `is_amendment`, `as_of`, `as_of_provenance`,
+    `pre_bitemporal`, `event_kind`.
+  - OpenAPI schemas (`Entity`, `Disclosure`, `FilingEvent`,
+    `Observation`) updated to match; validator passes.
+- `/observations` query parameters renamed:
+  `obs_from`/`obs_to` → `ts_from`/`ts_to`.
+- `/disclosures` no longer carries the `PRE_BITEMPORAL_TABLE`
+  envelope warning (the table IS bitemporal post-0051);
+  per-row `as_of_provenance` enum carries provenance instead.
+  The `PRE_BITEMPORAL_TABLE` warning now applies to `/filings`
+  (Class F; no `doc.filing_at` PIT function in v1).
+- README `/v1/verify/moat-2` → `/v1/research/verify/moat-2`.
+- RUNBOOK migration range `0043-0050` → `0043-0051`.
+
+### Verification
+
+- ruff + mypy --strict clean across the bitemporal-API surface.
+- openapi-spec-validator PASS on the round-6 OpenAPI changes.
+- Phase 2g re-validation on `aslan_shadow_round6_1778302913`:
+  9 registry rows, 9 triggers, 9 PIT functions, 16 flags;
+  `check_bitemporal_invariants.sql` returns 10/10 PASS.
+- `pytest --collect-only -m integration tests/research/` →
+  **48 tests** (was 35).
+
+---
+
 ## [v1.0.0-alpha] — 2026-05-09
 
 First internal-only release of the bitemporal read API. Schema

@@ -1,12 +1,16 @@
 # Bitemporal Research API — HANDOFF
 
-- **Status:** Phases 1-6 complete; Phase 2h reversibility cycle on
-  shadow PASS; Phase 3 fully implemented (14 endpoints); Phase 4
-  tests (22 cases) collectible; Phase 5 docs + CI + deploy entries
-  landed; Phase 6 lint + argon2id + draft PR open. **Not deployed
-  to staging or production** — `BITEMPORAL_API_ENABLED=false` in
-  the seeded `aslan_core.feature_flags` and Phase 7 production
-  deploy is gated on `PROMOTE_TO_PROD` per spec.
+- **Status:** Phases 1-6 complete; bug-review sweep complete
+  (Codex gpt-5.5 + xhigh produced 17 findings; **17/17 closed**
+  in round 6). Phase 2h reversibility cycle on shadow PASS;
+  Phase 3 fully implemented (15 routes including
+  `/v1/research/openapi.json`); Phase 4 tests (**48 cases
+  collected**) covering all D-decisions; Phase 5 docs + CI +
+  deploy entries landed; Phase 6 lint + argon2id + draft PR open
+  (#25). **Not deployed to staging or production** —
+  `BITEMPORAL_API_ENABLED=false` in the seeded
+  `aslan_core.feature_flags` and Phase 7 production deploy is
+  gated on `PROMOTE_TO_PROD` per spec.
 - **Owner:** sidar.
 - **Branch:** `aslan-core/feature/bitemporal-research-api`
 - **Drafted:** 2026-05-09 by autonomous agent run per `bitemporal-api-prompt.md`.
@@ -198,6 +202,47 @@ contract. `argon2-cffi` declared in `pyproject.toml` dependencies.
 - Phase 6 — `ruff` and `mypy --strict` clean on all new files;
   reversibility cycle on shadow PASS (round 3); draft PR open at
   https://github.com/kayadibi1/aslan-core/pull/25.
+
+## Round-6 update — bug-review sweep complete
+
+Codex (gpt-5.5 + xhigh) ran the comprehensive `BUG_REVIEW.md` spec
+and produced 17 findings. **All 17 closed** across three commits:
+
+- `b03076d` part 1 — mechanical fixes including the BLOCKER
+  (invariant SQL referenced nonexistent `daterange` column on
+  `ref.identifier`), the round-5 RFC 7807 handler-order regression,
+  `_PUBLIC_PATHS` exact-match, audit-middleware `startswith`,
+  Compose env-var escape, CI workflow paths, README/RUNBOOK/CHANGELOG
+  refresh.
+- `04047c5` part 2 — `routes/research.py` 1432→1862 LOC: D2
+  interval mode (`as_of_range` + `_enforce_query_cost` →
+  `QUERY_TOO_LARGE`), PIT switch (`/entities` and `/disclosures`
+  to `*_at(:as_of)`), response-shape alignment with OpenAPI
+  (Entity/Disclosure/FilingEvent fields), `disclosure_id: str` for
+  KAP IDs, `series_code` resolution, `ts_from`/`ts_to`,
+  `RequestContext.as_of_range`.
+- `b911496` part 3 — 12 new tests in `test_round6.py` covering
+  the new behaviors; revised TC-008 + new TC-008b for the warning
+  movement; OpenAPI updates for the new schema fields; close-out.
+
+**Phase 2g re-validation on a fresh shadow** with the BLOCKER fix:
+9 registry rows, 9 triggers, 9 PIT functions, 16 feature flags,
+**10/10 invariants PASS**.
+
+**Cumulative test count:** 48 collected under `pytest -m
+integration` (was 35). Lint (ruff) + types (mypy --strict) clean
+across every file in scope.
+
+| Severity | Codex flagged | Closed | Remaining |
+|---|---|---|---|
+| BLOCKER | 1 | 1 | 0 |
+| HIGH | 4 | 4 | 0 |
+| MEDIUM | 6 | 6 | 0 |
+| LOW | 6 | 6 | 0 |
+
+The remaining "deferred" items (cursor keyset-WHERE resumption per
+D7; `doc.filing_at` SCD-4 mirror) are deliberate v1.0.0-beta scope
+decisions, not bugs.
 
 ## What's truly remaining
 
