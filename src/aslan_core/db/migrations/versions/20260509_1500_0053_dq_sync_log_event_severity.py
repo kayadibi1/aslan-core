@@ -21,7 +21,7 @@ Roles:
   - audit_reader  - SELECT only
   - audit_admin   - full
 
-Trigger: audit.severity_rule_change_audit fires AFTER UPDATE/DELETE
+Trigger: audit.severity_rule_change_audit fires AFTER INSERT/UPDATE/DELETE
 on audit.severity_rule and writes a row into audit.event with
 event_type='severity_rule_changed'.
 """
