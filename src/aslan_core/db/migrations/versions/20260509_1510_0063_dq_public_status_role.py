@@ -60,9 +60,7 @@ def upgrade() -> None:
         password = "DEV_ONLY_REPLACE_ME"  # noqa: S105 — intentional dev fallback
 
     op.execute(
-        text("SELECT set_config('aslan.public_status_password', :pw, true)").bindparams(
-            pw=password
-        )
+        text("SELECT set_config('aslan.public_status_password', :pw, true)").bindparams(pw=password)
     )
     op.execute(
         """
@@ -79,9 +77,7 @@ def upgrade() -> None:
         """
     )
 
-    op.execute(
-        "ALTER ROLE public_status_reader SET default_transaction_read_only = on"
-    )
+    op.execute("ALTER ROLE public_status_reader SET default_transaction_read_only = on")
 
     # USAGE on audit schema only — every other schema (streams, doc,
     # ts, src, ref, agg) is unreachable from this role.
@@ -90,12 +86,8 @@ def upgrade() -> None:
     # SELECT on the two public-safe tables only. No other audit.* table
     # is granted — alert_dispatch payloads, validation_failure raw rows,
     # spot_check labels, scorecard notes, etc. all stay private.
-    op.execute(
-        "GRANT SELECT ON audit.recency_observation TO public_status_reader"
-    )
-    op.execute(
-        "GRANT SELECT ON audit.coverage_snapshot TO public_status_reader"
-    )
+    op.execute("GRANT SELECT ON audit.recency_observation TO public_status_reader")
+    op.execute("GRANT SELECT ON audit.coverage_snapshot TO public_status_reader")
 
 
 def downgrade() -> None:
