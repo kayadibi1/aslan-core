@@ -57,6 +57,7 @@ from aslan_core.dashboard.view_models import (
     OverviewVM,
     RedactionRowVM,
     RedactionsVM,
+    ReviewVM,
     SeriesRowVM,
     TimeseriesVM,
 )
@@ -455,6 +456,32 @@ async def redactions_recent(session: AsyncSession, *, limit: int = 50) -> Redact
     )
 
 
+async def review_overview(session: AsyncSession) -> ReviewVM:
+    """Three depth counters across the extractor's review queues.
+
+    Per aslan-event-extractor SCOPE_v2 D26: depth-only at this milestone;
+    the per-row resolution UI lands when there's data to act on.
+    """
+    row = (
+        await session.execute(
+            text(
+                "SELECT "
+                "  (SELECT count(*)::int FROM agg.filing_event_review_queue "
+                "     WHERE resolved_at IS NULL) AS review_queue_pending, "
+                "  (SELECT count(*)::int FROM agg.entity_resolution_queue "
+                "     WHERE resolved_entity_id IS NULL) AS entity_resolution_pending, "
+                "  (SELECT count(*)::int FROM agg.filing_event_quarantine) "
+                "    AS quarantine_total"
+            )
+        )
+    ).one()
+    return ReviewVM(
+        review_queue_pending=row.review_queue_pending,
+        entity_resolution_pending=row.entity_resolution_pending,
+        quarantine_total=row.quarantine_total,
+    )
+
+
 __all__ = [
     "audit_recent",
     "deadletter_recent",
@@ -463,6 +490,7 @@ __all__ = [
     "outbox_recent",
     "overview",
     "redactions_recent",
+    "review_overview",
     "streams_static_list",
     "timeseries_overview",
 ]

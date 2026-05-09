@@ -243,6 +243,32 @@ class RedactionsVM(_VMBase):
     compliance_banner: Literal["Network-edge logging only — not compliance evidence"] = _BANNER_TEXT  # type: ignore[assignment]
 
 
+# ── Review queues (aslan-event-extractor M0) ─────────────────────
+
+
+class ReviewVM(_VMBase):
+    """Top-level /review page — depth counters for the three review
+    queues that aslan-event-extractor populates.
+
+    Per aslan-event-extractor SCOPE_v2 D26 / M0: this is a skeleton —
+    counters only, no per-row resolution UI. The resolution UI lands
+    in the extractor's M3-M5 milestones when there's actual data to
+    review and the counters justify a richer view.
+    """
+
+    review_queue_pending: int
+    """Unresolved rows in agg.filing_event_review_queue (resolved_at IS NULL).
+    Tier 1/2 disagreements awaiting human resolution per SCOPE_v2 D9."""
+
+    entity_resolution_pending: int
+    """Unresolved rows in agg.entity_resolution_queue (resolved_entity_id IS NULL).
+    Counterparty / mentioned-entity name lookups awaiting registry match."""
+
+    quarantine_total: int
+    """Total rows in agg.filing_event_quarantine. Bodies the extractor
+    couldn't process (oversized, parse-failed, low-confidence)."""
+
+
 # ── Error pages ────────────────────────────────────────────────────
 
 

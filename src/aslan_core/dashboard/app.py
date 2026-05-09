@@ -157,6 +157,7 @@ def _register_pages() -> None:
     from aslan_core.dashboard.pages import outbox as _outbox  # noqa: F401
     from aslan_core.dashboard.pages import overview as _overview  # noqa: F401
     from aslan_core.dashboard.pages import redactions as _redactions  # noqa: F401
+    from aslan_core.dashboard.pages import review as _review  # noqa: F401
     from aslan_core.dashboard.pages import streams as _streams  # noqa: F401
     from aslan_core.dashboard.pages import timeseries as _timeseries  # noqa: F401
 
