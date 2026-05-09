@@ -1,4 +1,4 @@
-"""``aslan-core audit`` CLI group — M1 + M2.
+"""``aslan-core audit`` CLI group — M1 + M2 + M3.
 
 Subcommands:
 
@@ -16,11 +16,20 @@ Subcommands:
     spec §13). For each requested source draws N rows into
     ``audit.spot_check_sample`` for /dq/spot-check labelling.
 
+  * ``alert-dispatch`` — evaluate ``audit.severity_rule`` predicates
+    against recent audit.* rows; enqueue + drain pending
+    ``audit.alert_dispatch`` rows through the GlitchTip / email /
+    Slack sinks. See spec §10.3 + §10.4.
+
+  * ``test-alert`` — emit a synthetic alert through the configured
+    sinks for live-deployment smoke testing.
+
 Cadence:
 
   * recency-sweep — every 60s (spec §10.2)
   * coverage-snapshot — every 5m (spec §10.2)
   * spot-check-draw — weekly Mon 06:00 UTC (spec §13)
+  * alert-dispatch — every 60s (spec §10.4)
 
 Each writes durable rows that the dashboard reads back via the
 /dq/* pages.
@@ -29,6 +38,7 @@ Each writes durable rows that the dashboard reads back via the
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
@@ -36,11 +46,13 @@ import click
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from aslan_core.config import Settings
 from aslan_core.db.engine import create_engine
 from aslan_core.db.session import create_session_factory
-from aslan_core.dq import coverage, event, recency, spot_check
+from aslan_core.dq import alert_dispatch, coverage, event, recency, spot_check
 from aslan_core.dq._sql import SELECT_RECENCY_SLA
 from aslan_core.dq.probes import SOURCES, get_probe
+from aslan_core.dq.sinks import Sink, build_default_sinks
 from aslan_core.dq.types import Severity
 
 
@@ -470,6 +482,193 @@ async def _run_spot_check_draw(source_filter: str | None, n_per_source: int) -> 
             return {"drawn": drawn, "sources": sources_touched}
     finally:
         await engine.dispose()
+
+
+# ── alert-dispatch ─────────────────────────────────────────────────
+
+
+@audit.command("alert-dispatch")
+@click.option(
+    "--evaluate-only",
+    "evaluate_only",
+    is_flag=True,
+    default=False,
+    help=(
+        "Just evaluate severity rules + enqueue audit.alert_dispatch rows; "
+        "do not deliver pending rows through the sinks."
+    ),
+)
+@click.option(
+    "--dispatch-only",
+    "dispatch_only",
+    is_flag=True,
+    default=False,
+    help=("Just deliver pending audit.alert_dispatch rows; do not run the predicate evaluator."),
+)
+def alert_dispatch_cmd(evaluate_only: bool, dispatch_only: bool) -> None:
+    """Evaluate severity rules + drain pending alert dispatches.
+
+    Default behaviour (no flags) is the canonical cron loop: run the
+    predicate evaluator first to land freshly-fired conditions in
+    ``audit.alert_dispatch``, then drain pending rows through the
+    sinks.
+
+    --evaluate-only and --dispatch-only are mutually exclusive ways
+    to run only half the loop (useful for testing and for splitting
+    enqueue and dispatch onto separate cron schedules in the future).
+    """
+    if evaluate_only and dispatch_only:
+        raise click.UsageError("--evaluate-only and --dispatch-only are mutually exclusive")
+    summary = asyncio.run(
+        _run_alert_dispatch(evaluate_only=evaluate_only, dispatch_only=dispatch_only)
+    )
+    click.echo(
+        f"alert-dispatch complete: {summary['enqueued']} enqueued, {summary['delivered']} delivered"
+    )
+
+
+async def _run_alert_dispatch(
+    *,
+    evaluate_only: bool,
+    dispatch_only: bool,
+    settings: Settings | None = None,
+    sinks: dict[str, Sink] | None = None,
+) -> dict[str, int]:
+    """Inner async loop. The ``settings`` / ``sinks`` kwargs are test-only
+    overrides — production callers go through the click command which
+    constructs a real ``Settings()`` and the canonical default sinks.
+    """
+    if settings is None:
+        settings = Settings()
+    enqueued = 0
+    delivered = 0
+    if not dispatch_only:
+        engine = create_engine()
+        factory = create_session_factory(engine)
+        try:
+            async with factory() as s:
+                enqueued = await alert_dispatch.evaluate_and_enqueue(session=s, settings=settings)
+                await s.commit()
+        finally:
+            await engine.dispose()
+    if not evaluate_only:
+        delivered = await alert_dispatch.dispatch_pending(settings=settings, sinks=sinks)
+    return {"enqueued": enqueued, "delivered": delivered}
+
+
+# ── test-alert ─────────────────────────────────────────────────────
+
+
+@audit.command("test-alert")
+@click.option(
+    "--severity",
+    type=click.Choice(["info", "warn", "error", "critical"]),
+    default="info",
+    show_default=True,
+    help="Severity stamp on the synthetic event + dispatch row.",
+)
+@click.option(
+    "--sink",
+    "sink_filter",
+    type=click.Choice(["glitchtip", "email", "slack", "all"]),
+    default="all",
+    show_default=True,
+    help="Restrict the synthetic dispatch to one sink. Default fans out to all three.",
+)
+def test_alert_cmd(severity: str, sink_filter: str) -> None:
+    """Emit one synthetic alert through the configured sinks.
+
+    Useful for live-deployment smoke testing — no real upstream
+    condition required. The synthetic dispatch lands a row in
+    ``audit.alert_dispatch`` with ``rule_name='test_alert'`` and a
+    payload that identifies it as synthetic.
+
+    NOTE: ``test_alert`` is NOT a row in ``audit.severity_rule``; the
+    dispatch row uses a fabricated ``rule_name`` that the dispatcher
+    will skip on subsequent runs (no severity_rule entry → no
+    re-enqueue). The synthetic dispatch is drained immediately by this
+    command; subsequent ``alert-dispatch`` cron runs see no leftover.
+    """
+    summary = asyncio.run(_run_test_alert(severity=severity, sink_filter=sink_filter))
+    click.echo(
+        f"test-alert complete: {summary['delivered']} delivered, "
+        f"{summary['suppressed']} suppressed, {summary['failed']} failed"
+    )
+
+
+async def _run_test_alert(
+    *,
+    severity: str,
+    sink_filter: str,
+    settings: Settings | None = None,
+    sinks: dict[str, Sink] | None = None,
+) -> dict[str, int]:
+    """Inner async test-alert. ``settings`` / ``sinks`` kwargs are test-only
+    overrides for the integration test."""
+    if settings is None:
+        settings = Settings()
+    if sinks is None:
+        sinks = build_default_sinks(settings)
+    target_sinks = list(sinks.keys()) if sink_filter == "all" else [sink_filter]
+    synthetic_payload: dict[str, Any] = {
+        "synthetic": True,
+        "test_alert_id": str(uuid.uuid4()),
+        "emitted_at": datetime.now(UTC).isoformat(),
+        "note": "synthetic test-alert; safe to ignore",
+    }
+    delivered = 0
+    suppressed = 0
+    failed = 0
+    # Emit the audit.event marker so the dashboard's event stream
+    # carries a record of the smoke test, then drive each sink in turn
+    # with the synthetic payload. We bypass the audit.alert_dispatch
+    # table here (the synthetic rule_name doesn't exist in
+    # audit.severity_rule, so an INSERT would FK-fail) and call the
+    # sinks directly.
+    engine = create_engine()
+    factory = create_session_factory(engine)
+    try:
+        async with factory() as s:
+            await event.emit(
+                session=s,
+                event_type="test_alert_emitted",
+                emitter="cli:audit-test-alert",
+                severity=Severity(severity),
+                payload=synthetic_payload,
+            )
+            await s.commit()
+    finally:
+        await engine.dispose()
+
+    for sink_name in target_sinks:
+        sink_impl = sinks.get(sink_name)
+        if sink_impl is None:
+            failed += 1
+            click.echo(f"  {sink_name}: unknown sink", err=True)
+            continue
+        try:
+            ok = await sink_impl.deliver(
+                payload=synthetic_payload,
+                severity=severity,
+                rule_name="test_alert",
+            )
+        except Exception as exc:
+            from aslan_core.dq.sinks import SinkNotConfigured
+
+            if isinstance(exc, SinkNotConfigured):
+                suppressed += 1
+                click.echo(f"  {sink_name}: suppressed ({exc})", err=True)
+            else:
+                failed += 1
+                click.echo(f"  {sink_name}: failed ({exc})", err=True)
+            continue
+        if ok:
+            delivered += 1
+            click.echo(f"  {sink_name}: delivered")
+        else:
+            failed += 1
+            click.echo(f"  {sink_name}: returned False", err=True)
+    return {"delivered": delivered, "suppressed": suppressed, "failed": failed}
 
 
 __all__ = ["SOURCES", "audit"]
