@@ -226,7 +226,7 @@ wheels = [
 
 [[package]]
 name = "aslan-core"
-version = "0.9.0"
+version = "0.11.0"
 source = { editable = "." }
 dependencies = [
     { name = "aioboto3" },
