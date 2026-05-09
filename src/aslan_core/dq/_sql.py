@@ -207,3 +207,38 @@ SELECT_REGRESSION_FLAGS_OPEN = text(
     "ORDER BY detected_at DESC "
     "LIMIT :limit"
 )
+
+
+# ── dq M6: scorecard_snapshot ────────────────────────────────────
+
+
+UPSERT_SCORECARD_SNAPSHOT = text(
+    "INSERT INTO audit.scorecard_snapshot("
+    "  week_start, metric_name, target, actual, status, notes"
+    ") VALUES ("
+    "  :week_start, :metric_name, :target, :actual, :status, :notes"
+    ") ON CONFLICT (week_start, metric_name) DO UPDATE SET "
+    "  actual = EXCLUDED.actual, "
+    "  status = EXCLUDED.status, "
+    "  notes = EXCLUDED.notes"
+)
+
+SELECT_SCORECARD_SNAPSHOT_BY_WEEK = text(
+    "SELECT week_start, metric_name, target, actual, status, notes, recorded_at "
+    "FROM audit.scorecard_snapshot "
+    "WHERE week_start = :week_start "
+    "ORDER BY metric_name"
+)
+
+SELECT_SCORECARD_SNAPSHOT_WEEKS = text(
+    "SELECT week_start, "
+    "  count(*) FILTER (WHERE status = 'pass')::int AS pass_count, "
+    "  count(*) FILTER (WHERE status = 'warn')::int AS warn_count, "
+    "  count(*) FILTER (WHERE status = 'fail')::int AS fail_count, "
+    "  count(*)::int AS total_count, "
+    "  max(recorded_at) AS recorded_at "
+    "FROM audit.scorecard_snapshot "
+    "GROUP BY week_start "
+    "ORDER BY week_start DESC "
+    "LIMIT :limit"
+)
