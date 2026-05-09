@@ -261,6 +261,8 @@ services:
     build:
       context: /home/emersus
       dockerfile: aslan-core/infra/deploy/Dockerfile.event-extractor
+    env_file:
+      - .env
     environment:
       EXTRACTOR_POSTGRES_DSN: "postgresql+asyncpg://aslan:aslan@postgres:5432/aslan"
       ASLAN_PG_DSN: "postgresql+asyncpg://aslan:aslan@postgres:5432/aslan"
