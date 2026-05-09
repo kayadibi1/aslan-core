@@ -1,5 +1,52 @@
 # CHANGELOG
 
+## v0.11.0 — 2026-05-08 — `agg.filing_event` schema for aslan-event-extractor M0
+
+### Added
+
+- **`agg.filing_event_type` ENUM** — 32 values, locked by
+  `aslan-event-extractor/SCOPE.md` D18. Migration 0034.
+- **`agg.filing_event` table + `agg.filing_event_current` view + 6
+  indexes**. Bitemporal (`as_of` / `superseded_at`); cross-schema FKs
+  to `doc.filing`, `ref.entity`, `src.ingestion_run`. Migration 0035.
+- **`agg.filing_event_quarantine`** — bodies the extractor cannot
+  process. Migration 0036.
+- **`agg.filing_event_review_queue`** — Tier 1/2 disagreements awaiting
+  human resolution; partial index `freview_unresolved`. Migration 0037.
+- **`agg.filing_event_extraction_state`** — composite PK
+  `(filing_id, model_version, prompt_version)` driving re-extraction
+  on prompt/model upgrades. Migration 0038.
+- **`agg.filing_event_pii_index`** — GDPR Art. 17 PII path index;
+  ON DELETE CASCADE on `filing_event_id`. Privileged-only (NOT
+  granted to `aslan_dashboard`). Migration 0039.
+- **`agg.entity_resolution_queue`** — counterparty / mentioned-entity
+  resolution backlog; partial index `erq_pending`. Migration 0040.
+- **`agg.extraction_audit_log`** hypertable — every LLM call audited
+  for SOC II Processing Integrity; 30-day chunks, compressed after
+  90 days; PK is composite `(audit_id, started_at)` (TimescaleDB
+  partitioning-column-in-PK requirement). Privileged-only (NOT
+  granted to `aslan_dashboard`). Migration 0041.
+- **`agg.filing_event_label`** — ground-truth labels for the
+  500-disclosure benchmark set; partial index `fel_holdout`.
+  Migration 0042.
+- **ORM classes** for the 8 new tables in `aslan_core.models.agg`:
+  `FilingEvent`, `FilingEventQuarantine`, `FilingEventReviewQueue`,
+  `FilingEventExtractionState`, `FilingEventPiiIndex`,
+  `EntityResolutionQueue`, `ExtractionAuditLog`, `FilingEventLabel`.
+
+### Notes
+
+- Migrations 0034–0042 are additive; existing schemas unchanged.
+- `extraction_audit_log` PK is `(audit_id, started_at)` (composite)
+  because TimescaleDB hypertables require the partitioning column in
+  the PK. SCOPE §5.3's draft wording showed `audit_id BIGSERIAL PK`
+  — the composite is the resolved form.
+- `/review` operator route deferred to a follow-up PR (M0 nominally,
+  but the existing dashboard's view-model + register_template
+  pattern requires its own care to avoid regressing the 30+
+  dashboard invariant tests; track as `aslan-event-extractor` M0
+  follow-up).
+
 ## v0.6.0 — 2026-05-01 — Internal ops dashboard
 
 ### Added
