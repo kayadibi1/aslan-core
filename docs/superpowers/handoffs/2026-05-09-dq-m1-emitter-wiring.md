@@ -457,8 +457,12 @@ auto-dismissed flags are NOT shown in the open-queue (they leave
   v1 uses ±5 calendar days as a Mon-Fri ±3-trading-day approximation.
   Once `ref.calendar_tr` is populated, swap the SQL window to a real
   trading-day calculation.
-* **Curated top-50 entity roster** — sidar curation pending. See
-  the inline TODO in `regression_detect._SELECT_TOP_BIST_ENTITIES`.
+* **Curated top-50 entity roster** — DONE in migration 0065
+  (`audit.curated_top_50`). BIST-30 + 20 strategic-coverage extras
+  seeded with deterministic UUIDv5 entity_id keys. The dispatcher
+  rule `regression_flag_critical_entity` predicate now resolves to
+  a non-empty IN-list. See follow-up: production must backfill
+  `entity_id` to match `ref.entity` once that registry is populated.
 
 
 ## M6 weekly scorecard
@@ -554,13 +558,28 @@ body kicks in unchanged.
 * **GET /dq/scorecard/export** — downloads a standalone HTML file
   named `aslan-scorecard-YYYY-MM-DD.html` for the current week.
 
-### PDF export — deferred to M6.1
+### PDF export — DONE via WeasyPrint
 
-Real PDF rendering (WeasyPrint or reportlab) is deferred. The Export
-button serves HTML; the operator's browser does the print-to-PDF step.
-Documented inline in `dq.scorecard.render_html`'s docstring + the
-dashboard footer; ticket the M6.1 follow-up alongside the next `[obs]`
-extras refresh.
+Real PDF rendering ships through `dq.scorecard.render_pdf` and the
+`/dq/scorecard/export?format=pdf` dashboard endpoint. WeasyPrint is
+installed via the optional `aslan-core[obs]` extra (the same group
+holding sentry-sdk + opentelemetry + prometheus-client); the import
+is lazy so a base aslan-core install runs without it. When the extra
+is missing the endpoint returns 503 with the install hint and the
+HTML export keeps working.
+
+**Hetzner image — required native deps.** WeasyPrint depends on
+pango / cairo / gdk-pixbuf at runtime (the Python wheel does NOT
+bundle them). The production image must `apt install`:
+
+```
+libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz-subset0
+```
+
+Without these the lazy import succeeds but `render_pdf` raises a
+WeasyPrint-internal `OSError` at the first text-shape call. Add the
+apt line to the Dockerfile / Ansible play that builds the dashboard
+image alongside the existing `[obs]` install.
 
 ### Migration 0062
 
