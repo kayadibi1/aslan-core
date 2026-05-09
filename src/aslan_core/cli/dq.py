@@ -1,4 +1,4 @@
-"""``aslan-core audit`` CLI group — M1.
+"""``aslan-core audit`` CLI group — M1 + M2.
 
 Subcommands:
 
@@ -12,8 +12,16 @@ Subcommands:
     spec §8, write one row to ``audit.coverage_snapshot``. See
     spec §8.
 
-Both subcommands are designed to run as a cron (every 60s for
-recency-sweep, every 5m for coverage-snapshot per spec §10.2).
+  * ``spot-check-draw`` — weekly random sample (Mon 06:00 UTC per
+    spec §13). For each requested source draws N rows into
+    ``audit.spot_check_sample`` for /dq/spot-check labelling.
+
+Cadence:
+
+  * recency-sweep — every 60s (spec §10.2)
+  * coverage-snapshot — every 5m (spec §10.2)
+  * spot-check-draw — weekly Mon 06:00 UTC (spec §13)
+
 Each writes durable rows that the dashboard reads back via the
 /dq/* pages.
 """
@@ -30,7 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from aslan_core.db.engine import create_engine
 from aslan_core.db.session import create_session_factory
-from aslan_core.dq import coverage, event, recency
+from aslan_core.dq import coverage, event, recency, spot_check
 from aslan_core.dq._sql import SELECT_RECENCY_SLA
 from aslan_core.dq.probes import SOURCES, get_probe
 from aslan_core.dq.types import Severity
@@ -385,6 +393,88 @@ async def _run_coverage_snapshot() -> dict[str, int]:
                     written += 1
             await s.commit()
             return {"written": written, "skipped": skipped}
+    finally:
+        await engine.dispose()
+
+
+# ── spot-check-draw ────────────────────────────────────────────────
+
+
+# All 5 sources draw their primary table (kap.disclosures,
+# bist.daily_ohlcv, …) per dq.spot_check internal catalogue. KAP
+# alone gets a stratified high-priority over-sample (spec §7.2).
+_SPOT_CHECK_SOURCES: tuple[str, ...] = ("kap", "bist", "evds", "tefas", "mkk")
+
+
+@audit.command("spot-check-draw")
+@click.option(
+    "--source",
+    "source_filter",
+    default=None,
+    help=(
+        "Limit the draw to one source (kap|bist|evds|tefas|mkk). "
+        "Default: draw across all five."
+    ),
+)
+@click.option(
+    "--n",
+    "n_per_source",
+    type=int,
+    default=10,
+    show_default=True,
+    help="Rows to draw per source.",
+)
+def spot_check_draw_cmd(source_filter: str | None, n_per_source: int) -> None:
+    """Draw N random rows per source into audit.spot_check_sample.
+
+    For KAP, the draw is stratified over high-priority event types
+    (material_event, dividend, share_buyback, capital_action) at 2x
+    weight — see spec §7.2. Cron schedule: Mon 06:00 UTC.
+    """
+    summary = asyncio.run(_run_spot_check_draw(source_filter, n_per_source))
+    click.echo(
+        f"spot-check-draw complete: {summary['drawn']} samples drawn across "
+        f"{summary['sources']} source(s)"
+    )
+
+
+async def _run_spot_check_draw(
+    source_filter: str | None, n_per_source: int
+) -> dict[str, int]:
+    engine = create_engine()
+    factory = create_session_factory(engine)
+    try:
+        async with factory() as s:
+            drawn = 0
+            sources_touched = 0
+            sources = (
+                (source_filter,) if source_filter is not None else _SPOT_CHECK_SOURCES
+            )
+            for source in sources:
+                stratum = "high_priority_event_type" if source == "kap" else None
+                try:
+                    sample_ids = await spot_check.draw_sample(
+                        session=s,
+                        source=source,
+                        n=n_per_source,
+                        stratum=stratum,
+                    )
+                except ValueError as exc:
+                    # Bad source filter (e.g. typo on the CLI) — log
+                    # rather than crash the whole sweep.
+                    await event.emit(
+                        session=s,
+                        event_type="spot_check_draw_invalid",
+                        emitter=f"spot-check-draw:{source}",
+                        severity=Severity.WARN,
+                        payload={"source": source, "error": str(exc)},
+                    )
+                    continue
+                drawn += len(sample_ids)
+                if sample_ids:
+                    sources_touched += 1
+            await s.commit()
+            return {"drawn": drawn, "sources": sources_touched}
     finally:
         await engine.dispose()
 
