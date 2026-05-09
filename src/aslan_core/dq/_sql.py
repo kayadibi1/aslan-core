@@ -74,6 +74,5 @@ INSERT_RECENCY_OBSERVATION = text(
 )
 
 SELECT_RECENCY_SLA = text(
-    "SELECT source, dimension, sla_seconds FROM audit.recency_sla "
-    "ORDER BY source, dimension"
+    "SELECT source, dimension, sla_seconds FROM audit.recency_sla ORDER BY source, dimension"
 )
