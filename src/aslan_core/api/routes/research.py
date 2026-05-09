@@ -2262,7 +2262,9 @@ async def quality_scores(
         pagination=pagination,
     )
     body_bytes = _json.dumps(env, sort_keys=True, default=str).encode("utf-8")
-    set_cache_headers(response, as_of_resolved=resolved, body_bytes=body_bytes)
+    # Per SCOPE.md D17: interval cache freshness hinges on T2.
+    cache_as_of = interval[1] if interval is not None else resolved
+    set_cache_headers(response, as_of_resolved=cache_as_of, body_bytes=body_bytes)
     return env
 
 
