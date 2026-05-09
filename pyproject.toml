@@ -111,6 +111,9 @@ ignore = [
 # PII regex + comments deliberately use Turkish characters (ÇĞİÖŞÜ + lowercase)
 # that ruff flags as ambiguous against ASCII look-alikes.
 "src/aslan_core/timeseries/pii.py" = ["RUF001", "RUF002", "RUF003"]
+# dq probe module docstrings preserve Turkish source/agency names verbatim
+# per workspace CLAUDE.md "Turkish-language fidelity" (no auto-translation).
+"src/aslan_core/dq/probes/*.py" = ["RUF001", "RUF002", "RUF003"]
 # FastAPI Depends() / Query() in default args is the canonical DI pattern;
 # suppress B008 across all API route and dependency modules.
 "src/aslan_core/api/**" = ["B008"]
