@@ -7,8 +7,9 @@ The big additions exercised here are:
   normalization, malformed input, naive endpoints, T1 >= T2.
 - Mutual exclusion of ``as_of`` and ``as_of_range`` on list endpoints
   (BITEMPORAL_INTERVAL_INVALID).
-- Defense-in-depth ``_enforce_query_cost`` — width > 5y → 413
-  ``QUERY_TOO_LARGE``; FastAPI ``Query(le=500)`` → 422 on overflow.
+- ``_enforce_query_cost`` (D19) — width > 5y → 413
+  ``QUERY_TOO_LARGE``; ``limit > 500`` also surfaces as
+  ``QUERY_TOO_LARGE`` 413 (was 422 in round 6; pass-2 catch).
 - ``disclosure_id: str`` path-parameter type (KAP IDs of the form
   ``KAP-2024-1234567`` must NOT be rejected as non-UUID at routing).
 - ``_PRE_BITEMPORAL_WARNING`` shape on ``/filings``.
@@ -145,30 +146,32 @@ def test_as_of_range_parser_half_open() -> None:
     assert t2.microsecond == 0
 
 
-def test_as_of_range_parser_closed_bracket_normalized_to_half_open() -> None:
-    """Round-6 §4/X1 (D2 closed-bracket normalization).
+def test_as_of_range_parser_rejects_non_canonical_brackets() -> None:
+    """Round-7 (closes pass-2 finding §4/X2 — bracket-form drift).
 
-    closes BUG_REVIEW_FINDINGS HIGH §4/X1 as_of_range — closed-on-T2
-    forms ``[T1,T2]`` and ``(T1,T2]`` are normalized to half-open by
-    bumping the upper bound by 1 microsecond so the boundary row is
-    still included; open-on-T1 forms ``(T1,T2)`` and ``(T1,T2]`` shift
-    the lower bound inward by 1 microsecond.
+    Earlier rounds accepted ``(T1,T2)``, ``[T1,T2]``, and ``(T1,T2]``
+    via microsecond normalization. The OpenAPI ``AsOfRange.pattern``
+    is ``^\\[[^,]+,[^)]+\\)$`` — only the canonical half-open form
+    ``[T1,T2)`` is permitted. Server now matches the contract.
     """
+    from fastapi import HTTPException
+
     from aslan_core.api.routes.research import _parse_as_of_range
 
-    # Closed upper bracket: T2 bumps by 1us.
-    closed = _parse_as_of_range("(2024-01-01T00:00:00Z,2025-01-01T00:00:00Z]")
-    assert closed is not None
-    c_t1, c_t2 = closed
-    assert c_t1.microsecond == 1  # opened on lower → +1us
-    assert c_t2.microsecond == 1  # closed on upper → +1us
-
-    # Both open: T1 bumps by 1us, T2 unchanged.
-    both_open = _parse_as_of_range("(2024-01-01T00:00:00Z,2025-01-01T00:00:00Z)")
-    assert both_open is not None
-    o_t1, o_t2 = both_open
-    assert o_t1.microsecond == 1
-    assert o_t2.microsecond == 0
+    non_canonical = [
+        "(2024-01-01T00:00:00Z,2025-01-01T00:00:00Z)",  # both open
+        "[2024-01-01T00:00:00Z,2025-01-01T00:00:00Z]",  # both closed
+        "(2024-01-01T00:00:00Z,2025-01-01T00:00:00Z]",  # closed upper
+    ]
+    for raw in non_canonical:
+        try:
+            _parse_as_of_range(raw)
+            raise AssertionError(f"expected reject for {raw!r}")
+        except HTTPException as exc:
+            assert exc.status_code == 400
+            detail = exc.detail
+            assert isinstance(detail, dict)
+            assert detail.get("code") == "BITEMPORAL_INTERVAL_INVALID"
 
 
 def test_as_of_range_parser_malformed_string_rejected() -> None:
@@ -304,18 +307,20 @@ def test_query_too_large_when_as_of_range_width_exceeds_5_years(
 
 
 # ---------------------------------------------------------------------
-# 8. limit=501 → 422 from FastAPI's Query(le=500) validation.
+# 8. limit=501 → 413 QUERY_TOO_LARGE from _enforce_query_cost (D19).
 # ---------------------------------------------------------------------
 
 
-def test_limit_above_500_rejected_at_validation_layer(
+def test_limit_above_500_returns_query_too_large(
     client: TestClient, db_dsn: str
 ) -> None:
-    """Round-6 §4/X3 (limit hard cap) — closes BUG_REVIEW_FINDINGS HIGH §4/X3.
+    """Round-7 (closes pass-2 finding §4/X2 — limit hard cap).
 
-    ``Query(le=500)`` is enforced by FastAPI before the route body
-    runs; we confirm the 422 response shape so the contract regresses
-    visibly if someone widens the cap without updating SCOPE.md.
+    The earlier ``Query(le=500)`` constraint was removed so the cap
+    flows through ``_enforce_query_cost`` and surfaces as the
+    documented ``413 QUERY_TOO_LARGE`` envelope (SCOPE D19) instead
+    of FastAPI's 422 validation shape. Pass-2 caught the original
+    test asserting 422 — the bug was code-and-test in one piece.
     """
     _set_master_flag(db_dsn, value=True)
     try:
@@ -325,7 +330,11 @@ def test_limit_above_500_rejected_at_validation_layer(
             params={"limit": 501},
             headers={"X-Aslan-Api-Key": f"{key_id}:{secret}"},
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 413
+        body = resp.json()
+        # RFC 7807 envelope per the research handler.
+        assert body.get("code") == "QUERY_TOO_LARGE"
+        assert body.get("status") == 413
     finally:
         _set_master_flag(db_dsn, value=False)
 

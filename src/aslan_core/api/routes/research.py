@@ -105,16 +105,15 @@ def _parse_as_of(raw: str | None) -> datetime | None:
 def _parse_as_of_range(raw: str | None) -> tuple[datetime, datetime] | None:
     """Parse an interval ``as_of_range`` query param.
 
-    Per SCOPE.md D2 / OPENAPI.yaml ``AsOfRange``: accepts shapes
-    ``[T1,T2)``, ``[T1,T2]``, ``(T1,T2)``, ``(T1,T2]`` where T1 / T2
-    are ISO-8601 timestamps with explicit timezone. Returns the
-    half-open ``(T1_inclusive, T2_exclusive)`` form regardless of
-    input bracket — closed-on-T1 and open-on-T2 is the canonical
-    interval-mode contract per D2.
+    Per SCOPE.md D2 / OPENAPI.yaml ``AsOfRange``: only the canonical
+    half-open form ``[T1,T2)`` is accepted (T1-inclusive, T2-exclusive).
+    T1 and T2 are ISO-8601 timestamps with explicit timezone.
 
-    Closed-bracket forms shift their endpoint by one microsecond so
-    the semantics map to half-open without losing rows on the
-    boundary; open-bracket forms shift inward equivalently.
+    Earlier rounds tolerated ``(T1,T2)``, ``[T1,T2]``, and ``(T1,T2]``
+    via microsecond normalization; pass-2 finding 9 flagged that as
+    contract drift (the OpenAPI ``AsOfRange.pattern`` is
+    ``^\\[[^,]+,[^)]+\\)$``). Generated SDKs reject any non-canonical
+    form, so we now reject server-side too — one shape, one contract.
 
     Raises ``HTTPException(400, BITEMPORAL_INTERVAL_INVALID)`` on
     malformed input or T1 >= T2.
@@ -122,7 +121,7 @@ def _parse_as_of_range(raw: str | None) -> tuple[datetime, datetime] | None:
     if raw is None:
         return None
     s = raw.strip()
-    if len(s) < 5 or s[0] not in "[(" or s[-1] not in "])":
+    if len(s) < 5 or s[0] != "[" or s[-1] != ")":
         raise HTTPException(
             status_code=400,
             detail={
@@ -130,13 +129,11 @@ def _parse_as_of_range(raw: str | None) -> tuple[datetime, datetime] | None:
                     "https://docs.aslanterminal.com/errors/"
                     "BITEMPORAL_INTERVAL_INVALID"
                 ),
-                "title": "as_of_range malformed",
+                "title": "as_of_range must be the canonical half-open form [T1,T2)",
                 "code": "BITEMPORAL_INTERVAL_INVALID",
                 "extensions": {"received_value": raw},
             },
         )
-    open_bracket = s[0]
-    close_bracket = s[-1]
     inner = s[1:-1]
     # Split on the first comma not inside a date offset (offset never
     # contains commas, so a plain split on the first ``,`` is safe).
@@ -185,11 +182,6 @@ def _parse_as_of_range(raw: str | None) -> tuple[datetime, datetime] | None:
         )
     t1 = t1.astimezone(UTC)
     t2 = t2.astimezone(UTC)
-    # Normalize to half-open [t1, t2).
-    if open_bracket == "(":
-        t1 = t1 + timedelta(microseconds=1)
-    if close_bracket == "]":
-        t2 = t2 + timedelta(microseconds=1)
     if not (t1 < t2):
         raise HTTPException(
             status_code=400,
@@ -211,13 +203,17 @@ def _enforce_query_cost(
     as_of_range: tuple[datetime, datetime] | None,
     limit: int,
 ) -> None:
-    """Per SCOPE.md D19: defense-in-depth row / window caps.
+    """Per SCOPE.md D19: row / window caps with the documented contract.
 
     Raises ``HTTPException(413, QUERY_TOO_LARGE)`` when:
 
     - ``as_of_range`` width exceeds 5 years (per-key override deferred);
-    - ``limit`` exceeds the documented hard cap (``Query(le=500)`` is
-      already enforced by FastAPI; this is belt-and-suspenders).
+    - ``limit`` exceeds ``_LIMIT_HARD_CAP`` (500).
+
+    Note: ``Query(default=50, ge=1)`` deliberately omits ``le=500`` so
+    that an oversize page returns the documented 413 ``QUERY_TOO_LARGE``
+    envelope rather than FastAPI's 422 validation shape. This was
+    flagged by Codex pass-2 finding 5 / 8 / TC-074.
     """
     if as_of_range is not None:
         width = as_of_range[1] - as_of_range[0]
@@ -266,6 +262,35 @@ def _reject_pit_with_interval(
                 ),
                 "title": "as_of and as_of_range are mutually exclusive",
                 "code": "BITEMPORAL_INTERVAL_INVALID",
+            },
+        )
+
+
+def _gate_interval_flag(
+    *,
+    as_of_range: tuple[datetime, datetime] | None,
+    flags: FeatureFlagState,
+) -> None:
+    """Per SCOPE.md D2 / TESTPLAN TC-074: interval-mode requires the flag.
+
+    ``BITEMPORAL_API_INTERVAL_QUERIES`` defaults to ``true`` per
+    SCOPE.md §3 / migration 0048, so production behavior is unchanged
+    unless an operator deliberately flips the flag off. When disabled,
+    interval requests are rejected with 503 ``FEATURE_DISABLED`` so PIT
+    reads remain available without restart.
+    """
+    if as_of_range is None:
+        return
+    if not flags.enabled.get("BITEMPORAL_API_INTERVAL_QUERIES", False):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "type": (
+                    "https://docs.aslanterminal.com/errors/FEATURE_DISABLED"
+                ),
+                "title": "Interval queries are disabled",
+                "code": "FEATURE_DISABLED",
+                "extensions": {"flag": "BITEMPORAL_API_INTERVAL_QUERIES"},
             },
         )
 
@@ -491,7 +516,7 @@ async def observations(
     ts_from: datetime | None = Query(default=None),
     ts_to: datetime | None = Query(default=None),
     cursor: str | None = Query(default=None),
-    limit: int = Query(default=50, ge=1, le=500),
+    limit: int = Query(default=50, ge=1),
 ) -> dict[str, Any]:
     """Per SCOPE.md D1: ``ts.observation_at(p_as_of)``.
 
@@ -502,6 +527,7 @@ async def observations(
     """
     _reject_pit_with_interval(as_of=as_of, as_of_range=as_of_range)
     interval = _parse_as_of_range(as_of_range)
+    _gate_interval_flag(as_of_range=interval, flags=flags)
     _enforce_query_cost(as_of_range=interval, limit=limit)
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
@@ -562,11 +588,17 @@ async def observations(
         decode_cursor(cursor, filters_for_cursor)
         # TODO(D7): apply keyset WHERE from decoded["anchor"] in v1.0.0-beta.
 
+    # Per TC-014: interval mode returns the version chain ordered by
+    # natural key + as_of ASC; PIT mode keeps the display ordering.
+    if interval is not None:
+        order_by = "ORDER BY series_id, ts, as_of ASC"
+    else:
+        order_by = "ORDER BY series_id, ts DESC"
     sql = _build_filtered_sql(
         select_clause="SELECT series_id, ts, as_of, value, value_text",
         pit_call="ts.observation_at(:as_of)",
         where_parts=where_parts,
-        order_by="ORDER BY series_id, ts DESC",
+        order_by=order_by,
         as_of_range=interval,
     )
     rows = await session.execute(text(sql), params)
@@ -603,7 +635,10 @@ async def observations(
         pagination=pagination,
     )
     body_bytes = _json.dumps(env, sort_keys=True, default=str).encode("utf-8")
-    set_cache_headers(response, as_of_resolved=resolved, body_bytes=body_bytes)
+    # Per SCOPE.md D17: interval requests are immutable when T2 <= NOW()-5m;
+    # cache freshness hinges on the interval upper bound, not on now().
+    cache_as_of = interval[1] if interval is not None else resolved
+    set_cache_headers(response, as_of_resolved=cache_as_of, body_bytes=body_bytes)
     return env
 
 
@@ -703,7 +738,7 @@ async def financials_canonical(
         description="Optional filter; defaults to both bases.",
     ),
     cursor: str | None = Query(default=None),
-    limit: int = Query(default=50, ge=1, le=500),
+    limit: int = Query(default=50, ge=1),
 ) -> dict[str, Any]:
     """Per SCOPE.md D1, D8: ``ts.canonical_financial_at(p_as_of)``.
 
@@ -713,6 +748,7 @@ async def financials_canonical(
     """
     _reject_pit_with_interval(as_of=as_of, as_of_range=as_of_range)
     interval = _parse_as_of_range(as_of_range)
+    _gate_interval_flag(as_of_range=interval, flags=flags)
     _enforce_query_cost(as_of_range=interval, limit=limit)
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
@@ -751,6 +787,16 @@ async def financials_canonical(
         decode_cursor(cursor, filters_for_cursor)
         # TODO(D7): apply keyset WHERE from decoded["anchor"] in v1.0.0-beta.
 
+    # Per TC-014: interval mode returns the version chain ordered by
+    # natural key + as_of ASC.
+    if interval is not None:
+        order_by = (
+            "ORDER BY entity_id, canonical_code, period_end, period_type, "
+            "consolidation, currency_code, accounting_standard, "
+            "restatement_basis, cpi_base_date, mapping_version, as_of ASC"
+        )
+    else:
+        order_by = "ORDER BY period_end DESC, canonical_code, restatement_basis"
     sql = _build_filtered_sql(
         select_clause=(
             "SELECT entity_id, canonical_code, period_end, period_type, "
@@ -760,7 +806,7 @@ async def financials_canonical(
         ),
         pit_call="ts.canonical_financial_at(:as_of)",
         where_parts=where_parts,
-        order_by="ORDER BY period_end DESC, canonical_code, restatement_basis",
+        order_by=order_by,
         as_of_range=interval,
     )
     rows = await session.execute(text(sql), params)
@@ -828,7 +874,9 @@ async def financials_canonical(
         pagination=pagination,
     )
     body_bytes = _json.dumps(env, sort_keys=True, default=str).encode("utf-8")
-    set_cache_headers(response, as_of_resolved=resolved, body_bytes=body_bytes)
+    # Per SCOPE.md D17: interval cache freshness hinges on T2.
+    cache_as_of = interval[1] if interval is not None else resolved
+    set_cache_headers(response, as_of_resolved=cache_as_of, body_bytes=body_bytes)
     return env
 
 
@@ -887,7 +935,7 @@ async def financials_line_items(
         pattern="^(nominal|as_reported|restated|adjusted|cpi_normalized)$",
     ),
     cursor: str | None = Query(default=None),
-    limit: int = Query(default=50, ge=1, le=500),
+    limit: int = Query(default=50, ge=1),
 ) -> dict[str, Any]:
     """Per SCOPE.md D1, D8: ``ts.financial_line_item_at(p_as_of)``.
 
@@ -896,6 +944,7 @@ async def financials_line_items(
     """
     _reject_pit_with_interval(as_of=as_of, as_of_range=as_of_range)
     interval = _parse_as_of_range(as_of_range)
+    _gate_interval_flag(as_of_range=interval, flags=flags)
     _enforce_query_cost(as_of_range=interval, limit=limit)
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
@@ -946,6 +995,15 @@ async def financials_line_items(
         decode_cursor(cursor, filters_for_cursor)
         # TODO(D7): apply keyset WHERE from decoded["anchor"] in v1.0.0-beta.
 
+    # Per TC-014: interval mode returns the version chain ordered by
+    # natural key + as_of ASC.
+    if interval is not None:
+        order_by = (
+            "ORDER BY entity_id, filing_id, statement_type, line_code, "
+            "consolidation, period_end, as_of ASC"
+        )
+    else:
+        order_by = "ORDER BY period_end DESC, line_code, restatement_basis"
     sql = _build_filtered_sql(
         select_clause=(
             "SELECT entity_id, filing_id, statement_type, line_code, "
@@ -956,7 +1014,7 @@ async def financials_line_items(
         ),
         pit_call="ts.financial_line_item_at(:as_of)",
         where_parts=where_parts,
-        order_by="ORDER BY period_end DESC, line_code, restatement_basis",
+        order_by=order_by,
         as_of_range=interval,
     )
     rows = await session.execute(text(sql), params)
@@ -1013,7 +1071,9 @@ async def financials_line_items(
         pagination=pagination,
     )
     body_bytes = _json.dumps(env, sort_keys=True, default=str).encode("utf-8")
-    set_cache_headers(response, as_of_resolved=resolved, body_bytes=body_bytes)
+    # Per SCOPE.md D17: interval cache freshness hinges on T2.
+    cache_as_of = interval[1] if interval is not None else resolved
+    set_cache_headers(response, as_of_resolved=cache_as_of, body_bytes=body_bytes)
     return env
 
 
@@ -1028,7 +1088,7 @@ async def entities(
     as_of_range: str | None = Query(default=None),
     kind: str | None = Query(default=None),
     cursor: str | None = Query(default=None),
-    limit: int = Query(default=50, ge=1, le=500),
+    limit: int = Query(default=50, ge=1),
 ) -> dict[str, Any]:
     """Per SCOPE.md D1, D10: list entities + lineage events.
 
@@ -1040,6 +1100,7 @@ async def entities(
     """
     _reject_pit_with_interval(as_of=as_of, as_of_range=as_of_range)
     interval = _parse_as_of_range(as_of_range)
+    _gate_interval_flag(as_of_range=interval, flags=flags)
     _enforce_query_cost(as_of_range=interval, limit=limit)
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
@@ -1074,6 +1135,12 @@ async def entities(
         decode_cursor(cursor, filters_for_cursor)
         # TODO(D7): apply keyset WHERE from decoded["anchor"] in v1.0.0-beta.
 
+    # Per TC-014: interval mode returns the version chain ordered by
+    # natural key + as_of ASC.
+    if interval is not None:
+        order_by = "ORDER BY entity_id, as_of ASC"
+    else:
+        order_by = "ORDER BY legal_name, entity_id"
     sql = _build_filtered_sql(
         select_clause=(
             "SELECT entity_id, as_of, event_kind, entity_type, legal_name, "
@@ -1081,7 +1148,7 @@ async def entities(
         ),
         pit_call="ref.entity_at(:as_of)",
         where_parts=where_parts,
-        order_by="ORDER BY legal_name, entity_id",
+        order_by=order_by,
         as_of_range=interval,
     )
     rows = (await session.execute(text(sql), params)).all()
@@ -1096,10 +1163,17 @@ async def entities(
 
     data: list[dict[str, Any]] = []
     for r in rows:
+        # Per SCOPE.md D2 / pass-2 finding 7: in interval mode, each
+        # version row's lineage must be evaluated at that row's own
+        # as_of, not at the request's resolved (NOW()) timestamp,
+        # otherwise a historical version row carries future merge/split
+        # events. Loop-and-rebind is fine for ref.entity-scale data; a
+        # bulk join is a v1.0.0-beta perf follow-up.
+        lineage_as_of = r.as_of if interval is not None else resolved
         lineage_rows = (
             await session.execute(
                 text(lineage_sql),
-                {"as_of": resolved, "entity_id": str(r.entity_id)},
+                {"as_of": lineage_as_of, "entity_id": str(r.entity_id)},
             )
         ).all()
         merged_from = r.merged_from_entity_ids
@@ -1167,7 +1241,9 @@ async def entities(
         pagination=pagination,
     )
     body_bytes = _json.dumps(env, sort_keys=True, default=str).encode("utf-8")
-    set_cache_headers(response, as_of_resolved=resolved, body_bytes=body_bytes)
+    # Per SCOPE.md D17: interval cache freshness hinges on T2.
+    cache_as_of = interval[1] if interval is not None else resolved
+    set_cache_headers(response, as_of_resolved=cache_as_of, body_bytes=body_bytes)
     return env
 
 
@@ -1297,10 +1373,40 @@ async def disclosures(
     as_of: str | None = Query(default=None),
     as_of_range: str | None = Query(default=None),
     entity_id: UUID | None = Query(default=None),
-    published_after: datetime | None = Query(default=None),
-    published_before: datetime | None = Query(default=None),
+    kap_company_id: str | None = Query(
+        default=None,
+        description="Per OpenAPI: filter by KAP company id (kap.disclosures.kap_id).",
+    ),
+    form_type: str | None = Query(
+        default=None,
+        description="Per OpenAPI: filter by KAP category code (e.g. ÖDA).",
+    ),
+    published_from: datetime | None = Query(
+        default=None,
+        description="Per OpenAPI: published_at >= published_from.",
+    ),
+    published_to: datetime | None = Query(
+        default=None,
+        description="Per OpenAPI: published_at <= published_to.",
+    ),
+    published_after: datetime | None = Query(
+        default=None,
+        description="Deprecated alias for published_from (D24).",
+    ),
+    published_before: datetime | None = Query(
+        default=None,
+        description="Deprecated alias for published_to (D24).",
+    ),
+    include_pre_bitemporal: bool = Query(
+        default=False,
+        description=(
+            "Per SCOPE.md D3: when true, also include rows whose "
+            "as_of_provenance is 'pre_bitemporal_unknown' "
+            "(as_of=NULL backfill rows excluded by kap.disclosures_at)."
+        ),
+    ),
     cursor: str | None = Query(default=None),
-    limit: int = Query(default=50, ge=1, le=500),
+    limit: int = Query(default=50, ge=1),
 ) -> dict[str, Any]:
     """Per SCOPE.md D1, D3, D11: list ``kap.disclosures``.
 
@@ -1313,6 +1419,7 @@ async def disclosures(
     """
     _reject_pit_with_interval(as_of=as_of, as_of_range=as_of_range)
     interval = _parse_as_of_range(as_of_range)
+    _gate_interval_flag(as_of_range=interval, flags=flags)
     _enforce_query_cost(as_of_range=interval, limit=limit)
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
@@ -1322,6 +1429,17 @@ async def disclosures(
     ctx.as_of_resolved = resolved
     ctx.as_of_range = interval
     ctx.feature_flags_active = _active_flags(flags)
+
+    # Per pass-2 finding 6 / OpenAPI: the documented OpenAPI parameter
+    # name takes precedence when both old (deprecated) and new aliases
+    # are passed. Old aliases stay accepted to avoid breaking existing
+    # clients; D24 deprecation header is a v1.0.0-beta follow-up.
+    effective_published_from = (
+        published_from if published_from is not None else published_after
+    )
+    effective_published_to = (
+        published_to if published_to is not None else published_before
+    )
 
     where_parts: list[str] = []
     params: dict[str, Any] = {"limit": limit}
@@ -1333,12 +1451,18 @@ async def disclosures(
     if entity_id is not None:
         where_parts.append("entity_id = :entity_id")
         params["entity_id"] = str(entity_id)
-    if published_after is not None:
-        where_parts.append("published_at >= :published_after")
-        params["published_after"] = published_after
-    if published_before is not None:
-        where_parts.append("published_at <= :published_before")
-        params["published_before"] = published_before
+    if kap_company_id is not None:
+        where_parts.append("kap_id = :kap_company_id")
+        params["kap_company_id"] = kap_company_id
+    if form_type is not None:
+        where_parts.append("category_code = :form_type")
+        params["form_type"] = form_type
+    if effective_published_from is not None:
+        where_parts.append("published_at >= :published_from")
+        params["published_from"] = effective_published_from
+    if effective_published_to is not None:
+        where_parts.append("published_at <= :published_to")
+        params["published_to"] = effective_published_to
 
     filters_for_cursor: dict[str, Any] = {
         "as_of": resolved.isoformat() if interval is None else None,
@@ -1348,29 +1472,78 @@ async def disclosures(
             else None
         ),
         "entity_id": str(entity_id) if entity_id else None,
-        "published_after": (
-            published_after.isoformat() if published_after else None
+        "kap_company_id": kap_company_id,
+        "form_type": form_type,
+        "published_from": (
+            effective_published_from.isoformat()
+            if effective_published_from
+            else None
         ),
-        "published_before": (
-            published_before.isoformat() if published_before else None
+        "published_to": (
+            effective_published_to.isoformat()
+            if effective_published_to
+            else None
         ),
+        "include_pre_bitemporal": include_pre_bitemporal,
     }
     if cursor is not None:
         decode_cursor(cursor, filters_for_cursor)
         # TODO(D7): apply keyset WHERE from decoded["anchor"] in v1.0.0-beta.
 
-    sql = _build_filtered_sql(
-        select_clause=(
-            "SELECT disclosure_id, as_of, event_kind, as_of_provenance, "
-            "       entity_id, kap_id, title, category_code, "
-            "       subcategory_code, published_at, is_amendment, "
-            "       body_fetched, body_fetched_at, parent_disclosure_id"
-        ),
-        pit_call="kap.disclosures_at(:as_of)",
-        where_parts=where_parts,
-        order_by="ORDER BY published_at DESC",
-        as_of_range=interval,
-    )
+    # Per SCOPE.md D3 / pass-2 finding 2: by default we read the PIT
+    # function (which filters ``v.as_of <= p_as_of`` and so excludes
+    # NULL as_of pre-bitemporal backfill rows). When
+    # ``include_pre_bitemporal=true`` we read ``kap.disclosures_version``
+    # directly with the same predicate plus an OR for the
+    # pre_bitemporal_unknown provenance, so the backfill rows surface.
+    # Interval mode (already a version-table scan) is unaffected.
+    if include_pre_bitemporal and interval is None:
+        # Direct scan of the SCD-4 version table; mirror the PIT-function
+        # latest-per-key shape via DISTINCT ON.
+        from_clause_pre = (
+            "(SELECT DISTINCT ON (v.disclosure_id) "
+            "        v.disclosure_id, v.as_of, v.event_kind, v.as_of_provenance, "
+            "        v.entity_id, v.kap_id, v.title, v.category_code, "
+            "        v.subcategory_code, v.published_at, v.is_amendment, "
+            "        v.body_fetched, v.body_fetched_at, v.parent_disclosure_id "
+            " FROM kap.disclosures_version v "
+            " WHERE (v.as_of <= :as_of "
+            "        OR v.as_of_provenance = 'pre_bitemporal_unknown') "
+            "   AND v.event_kind <> 'deleted' "
+            " ORDER BY v.disclosure_id, v.as_of DESC NULLS LAST) AS d"
+        )
+        order_by = "ORDER BY published_at DESC"
+        sql = _build_filtered_sql(
+            select_clause=(
+                "SELECT disclosure_id, as_of, event_kind, as_of_provenance, "
+                "       entity_id, kap_id, title, category_code, "
+                "       subcategory_code, published_at, is_amendment, "
+                "       body_fetched, body_fetched_at, parent_disclosure_id"
+            ),
+            from_clause=from_clause_pre,
+            where_parts=where_parts,
+            order_by=order_by,
+            as_of_range=None,
+        )
+    else:
+        # Per TC-014: interval mode returns the version chain ordered
+        # by natural key + as_of ASC; PIT mode keeps display ordering.
+        if interval is not None:
+            order_by = "ORDER BY disclosure_id, as_of ASC"
+        else:
+            order_by = "ORDER BY published_at DESC"
+        sql = _build_filtered_sql(
+            select_clause=(
+                "SELECT disclosure_id, as_of, event_kind, as_of_provenance, "
+                "       entity_id, kap_id, title, category_code, "
+                "       subcategory_code, published_at, is_amendment, "
+                "       body_fetched, body_fetched_at, parent_disclosure_id"
+            ),
+            pit_call="kap.disclosures_at(:as_of)",
+            where_parts=where_parts,
+            order_by=order_by,
+            as_of_range=interval,
+        )
     rows = await session.execute(text(sql), params)
     data = [
         {
@@ -1433,7 +1606,9 @@ async def disclosures(
         pagination=pagination,
     )
     body_bytes = _json.dumps(env, sort_keys=True, default=str).encode("utf-8")
-    set_cache_headers(response, as_of_resolved=resolved, body_bytes=body_bytes)
+    # Per SCOPE.md D17: interval cache freshness hinges on T2.
+    cache_as_of = interval[1] if interval is not None else resolved
+    set_cache_headers(response, as_of_resolved=cache_as_of, body_bytes=body_bytes)
     return env
 
 
@@ -1446,6 +1621,14 @@ async def get_disclosure(
     flags: FeatureFlagState = Depends(require_master_flag),
     ctx: RequestContext = Depends(get_request_context),
     as_of: str | None = Query(default=None),
+    include_pre_bitemporal: bool = Query(
+        default=False,
+        description=(
+            "Per SCOPE.md D3: when true, also accept rows whose "
+            "as_of_provenance is 'pre_bitemporal_unknown' "
+            "(otherwise hidden by kap.disclosures_at)."
+        ),
+    ),
 ) -> dict[str, Any]:
     """Per SCOPE.md D1, D11: single disclosure.
 
@@ -1462,19 +1645,44 @@ async def get_disclosure(
     ctx.as_of_resolved = resolved
     ctx.feature_flags_active = _active_flags(flags)
 
-    row = (
-        await session.execute(
-            text(
-                "SELECT disclosure_id, as_of, event_kind, as_of_provenance, "
-                "       entity_id, kap_id, title, category_code, "
-                "       subcategory_code, published_at, is_amendment, "
-                "       body_fetched, body_fetched_at, parent_disclosure_id "
-                "FROM kap.disclosures_at(:as_of) "
-                "WHERE disclosure_id = :disclosure_id"
-            ),
-            {"as_of": resolved, "disclosure_id": disclosure_id},
-        )
-    ).first()
+    # Per SCOPE.md D3 / pass-2 finding 2: when include_pre_bitemporal
+    # is true, scan kap.disclosures_version directly so the backfill
+    # rows (as_of NULL, provenance 'pre_bitemporal_unknown') surface;
+    # the PIT function would filter them out via ``v.as_of <= p_as_of``.
+    if include_pre_bitemporal:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT DISTINCT ON (v.disclosure_id) "
+                    "       v.disclosure_id, v.as_of, v.event_kind, "
+                    "       v.as_of_provenance, v.entity_id, v.kap_id, "
+                    "       v.title, v.category_code, v.subcategory_code, "
+                    "       v.published_at, v.is_amendment, v.body_fetched, "
+                    "       v.body_fetched_at, v.parent_disclosure_id "
+                    "FROM kap.disclosures_version v "
+                    "WHERE v.disclosure_id = :disclosure_id "
+                    "  AND (v.as_of <= :as_of "
+                    "       OR v.as_of_provenance = 'pre_bitemporal_unknown') "
+                    "  AND v.event_kind <> 'deleted' "
+                    "ORDER BY v.disclosure_id, v.as_of DESC NULLS LAST"
+                ),
+                {"as_of": resolved, "disclosure_id": disclosure_id},
+            )
+        ).first()
+    else:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT disclosure_id, as_of, event_kind, as_of_provenance, "
+                    "       entity_id, kap_id, title, category_code, "
+                    "       subcategory_code, published_at, is_amendment, "
+                    "       body_fetched, body_fetched_at, parent_disclosure_id "
+                    "FROM kap.disclosures_at(:as_of) "
+                    "WHERE disclosure_id = :disclosure_id"
+                ),
+                {"as_of": resolved, "disclosure_id": disclosure_id},
+            )
+        ).first()
     if row is None:
         raise HTTPException(
             status_code=404,
@@ -1539,10 +1747,35 @@ async def filings(
     as_of: str | None = Query(default=None),
     as_of_range: str | None = Query(default=None),
     entity_id: UUID | None = Query(default=None),
-    received_after: datetime | None = Query(default=None),
-    received_before: datetime | None = Query(default=None),
+    source_kind: str | None = Query(
+        default=None,
+        description=(
+            "Per OpenAPI: filter by src.source.kind (joined via "
+            "doc.filing.source_id). Enum: kap, bist, tcmb, mkk, tefas, other."
+        ),
+    ),
+    filed_from: datetime | None = Query(
+        default=None,
+        description=(
+            "Per OpenAPI: published_at >= filed_from "
+            "(doc.filing has no received_at column; published_at is the "
+            "filed timestamp)."
+        ),
+    ),
+    filed_to: datetime | None = Query(
+        default=None,
+        description="Per OpenAPI: published_at <= filed_to.",
+    ),
+    received_after: datetime | None = Query(
+        default=None,
+        description="Deprecated alias for filed_from (D24).",
+    ),
+    received_before: datetime | None = Query(
+        default=None,
+        description="Deprecated alias for filed_to (D24).",
+    ),
     cursor: str | None = Query(default=None),
-    limit: int = Query(default=50, ge=1, le=500),
+    limit: int = Query(default=50, ge=1),
 ) -> dict[str, Any]:
     """Per SCOPE.md D1: list ``doc.filing`` (Class F, no PIT function).
 
@@ -1554,6 +1787,7 @@ async def filings(
     """
     _reject_pit_with_interval(as_of=as_of, as_of_range=as_of_range)
     interval = _parse_as_of_range(as_of_range)
+    _gate_interval_flag(as_of_range=interval, flags=flags)
     _enforce_query_cost(as_of_range=interval, limit=limit)
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
@@ -1564,17 +1798,31 @@ async def filings(
     ctx.as_of_range = interval
     ctx.feature_flags_active = _active_flags(flags)
 
+    # Per pass-2 finding 6 / OpenAPI: prefer the documented OpenAPI
+    # parameter names; the legacy ``received_*`` names stay as aliases.
+    # ``doc.filing`` does not store a "received_at" column — the closest
+    # documented timestamp is ``published_at``, so both names map to it.
+    effective_filed_from = (
+        filed_from if filed_from is not None else received_after
+    )
+    effective_filed_to = filed_to if filed_to is not None else received_before
+
     where_parts: list[str] = []
     params: dict[str, Any] = {"limit": limit}
     if entity_id is not None:
-        where_parts.append("entity_id = :entity_id")
+        where_parts.append("f.entity_id = :entity_id")
         params["entity_id"] = str(entity_id)
-    if received_after is not None:
-        where_parts.append("received_at >= :received_after")
-        params["received_after"] = received_after
-    if received_before is not None:
-        where_parts.append("received_at <= :received_before")
-        params["received_before"] = received_before
+    if source_kind is not None:
+        # ``doc.filing`` has no source_kind column; resolve via the
+        # ``src.source.kind`` lookup joined on ``source_id``.
+        where_parts.append("s.kind = :source_kind")
+        params["source_kind"] = source_kind
+    if effective_filed_from is not None:
+        where_parts.append("f.published_at >= :filed_from")
+        params["filed_from"] = effective_filed_from
+    if effective_filed_to is not None:
+        where_parts.append("f.published_at <= :filed_to")
+        params["filed_to"] = effective_filed_to
 
     filters_for_cursor: dict[str, Any] = {
         "as_of": resolved.isoformat() if interval is None else None,
@@ -1584,11 +1832,12 @@ async def filings(
             else None
         ),
         "entity_id": str(entity_id) if entity_id else None,
-        "received_after": (
-            received_after.isoformat() if received_after else None
+        "source_kind": source_kind,
+        "filed_from": (
+            effective_filed_from.isoformat() if effective_filed_from else None
         ),
-        "received_before": (
-            received_before.isoformat() if received_before else None
+        "filed_to": (
+            effective_filed_to.isoformat() if effective_filed_to else None
         ),
     }
     if cursor is not None:
@@ -1597,12 +1846,14 @@ async def filings(
 
     # doc.filing has no PIT function and no SCD-4 version table in v1;
     # both PIT and interval modes return the current-state rows with a
-    # PRE_BITEMPORAL_TABLE warning attached.
+    # PRE_BITEMPORAL_TABLE warning attached. We always join src.source
+    # so source_kind filtering is uniform; the join is cheap (PK lookup)
+    # and the source row exists for every filing by FK.
     sql = _build_filtered_sql(
-        select_clause="SELECT *",
-        from_clause="doc.filing",
+        select_clause="SELECT f.*, s.kind AS source_kind",
+        from_clause="doc.filing f JOIN src.source s ON s.source_id = f.source_id",
         where_parts=where_parts,
-        order_by="ORDER BY received_at DESC NULLS LAST",
+        order_by="ORDER BY f.published_at DESC NULLS LAST",
     )
     result = await session.execute(text(sql), params)
     columns = list(result.keys())
@@ -1624,7 +1875,7 @@ async def filings(
     if len(data) == limit and data:
         last = data[-1]
         anchor = {
-            "received_at": last.get("received_at"),
+            "published_at": last.get("published_at"),
             "filing_id": last.get("filing_id"),
         }
         next_cursor = encode_cursor(
@@ -1645,7 +1896,9 @@ async def filings(
         pagination=pagination,
     )
     body_bytes = _json.dumps(env, sort_keys=True, default=str).encode("utf-8")
-    set_cache_headers(response, as_of_resolved=resolved, body_bytes=body_bytes)
+    # Per SCOPE.md D17: interval cache freshness hinges on T2.
+    cache_as_of = interval[1] if interval is not None else resolved
+    set_cache_headers(response, as_of_resolved=cache_as_of, body_bytes=body_bytes)
     return env
 
 
@@ -1659,11 +1912,29 @@ async def events(
     as_of: str | None = Query(default=None),
     as_of_range: str | None = Query(default=None),
     entity_id: UUID | None = Query(default=None),
+    filing_id: UUID | None = Query(
+        default=None,
+        description="Per OpenAPI: filter by source filing UUID.",
+    ),
     event_type: str | None = Query(default=None),
-    event_after: datetime | None = Query(default=None),
-    event_before: datetime | None = Query(default=None),
+    occurred_from: datetime | None = Query(
+        default=None,
+        description="Per OpenAPI: event_ts >= occurred_from.",
+    ),
+    occurred_to: datetime | None = Query(
+        default=None,
+        description="Per OpenAPI: event_ts <= occurred_to.",
+    ),
+    event_after: datetime | None = Query(
+        default=None,
+        description="Deprecated alias for occurred_from (D24).",
+    ),
+    event_before: datetime | None = Query(
+        default=None,
+        description="Deprecated alias for occurred_to (D24).",
+    ),
     cursor: str | None = Query(default=None),
-    limit: int = Query(default=50, ge=1, le=500),
+    limit: int = Query(default=50, ge=1),
 ) -> dict[str, Any]:
     """Per SCOPE.md D1, D30: ``agg.filing_event_at(p_as_of)``.
 
@@ -1681,6 +1952,7 @@ async def events(
     """
     _reject_pit_with_interval(as_of=as_of, as_of_range=as_of_range)
     interval = _parse_as_of_range(as_of_range)
+    _gate_interval_flag(as_of_range=interval, flags=flags)
     _enforce_query_cost(as_of_range=interval, limit=limit)
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
@@ -1693,6 +1965,15 @@ async def events(
     if principal is not None and principal.pii_unredacted:
         ctx.pii_unredacted_used = True
 
+    # Per pass-2 finding 6 / OpenAPI: prefer the documented OpenAPI
+    # parameter names; legacy ``event_*`` aliases keep working.
+    effective_occurred_from = (
+        occurred_from if occurred_from is not None else event_after
+    )
+    effective_occurred_to = (
+        occurred_to if occurred_to is not None else event_before
+    )
+
     where_parts: list[str] = []
     params: dict[str, Any] = {"limit": limit}
     if interval is None:
@@ -1703,15 +1984,18 @@ async def events(
     if entity_id is not None:
         where_parts.append("entity_id = :entity_id")
         params["entity_id"] = str(entity_id)
+    if filing_id is not None:
+        where_parts.append("filing_id = :filing_id")
+        params["filing_id"] = str(filing_id)
     if event_type is not None:
         where_parts.append("event_type = :event_type")
         params["event_type"] = event_type
-    if event_after is not None:
-        where_parts.append("event_ts >= :event_after")
-        params["event_after"] = event_after
-    if event_before is not None:
-        where_parts.append("event_ts <= :event_before")
-        params["event_before"] = event_before
+    if effective_occurred_from is not None:
+        where_parts.append("event_ts >= :occurred_from")
+        params["occurred_from"] = effective_occurred_from
+    if effective_occurred_to is not None:
+        where_parts.append("event_ts <= :occurred_to")
+        params["occurred_to"] = effective_occurred_to
 
     filters_for_cursor: dict[str, Any] = {
         "as_of": resolved.isoformat() if interval is None else None,
@@ -1721,14 +2005,29 @@ async def events(
             else None
         ),
         "entity_id": str(entity_id) if entity_id else None,
+        "filing_id": str(filing_id) if filing_id else None,
         "event_type": event_type,
-        "event_after": event_after.isoformat() if event_after else None,
-        "event_before": event_before.isoformat() if event_before else None,
+        "occurred_from": (
+            effective_occurred_from.isoformat()
+            if effective_occurred_from
+            else None
+        ),
+        "occurred_to": (
+            effective_occurred_to.isoformat()
+            if effective_occurred_to
+            else None
+        ),
     }
     if cursor is not None:
         decode_cursor(cursor, filters_for_cursor)
         # TODO(D7): apply keyset WHERE from decoded["anchor"] in v1.0.0-beta.
 
+    # Per TC-014: interval mode returns the version chain ordered by
+    # natural key + as_of ASC.
+    if interval is not None:
+        order_by = "ORDER BY filing_id, event_type, event_seq, as_of ASC"
+    else:
+        order_by = "ORDER BY event_ts DESC, event_seq"
     sql = _build_filtered_sql(
         select_clause=(
             "SELECT filing_event_id, filing_id, source_id, source_filing_ref, "
@@ -1740,7 +2039,7 @@ async def events(
         ),
         pit_call="agg.filing_event_at(:as_of)",
         where_parts=where_parts,
-        order_by="ORDER BY event_ts DESC, event_seq",
+        order_by=order_by,
         as_of_range=interval,
     )
     rows = (await session.execute(text(sql), params)).all()
@@ -1821,7 +2120,9 @@ async def events(
         pagination=pagination,
     )
     body_bytes = _json.dumps(env, sort_keys=True, default=str).encode("utf-8")
-    set_cache_headers(response, as_of_resolved=resolved, body_bytes=body_bytes)
+    # Per SCOPE.md D17: interval cache freshness hinges on T2.
+    cache_as_of = interval[1] if interval is not None else resolved
+    set_cache_headers(response, as_of_resolved=cache_as_of, body_bytes=body_bytes)
     return env
 
 
@@ -1842,7 +2143,7 @@ async def quality_scores(
         pattern="^(nominal|as_reported|restated|adjusted|cpi_normalized)$",
     ),
     cursor: str | None = Query(default=None),
-    limit: int = Query(default=50, ge=1, le=500),
+    limit: int = Query(default=50, ge=1),
 ) -> dict[str, Any]:
     """Per SCOPE.md D1: ``ts.entity_quality_score_at(p_as_of)``.
 
@@ -1850,6 +2151,7 @@ async def quality_scores(
     """
     _reject_pit_with_interval(as_of=as_of, as_of_range=as_of_range)
     interval = _parse_as_of_range(as_of_range)
+    _gate_interval_flag(as_of_range=interval, flags=flags)
     _enforce_query_cost(as_of_range=interval, limit=limit)
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
@@ -1900,11 +2202,21 @@ async def quality_scores(
         decode_cursor(cursor, filters_for_cursor)
         # TODO(D7): apply keyset WHERE from decoded["anchor"] in v1.0.0-beta.
 
+    # Per TC-014: interval mode returns the version chain ordered by
+    # natural key + as_of ASC.
+    if interval is not None:
+        order_by = (
+            "ORDER BY entity_id, period_end, period_type, consolidation, "
+            "currency_code, accounting_standard, restatement_basis, "
+            "cpi_base_date, mapping_version, as_of ASC"
+        )
+    else:
+        order_by = "ORDER BY period_end DESC"
     sql = _build_filtered_sql(
         select_clause="SELECT *",
         pit_call="ts.entity_quality_score_at(:as_of)",
         where_parts=where_parts,
-        order_by="ORDER BY period_end DESC",
+        order_by=order_by,
         as_of_range=interval,
     )
     result = await session.execute(text(sql), params)

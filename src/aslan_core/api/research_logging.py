@@ -174,7 +174,15 @@ _RESEARCH_PREFIX = "/v1/research"
 
 
 def _is_research_path(request: Request) -> bool:
-    return request.url.path.startswith(_RESEARCH_PREFIX)
+    """Match the research surface exactly.
+
+    A bare ``startswith(_RESEARCH_PREFIX)`` would also match a future
+    sibling path like ``/v1/research-status`` or ``/v1/research_legacy``.
+    Mirror the audit-middleware boundary: exact ``/v1/research`` (no
+    children) or any path under ``/v1/research/``.
+    """
+    path = request.url.path
+    return path == _RESEARCH_PREFIX or path.startswith(_RESEARCH_PREFIX + "/")
 
 
 def _problem_json(
