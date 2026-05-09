@@ -1,0 +1,25 @@
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+
+ENV UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/app/.venv/bin:${PATH}"
+
+WORKDIR /app
+
+# Copy aslan-core for local path resolution
+COPY aslan-core/pyproject.toml aslan-core/README.md /deps/aslan-core/
+COPY aslan-core/src/ /deps/aslan-core/src/
+
+# Copy aslan-event-extractor project files
+COPY aslan-event-extractor/pyproject.toml aslan-event-extractor/README.md ./
+COPY aslan-event-extractor/src/ ./src/
+
+# Override aslan-core uv source → local path, then install
+RUN sed -i 's|^aslan-core = .*|aslan-core = { path = "/deps/aslan-core" }|' pyproject.toml && \
+    rm -f uv.lock && \
+    uv lock && \
+    uv sync --frozen --no-dev
+
+ENTRYPOINT ["extract"]
