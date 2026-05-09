@@ -226,11 +226,12 @@ wheels = [
 
 [[package]]
 name = "aslan-core"
-version = "0.9.0"
+version = "0.11.0"
 source = { editable = "." }
 dependencies = [
     { name = "aioboto3" },
     { name = "alembic" },
+    { name = "argon2-cffi" },
     { name = "asyncpg" },
     { name = "click" },
     { name = "pydantic" },
@@ -280,6 +281,7 @@ dev = [
 requires-dist = [
     { name = "aioboto3", specifier = ">=13.0" },
     { name = "alembic", specifier = ">=1.13" },
+    { name = "argon2-cffi", specifier = ">=25.1.0" },
     { name = "asyncpg", specifier = ">=0.29" },
     { name = "click", specifier = ">=8.1" },
     { name = "fastapi", marker = "extra == 'api'", specifier = ">=0.115" },

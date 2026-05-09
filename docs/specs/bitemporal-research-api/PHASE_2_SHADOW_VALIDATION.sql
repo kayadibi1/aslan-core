@@ -147,11 +147,145 @@ ON CONFLICT DO NOTHING;
 -- =====================================================================
 
 -- =====================================================================
--- 0046: NO-OP — ref.entity bitemporal upgrade DEFERRED to v2.
---   ref.entity_pkey is referenced by 14+ FKs; coordinated re-creation
---   beyond v1 scope. PIT entity reconstruction at the API layer uses
---   ref.entity joined to ref.entity_lineage. See migration 0046 docstring.
+-- 0046: ref.entity bitemporal via SCD-4 (history mirror, not replacement)
 -- =====================================================================
+
+CREATE TABLE ref.entity_version (
+    entity_id              UUID NOT NULL,
+    as_of                  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    event_kind             TEXT NOT NULL CHECK (event_kind IN
+                               ('created','updated','merged','split','renamed','deleted')),
+    entity_type            TEXT NOT NULL,
+    legal_name             TEXT NOT NULL,
+    short_name             TEXT,
+    country_code           CHARACTER(2) NOT NULL,
+    domicile               TEXT,
+    incorporation_dt       DATE,
+    fiscal_year_end        DATE,
+    status                 TEXT NOT NULL,
+    parent_entity_id       UUID,
+    metadata               JSONB NOT NULL,
+    merged_from_entity_ids JSONB,
+    source_id              TEXT NOT NULL,
+    ingestion_run_id       BIGINT NOT NULL,
+    actor_id               TEXT,
+    actor_kind             TEXT,
+    client_ip              INET,
+    user_agent             TEXT,
+    request_id             UUID,
+    captured_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (entity_id, as_of)
+);
+CREATE INDEX entity_version_entity_idx ON ref.entity_version (entity_id, as_of DESC);
+CREATE INDEX entity_version_event_kind_idx ON ref.entity_version (event_kind, as_of DESC);
+
+CREATE OR REPLACE FUNCTION ref.fn_capture_entity_version()
+RETURNS trigger AS $$
+DECLARE
+    v_event_kind TEXT;
+    v_row        ref.entity%ROWTYPE;
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        v_event_kind := 'created';
+        v_row := NEW;
+    ELSIF TG_OP = 'UPDATE' THEN
+        IF NEW.status = 'merged' AND OLD.status IS DISTINCT FROM 'merged' THEN
+            v_event_kind := 'merged';
+        ELSIF NEW.legal_name IS DISTINCT FROM OLD.legal_name THEN
+            v_event_kind := 'renamed';
+        ELSE
+            v_event_kind := 'updated';
+        END IF;
+        v_row := NEW;
+    ELSIF TG_OP = 'DELETE' THEN
+        v_event_kind := 'deleted';
+        v_row := OLD;
+    END IF;
+    INSERT INTO ref.entity_version (
+        entity_id, as_of, event_kind,
+        entity_type, legal_name, short_name, country_code,
+        domicile, incorporation_dt, fiscal_year_end, status,
+        parent_entity_id, metadata, merged_from_entity_ids,
+        source_id, ingestion_run_id, actor_id, actor_kind,
+        client_ip, user_agent, request_id
+    ) VALUES (
+        v_row.entity_id, now(), v_event_kind,
+        v_row.entity_type, v_row.legal_name, v_row.short_name, v_row.country_code,
+        v_row.domicile, v_row.incorporation_dt, v_row.fiscal_year_end, v_row.status,
+        v_row.parent_entity_id, v_row.metadata,
+        CASE WHEN v_row.metadata ? 'merged_from_entity_ids'
+             THEN v_row.metadata->'merged_from_entity_ids' ELSE NULL END,
+        v_row.source_id, v_row.ingestion_run_id, v_row.actor_id, v_row.actor_kind,
+        v_row.client_ip, v_row.user_agent, v_row.request_id
+    )
+    ON CONFLICT (entity_id, as_of) DO NOTHING;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER entity_capture_version
+    AFTER INSERT OR UPDATE OR DELETE ON ref.entity
+    FOR EACH ROW
+    EXECUTE FUNCTION ref.fn_capture_entity_version();
+
+CREATE TRIGGER entity_version_no_update
+    BEFORE UPDATE ON ref.entity_version
+    FOR EACH ROW
+    EXECUTE FUNCTION aslan_core.reject_bitemporal_update_generic();
+
+-- Backfill from existing rows.
+INSERT INTO ref.entity_version (
+    entity_id, as_of, event_kind,
+    entity_type, legal_name, short_name, country_code,
+    domicile, incorporation_dt, fiscal_year_end, status,
+    parent_entity_id, metadata,
+    source_id, ingestion_run_id, actor_id, actor_kind,
+    client_ip, user_agent, request_id
+)
+SELECT
+    entity_id, created_at, 'created',
+    entity_type, legal_name, short_name, country_code,
+    domicile, incorporation_dt, fiscal_year_end, status,
+    parent_entity_id, metadata,
+    source_id, ingestion_run_id, actor_id, actor_kind,
+    client_ip, user_agent, request_id
+FROM ref.entity
+ON CONFLICT (entity_id, as_of) DO NOTHING;
+
+INSERT INTO ref.entity_version (
+    entity_id, as_of, event_kind,
+    entity_type, legal_name, short_name, country_code,
+    domicile, incorporation_dt, fiscal_year_end, status,
+    parent_entity_id, metadata,
+    source_id, ingestion_run_id, actor_id, actor_kind,
+    client_ip, user_agent, request_id
+)
+SELECT
+    entity_id, updated_at, 'updated',
+    entity_type, legal_name, short_name, country_code,
+    domicile, incorporation_dt, fiscal_year_end, status,
+    parent_entity_id, metadata,
+    source_id, ingestion_run_id, actor_id, actor_kind,
+    client_ip, user_agent, request_id
+FROM ref.entity
+WHERE updated_at > created_at
+ON CONFLICT (entity_id, as_of) DO NOTHING;
+
+INSERT INTO aslan_core.bitemporal_table_registry
+    (schema_name, table_name, entity_columns, as_of_column,
+     pit_function_name, api_path, exposed_in_api, notes)
+VALUES
+    ('ref', 'entity_version', ARRAY['entity_id']::text[], 'as_of',
+     'ref.entity_at', '/v1/research/entities', true,
+     'SCD-4 bitemporal history of ref.entity')
+ON CONFLICT (schema_name, table_name) DO UPDATE
+SET entity_columns = EXCLUDED.entity_columns,
+    pit_function_name = EXCLUDED.pit_function_name,
+    api_path = EXCLUDED.api_path,
+    exposed_in_api = EXCLUDED.exposed_in_api,
+    notes = EXCLUDED.notes;
+
+GRANT SELECT ON ref.entity_version TO aslan_dashboard;
 
 -- =====================================================================
 -- 0047: ref.entity_lineage table
@@ -317,7 +451,34 @@ LANGUAGE sql STABLE PARALLEL SAFE AS $$
              restatement_basis, cpi_base_date, mapping_version, as_of DESC;
 $$;
 
--- ref.entity_at PIT function omitted — see migration 0046 stub.
+CREATE OR REPLACE FUNCTION ref.entity_at(p_as_of TIMESTAMPTZ)
+RETURNS TABLE (
+    entity_id              UUID,
+    as_of                  TIMESTAMPTZ,
+    event_kind             TEXT,
+    entity_type            TEXT,
+    legal_name             TEXT,
+    short_name             TEXT,
+    country_code           CHARACTER(2),
+    domicile               TEXT,
+    incorporation_dt       DATE,
+    fiscal_year_end        DATE,
+    status                 TEXT,
+    parent_entity_id       UUID,
+    metadata               JSONB,
+    merged_from_entity_ids JSONB
+)
+LANGUAGE sql STABLE PARALLEL SAFE AS $$
+    SELECT DISTINCT ON (v.entity_id)
+        v.entity_id, v.as_of, v.event_kind,
+        v.entity_type, v.legal_name, v.short_name, v.country_code,
+        v.domicile, v.incorporation_dt, v.fiscal_year_end, v.status,
+        v.parent_entity_id, v.metadata, v.merged_from_entity_ids
+    FROM ref.entity_version v
+    WHERE v.as_of <= p_as_of
+      AND v.event_kind <> 'deleted'
+    ORDER BY v.entity_id, v.as_of DESC;
+$$;
 
 CREATE OR REPLACE FUNCTION ref.identifier_at(p_as_of TIMESTAMPTZ)
 RETURNS SETOF ref.identifier
@@ -352,9 +513,11 @@ UPDATE aslan_core.bitemporal_table_registry
         'ts.observation_at',
         'ts.financial_line_item_at',
         'ts.canonical_financial_at',
+        'ref.entity_at',
         'ref.identifier_at',
         'ref.entity_lineage_at',
-        'agg.filing_event_at'
+        'agg.filing_event_at',
+        'kap.disclosures_at'
     );
 
 -- =====================================================================
@@ -400,6 +563,193 @@ LANGUAGE sql STABLE PARALLEL SAFE AS $$
              consolidation, currency_code, accounting_standard,
              restatement_basis, cpi_base_date, mapping_version, as_of DESC;
 $$;
+
+-- =====================================================================
+-- 0051: kap.disclosures bitemporal via SCD-4 (history mirror)
+-- =====================================================================
+
+CREATE TABLE kap.disclosures_version (
+    disclosure_id          TEXT NOT NULL,
+    as_of                  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    event_kind             TEXT NOT NULL CHECK (event_kind IN
+                               ('indexed','body_fetched','republished','updated','deleted')),
+    as_of_provenance       TEXT NOT NULL DEFAULT 'live'
+                           CHECK (as_of_provenance IN
+                               ('live','index_fetched_at','body_fetched_at',
+                                'published_at','pre_bitemporal_unknown')),
+    entity_id              UUID NOT NULL,
+    kap_id                 TEXT NOT NULL,
+    published_at           TIMESTAMPTZ NOT NULL,
+    category_code          TEXT NOT NULL,
+    subcategory_code       TEXT,
+    title                  TEXT NOT NULL,
+    language               kap.disclosure_language NOT NULL,
+    kap_url                TEXT NOT NULL,
+    is_amendment           BOOLEAN NOT NULL DEFAULT false,
+    parent_disclosure_id   TEXT,
+    body_fetched           BOOLEAN NOT NULL DEFAULT false,
+    index_fetched_at       TIMESTAMPTZ NOT NULL,
+    raw_index_storage_key  TEXT NOT NULL,
+    raw_body_storage_key   TEXT,
+    body_fetched_at        TIMESTAMPTZ,
+    raw_body_sha256        CHARACTER(64),
+    raw_body_bytes         BIGINT,
+    raw_body_mime          TEXT,
+    captured_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (disclosure_id, as_of)
+);
+
+CREATE INDEX disclosures_version_disclosure_idx ON kap.disclosures_version (disclosure_id, as_of DESC);
+CREATE INDEX disclosures_version_event_kind_idx ON kap.disclosures_version (event_kind, as_of DESC);
+CREATE INDEX disclosures_version_entity_idx ON kap.disclosures_version (entity_id, as_of DESC);
+CREATE INDEX disclosures_version_provenance_idx ON kap.disclosures_version (as_of_provenance) WHERE as_of_provenance <> 'live';
+
+CREATE OR REPLACE FUNCTION kap.fn_capture_disclosure_version()
+RETURNS trigger AS $$
+DECLARE
+    v_event_kind TEXT;
+    v_row        kap.disclosures%ROWTYPE;
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        v_event_kind := 'indexed';
+        v_row := NEW;
+    ELSIF TG_OP = 'UPDATE' THEN
+        IF NEW.body_fetched IS DISTINCT FROM OLD.body_fetched AND NEW.body_fetched = true THEN
+            v_event_kind := 'body_fetched';
+        ELSIF NEW.parent_disclosure_id IS DISTINCT FROM OLD.parent_disclosure_id THEN
+            v_event_kind := 'republished';
+        ELSE
+            v_event_kind := 'updated';
+        END IF;
+        v_row := NEW;
+    ELSIF TG_OP = 'DELETE' THEN
+        v_event_kind := 'deleted';
+        v_row := OLD;
+    END IF;
+    INSERT INTO kap.disclosures_version (
+        disclosure_id, as_of, event_kind, as_of_provenance,
+        entity_id, kap_id, published_at, category_code,
+        subcategory_code, title, language, kap_url, is_amendment,
+        parent_disclosure_id, body_fetched, index_fetched_at,
+        raw_index_storage_key, raw_body_storage_key,
+        body_fetched_at, raw_body_sha256, raw_body_bytes, raw_body_mime
+    ) VALUES (
+        v_row.disclosure_id, now(), v_event_kind, 'live',
+        v_row.entity_id, v_row.kap_id, v_row.published_at, v_row.category_code,
+        v_row.subcategory_code, v_row.title, v_row.language, v_row.kap_url, v_row.is_amendment,
+        v_row.parent_disclosure_id, v_row.body_fetched, v_row.index_fetched_at,
+        v_row.raw_index_storage_key, v_row.raw_body_storage_key,
+        v_row.body_fetched_at, v_row.raw_body_sha256, v_row.raw_body_bytes, v_row.raw_body_mime
+    )
+    ON CONFLICT (disclosure_id, as_of) DO NOTHING;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_capture_disclosure_version
+    AFTER INSERT OR UPDATE OR DELETE ON kap.disclosures
+    FOR EACH ROW
+    EXECUTE FUNCTION kap.fn_capture_disclosure_version();
+
+CREATE TRIGGER disclosures_version_no_update
+    BEFORE UPDATE ON kap.disclosures_version
+    FOR EACH ROW
+    EXECUTE FUNCTION aslan_core.reject_bitemporal_update_generic();
+
+-- Backfill 'indexed' events from existing rows.
+INSERT INTO kap.disclosures_version (
+    disclosure_id, as_of, event_kind, as_of_provenance,
+    entity_id, kap_id, published_at, category_code,
+    subcategory_code, title, language, kap_url, is_amendment,
+    parent_disclosure_id, body_fetched, index_fetched_at,
+    raw_index_storage_key, raw_body_storage_key,
+    body_fetched_at, raw_body_sha256, raw_body_bytes, raw_body_mime
+)
+SELECT
+    disclosure_id, index_fetched_at, 'indexed',
+    CASE WHEN index_fetched_at IS NOT NULL THEN 'index_fetched_at' ELSE 'pre_bitemporal_unknown' END,
+    entity_id, kap_id, published_at, category_code,
+    subcategory_code, title, language, kap_url, is_amendment,
+    parent_disclosure_id, false, index_fetched_at,
+    raw_index_storage_key, NULL,
+    NULL, NULL, NULL, NULL
+FROM kap.disclosures
+ON CONFLICT (disclosure_id, as_of) DO NOTHING;
+
+-- Backfill 'body_fetched' events for the ~89.7k rows.
+INSERT INTO kap.disclosures_version (
+    disclosure_id, as_of, event_kind, as_of_provenance,
+    entity_id, kap_id, published_at, category_code,
+    subcategory_code, title, language, kap_url, is_amendment,
+    parent_disclosure_id, body_fetched, index_fetched_at,
+    raw_index_storage_key, raw_body_storage_key,
+    body_fetched_at, raw_body_sha256, raw_body_bytes, raw_body_mime
+)
+SELECT
+    disclosure_id, body_fetched_at, 'body_fetched', 'body_fetched_at',
+    entity_id, kap_id, published_at, category_code,
+    subcategory_code, title, language, kap_url, is_amendment,
+    parent_disclosure_id, true, index_fetched_at,
+    raw_index_storage_key, raw_body_storage_key,
+    body_fetched_at, raw_body_sha256, raw_body_bytes, raw_body_mime
+FROM kap.disclosures
+WHERE body_fetched = true AND body_fetched_at IS NOT NULL
+ON CONFLICT (disclosure_id, as_of) DO NOTHING;
+
+CREATE OR REPLACE FUNCTION kap.disclosures_at(p_as_of TIMESTAMPTZ)
+RETURNS TABLE (
+    disclosure_id          TEXT,
+    as_of                  TIMESTAMPTZ,
+    event_kind             TEXT,
+    as_of_provenance       TEXT,
+    entity_id              UUID,
+    kap_id                 TEXT,
+    published_at           TIMESTAMPTZ,
+    category_code          TEXT,
+    subcategory_code       TEXT,
+    title                  TEXT,
+    language               kap.disclosure_language,
+    kap_url                TEXT,
+    is_amendment           BOOLEAN,
+    parent_disclosure_id   TEXT,
+    body_fetched           BOOLEAN,
+    index_fetched_at       TIMESTAMPTZ,
+    raw_index_storage_key  TEXT,
+    raw_body_storage_key   TEXT,
+    body_fetched_at        TIMESTAMPTZ,
+    raw_body_sha256        CHARACTER(64),
+    raw_body_bytes         BIGINT,
+    raw_body_mime          TEXT
+)
+LANGUAGE sql STABLE PARALLEL SAFE AS $$
+    SELECT DISTINCT ON (v.disclosure_id)
+        v.disclosure_id, v.as_of, v.event_kind, v.as_of_provenance,
+        v.entity_id, v.kap_id, v.published_at, v.category_code,
+        v.subcategory_code, v.title, v.language, v.kap_url, v.is_amendment,
+        v.parent_disclosure_id, v.body_fetched, v.index_fetched_at,
+        v.raw_index_storage_key, v.raw_body_storage_key,
+        v.body_fetched_at, v.raw_body_sha256, v.raw_body_bytes, v.raw_body_mime
+    FROM kap.disclosures_version v
+    WHERE v.as_of <= p_as_of
+      AND v.event_kind <> 'deleted'
+    ORDER BY v.disclosure_id, v.as_of DESC;
+$$;
+
+INSERT INTO aslan_core.bitemporal_table_registry
+    (schema_name, table_name, entity_columns, as_of_column,
+     pit_function_name, api_path, exposed_in_api, notes)
+VALUES
+    ('kap', 'disclosures_version', ARRAY['disclosure_id']::text[], 'as_of',
+     'kap.disclosures_at', '/v1/research/disclosures', true,
+     'SCD-4 bitemporal history of kap.disclosures')
+ON CONFLICT (schema_name, table_name) DO UPDATE
+SET entity_columns = EXCLUDED.entity_columns,
+    pit_function_name = EXCLUDED.pit_function_name,
+    api_path = EXCLUDED.api_path,
+    exposed_in_api = EXCLUDED.exposed_in_api,
+    notes = EXCLUDED.notes;
+
+GRANT SELECT ON kap.disclosures_version TO aslan_dashboard;
 
 COMMIT;
 

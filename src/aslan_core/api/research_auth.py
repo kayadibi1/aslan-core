@@ -15,17 +15,53 @@ expiry / revocation state.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any
+from datetime import UTC, datetime
 from uuid import UUID
 
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
 from fastapi import Depends, Header, HTTPException, Request, status
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aslan_core.api.deps import get_session
+
+# Argon2id is the secret-hash KDF for API keys per SCOPE.md D5.
+# Defaults are reasonable for v1 (memory_cost=64MiB, time_cost=3,
+# parallelism=4); tune via environment if a different cost is needed.
+_PASSWORD_HASHER = PasswordHasher()
+
+
+def hash_secret(secret: str) -> str:
+    """Hash an API-key secret with argon2id.
+
+    Used by the key-issuance CLI (not exposed via the API).
+    """
+    return _PASSWORD_HASHER.hash(secret)
+
+
+def verify_secret(stored_hash: str, presented_secret: str) -> bool:
+    """Constant-time argon2id verify with backward-compat fallback.
+
+    Returns True if `presented_secret` argon2-verifies against
+    `stored_hash`. Falls back to plaintext equality only when the
+    stored hash does NOT look like an argon2 string (legacy seed
+    keys); legacy verification is documented for one release and
+    removed in v1.0.0.
+    """
+    if not stored_hash:
+        return False
+    if stored_hash.startswith("$argon2"):
+        try:
+            return _PASSWORD_HASHER.verify(stored_hash, presented_secret)
+        except VerifyMismatchError:
+            return False
+    # Backward-compat for seed/test keys with non-argon2 hashes.
+    # Constant-time compare via hmac.compare_digest.
+    import hmac
+
+    return hmac.compare_digest(stored_hash, presented_secret)
 
 
 @dataclass(frozen=True)
@@ -172,8 +208,8 @@ async def get_principal(
             detail={"code": "AUTH_INVALID", "title": "Unknown API key"},
         )
 
-    # PROVISIONAL: direct secret-hash compare. Replace with argon2id.verify in v1.1.
-    if row.secret_hash != raw_secret and not _equals_legacy_hash(row.secret_hash, raw_secret):
+    # Argon2id verification (with backward-compat for seed/test keys).
+    if not verify_secret(row.secret_hash, raw_secret):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"code": "AUTH_INVALID", "title": "Invalid API key secret"},
@@ -184,7 +220,7 @@ async def get_principal(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"code": "AUTH_INVALID", "title": "API key revoked"},
         )
-    if row.expires_at is not None and row.expires_at < datetime.utcnow():
+    if row.expires_at is not None and row.expires_at < datetime.now(tz=UTC):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"code": "AUTH_INVALID", "title": "API key expired"},
@@ -200,7 +236,7 @@ async def get_principal(
             {"key_id": str(key_id)},
         )
         await session.commit()
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: S110 — best-effort last_used touch
         pass
 
     return ApiKeyPrincipal(

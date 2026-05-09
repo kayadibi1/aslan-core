@@ -11,7 +11,7 @@ and ``metadata.served_by`` (commit SHA) are uniform across endpoints.
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -71,7 +71,7 @@ def _commit_sha() -> str:
 
 def now_utc() -> datetime:
     """UTC now, microsecond-precise per SCOPE.md D12."""
-    return datetime.now(tz=timezone.utc)
+    return datetime.now(tz=UTC)
 
 
 def build_envelope(

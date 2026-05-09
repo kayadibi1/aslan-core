@@ -277,6 +277,52 @@ services:
     profiles:
       - event-extractor
 
+  # Moat 2 bitemporal canary. Re-runs ≥10 hand-curated KAP-amendment
+  # cases every 5 minutes; writes status into
+  # aslan_core.feature_flags.MOAT_2_CANARY_STATUS, increments the
+  # moat_2_canary_failures_total Prometheus counter on red, and emits
+  # the JSON failing-cases blob into the flag's `notes` column for
+  # RUNBOOK §5a triage.
+  #
+  # Profile-gated: only starts under `docker compose --profile
+  # bitemporal-canary up bitemporal-canary`. Mirrors the workspace
+  # convention of long-running services using
+  # `restart: unless-stopped`; the host crontab is reserved for
+  # heavyweight pullers, and a 5-minute internal Python loop is
+  # cheaper than a per-tick container spawn.
+  #
+  # TODO: when the workspace adopts a uniform cron container pattern,
+  # migrate this to that pattern instead of the in-process
+  # `while true; sleep 300` loop. Until then this is the simplest
+  # thing that mirrors the existing tail/body-fetcher long-running
+  # service shape.
+  bitemporal-canary:
+    build:
+      context: ../..
+      dockerfile: infra/deploy/Dockerfile
+    env_file:
+      - .env
+    environment:
+      ASLAN_PG_DSN: "postgresql+asyncpg://aslan:aslan@postgres:5432/aslan"
+      ASLAN_REDIS_URL: "redis://redis:6379/0"
+      BITEMPORAL_CANARY_INTERVAL_SECONDS: "300"
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+        echo "bitemporal-canary: starting; interval=${BITEMPORAL_CANARY_INTERVAL_SECONDS}s"
+        while true; do
+          /app/.venv/bin/python scripts/canary_moat_2.py || true
+          sleep "${BITEMPORAL_CANARY_INTERVAL_SECONDS}"
+        done
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - bitemporal-canary
+    restart: unless-stopped
+
 volumes:
   pg_data:
   minio_data:

@@ -31,7 +31,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import psycopg
@@ -64,9 +64,203 @@ class AmendmentCase:
     expected_after: float | None
 
 
-# Placeholder; populate from a curated YAML in scripts/canary_cases/ as
-# real amendments accumulate. ≥10 cases required per SCOPE.md D29.
-KNOWN_AMENDMENTS: tuple[AmendmentCase, ...] = ()
+# SYNTHETIC v1 fixtures — populated as a placeholder set so the canary
+# loop, the /verify/moat-2 plumbing, and the integration tests have
+# something to chew on. Per HANDOFF.md "Populate KNOWN_AMENDMENTS from
+# production after Phase 7e": the next session must replace these
+# entity_ids with real production UUIDs (sourced from
+# ``ts.canonical_financial`` rows that have ≥2 distinct ``as_of`` per
+# bitemporal key) and verify each before/after value against the
+# corresponding KAP filing.
+#
+# Until that backfill happens, the staging canary is seeded with these
+# rows by the integration test suite (``tests/research/``) before
+# ``scripts/canary_moat_2.py --once`` runs. The production canary
+# stays red ("unknown — no curated amendments yet") until the swap.
+#
+# ≥10 cases required per SCOPE.md D29 / TESTPLAN.md TC-054.
+KNOWN_AMENDMENTS: tuple[AmendmentCase, ...] = (
+    AmendmentCase(
+        case_id="synthetic-001-revenue-amend",
+        entity_id="00000000-0000-0000-0000-000000000001",
+        canonical_code="revenue",
+        period_end="2024-03-31",
+        period_type="q",
+        consolidation="consolidated",
+        currency_code="TRY",
+        accounting_standard="ifrs",
+        restatement_basis="as_reported",
+        cpi_base_date="9999-01-01",
+        mapping_version=1,
+        as_of_before="2024-04-25T10:00:00+00:00",
+        as_of_after="2024-05-10T16:00:00+00:00",
+        field="value",
+        expected_before=1_250_000_000.0,
+        expected_after=1_287_450_000.0,
+    ),
+    AmendmentCase(
+        case_id="synthetic-002-gross-profit-amend",
+        entity_id="00000000-0000-0000-0000-000000000002",
+        canonical_code="gross_profit",
+        period_end="2024-06-30",
+        period_type="q",
+        consolidation="consolidated",
+        currency_code="TRY",
+        accounting_standard="ifrs",
+        restatement_basis="as_reported",
+        cpi_base_date="9999-01-01",
+        mapping_version=1,
+        as_of_before="2024-07-22T11:30:00+00:00",
+        as_of_after="2024-08-05T14:15:00+00:00",
+        field="value",
+        expected_before=420_000_000.0,
+        expected_after=415_500_000.0,
+    ),
+    AmendmentCase(
+        case_id="synthetic-003-operating-income-correction",
+        entity_id="00000000-0000-0000-0000-000000000003",
+        canonical_code="operating_income",
+        period_end="2024-09-30",
+        period_type="q",
+        consolidation="consolidated",
+        currency_code="TRY",
+        accounting_standard="ifrs",
+        restatement_basis="as_reported",
+        cpi_base_date="9999-01-01",
+        mapping_version=1,
+        as_of_before="2024-10-28T09:45:00+00:00",
+        as_of_after="2024-11-15T17:00:00+00:00",
+        field="value",
+        expected_before=315_750_000.0,
+        expected_after=308_900_000.0,
+    ),
+    AmendmentCase(
+        case_id="synthetic-004-net-income-amend",
+        entity_id="00000000-0000-0000-0000-000000000004",
+        canonical_code="net_income",
+        period_end="2024-12-31",
+        period_type="y",
+        consolidation="consolidated",
+        currency_code="TRY",
+        accounting_standard="ifrs",
+        restatement_basis="as_reported",
+        cpi_base_date="9999-01-01",
+        mapping_version=1,
+        as_of_before="2025-03-15T10:00:00+00:00",
+        as_of_after="2025-04-20T16:00:00+00:00",
+        field="value",
+        expected_before=895_300_000.0,
+        expected_after=902_150_000.0,
+    ),
+    AmendmentCase(
+        case_id="synthetic-005-total-assets-amend",
+        entity_id="00000000-0000-0000-0000-000000000005",
+        canonical_code="total_assets",
+        period_end="2024-12-31",
+        period_type="y",
+        consolidation="consolidated",
+        currency_code="TRY",
+        accounting_standard="ifrs",
+        restatement_basis="as_reported",
+        cpi_base_date="9999-01-01",
+        mapping_version=1,
+        as_of_before="2025-03-20T08:00:00+00:00",
+        as_of_after="2025-04-10T11:30:00+00:00",
+        field="value",
+        expected_before=12_400_000_000.0,
+        expected_after=12_385_000_000.0,
+    ),
+    AmendmentCase(
+        case_id="synthetic-006-total-equity-correction",
+        entity_id="00000000-0000-0000-0000-000000000006",
+        canonical_code="total_equity",
+        period_end="2024-12-31",
+        period_type="y",
+        consolidation="consolidated",
+        currency_code="TRY",
+        accounting_standard="ifrs",
+        restatement_basis="as_reported",
+        cpi_base_date="9999-01-01",
+        mapping_version=1,
+        as_of_before="2025-03-25T13:00:00+00:00",
+        as_of_after="2025-04-12T15:00:00+00:00",
+        field="value",
+        expected_before=4_750_000_000.0,
+        expected_after=4_762_300_000.0,
+    ),
+    AmendmentCase(
+        case_id="synthetic-007-eps-basic-amend",
+        entity_id="00000000-0000-0000-0000-000000000007",
+        canonical_code="eps_basic",
+        period_end="2024-12-31",
+        period_type="y",
+        consolidation="consolidated",
+        currency_code="TRY",
+        accounting_standard="ifrs",
+        restatement_basis="as_reported",
+        cpi_base_date="9999-01-01",
+        mapping_version=1,
+        as_of_before="2025-03-15T10:00:00+00:00",
+        as_of_after="2025-04-20T16:00:00+00:00",
+        field="value",
+        expected_before=2.45,
+        expected_after=2.51,
+    ),
+    AmendmentCase(
+        case_id="synthetic-008-dividends-declared-amend",
+        entity_id="00000000-0000-0000-0000-000000000008",
+        canonical_code="dividends_declared",
+        period_end="2024-12-31",
+        period_type="y",
+        consolidation="consolidated",
+        currency_code="TRY",
+        accounting_standard="ifrs",
+        restatement_basis="as_reported",
+        cpi_base_date="9999-01-01",
+        mapping_version=1,
+        as_of_before="2025-04-15T09:00:00+00:00",
+        as_of_after="2025-05-08T12:00:00+00:00",
+        field="value",
+        expected_before=1.50,
+        expected_after=1.75,
+    ),
+    AmendmentCase(
+        case_id="synthetic-009-cash-equivalents-amend-tas29",
+        entity_id="00000000-0000-0000-0000-000000000009",
+        canonical_code="cash_and_equivalents",
+        period_end="2024-12-31",
+        period_type="y",
+        consolidation="consolidated",
+        currency_code="TRY",
+        accounting_standard="ifrs",
+        restatement_basis="cpi_normalized",
+        cpi_base_date="2024-12-31",
+        mapping_version=1,
+        as_of_before="2025-03-20T08:00:00+00:00",
+        as_of_after="2025-04-25T14:00:00+00:00",
+        field="value",
+        expected_before=2_100_000_000.0,
+        expected_after=2_148_500_000.0,
+    ),
+    AmendmentCase(
+        case_id="synthetic-010-inventory-amend-tas29",
+        entity_id="00000000-0000-0000-0000-00000000000a",
+        canonical_code="inventory",
+        period_end="2025-03-31",
+        period_type="q",
+        consolidation="consolidated",
+        currency_code="TRY",
+        accounting_standard="ifrs",
+        restatement_basis="cpi_normalized",
+        cpi_base_date="2025-03-31",
+        mapping_version=1,
+        as_of_before="2025-04-22T10:30:00+00:00",
+        as_of_after="2025-05-09T16:45:00+00:00",
+        field="value",
+        expected_before=875_400_000.0,
+        expected_after=881_200_000.0,
+    ),
+)
 
 
 def fetch_canonical_value(
@@ -121,7 +315,7 @@ def evaluate(conn: psycopg.Connection) -> dict[str, Any]:
         try:
             before = fetch_canonical_value(conn, case, as_of=case.as_of_before)
             after = fetch_canonical_value(conn, case, as_of=case.as_of_after)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             failing_cases.append(
                 {"case_id": case.case_id, "kind": "exception", "error": repr(e)}
             )
@@ -154,7 +348,7 @@ def evaluate(conn: psycopg.Connection) -> dict[str, Any]:
         "cases_passing": len(KNOWN_AMENDMENTS) - len(failing_cases),
         "failing_cases": failing_cases,
         "duration_seconds": round(duration, 4),
-        "ran_at": datetime.now(tz=timezone.utc).isoformat(),
+        "ran_at": datetime.now(tz=UTC).isoformat(),
     }
 
 

@@ -276,7 +276,7 @@ def run_one(conn: psycopg.Connection, inv: Invariant) -> tuple[bool, int, str]:
         return (True, 0, "table-not-yet-present (skipped)")
     except psycopg.errors.UndefinedObject as e:
         return (True, 0, f"object-not-yet-present: {e} (skipped)")
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         return (False, -1, f"runtime-error: {e!r}")
 
 
