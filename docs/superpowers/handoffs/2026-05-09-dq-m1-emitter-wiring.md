@@ -689,3 +689,129 @@ without DB changes.
   * `tests/unit/test_public_status_queries.py` (24 tests — pure-
     function coverage of `_humanize_age`, `_freshness_pct`,
     `_classify_badge`, `_build_row`, `_build_status`)
+
+
+## NG6 External-source corroborator setup
+
+The /dq/spot-check/<sample_id> page surfaces a "second opinion" panel
+below the existing canonical-DB / raw / labels / form blocks. For each
+registered external source (Investing.com Turkey, KAP company IR page,
+...) the panel renders a fresh-extracted reference payload alongside
+the canonical row so the labeller can compare against an independent
+witness. The labeller's truth value remains the binding label —
+the corroborator is reference material, not ground truth.
+
+### Required env
+
+* **SDK path**: `FIRECRAWL_API_KEY` set in the dashboard process
+  environment. The corroborator imports the `firecrawl` Python SDK
+  lazily so a base aslan-core install runs without it.
+* **CLI path**: `firecrawl` resolvable on PATH. The module probes via
+  `shutil.which("firecrawl")` (absolute path; no shell). 30-second
+  timeout per call.
+* **Neither**: the panel renders gracefully —
+  `CorroboratorResult(fetch_status='error', error_summary='firecrawl
+  unavailable')` is written to the cache so the labeller sees the
+  failure trail rather than a crash.
+
+The implementation tries SDK first; on `ImportError` or missing
+`FIRECRAWL_API_KEY` falls back to the CLI; on hard failure (rate
+limit, blocked, timeout) reports the failure verbatim and does NOT
+retry through the second path (cost discipline).
+
+### Cost discipline
+
+Firecrawl is paid. Steady-state cost is bounded by:
+
+* **24-hour cache TTL** in `audit.external_corroborator_cache`. The
+  panel only triggers a fresh fetch when no row exists or the latest
+  row is past TTL.
+* **Manual refresh only**. The Refresh button is the only path to a
+  fresh fetch outside of natural cache expiry. There is no
+  background cron — the panel is interactive, only the labeller's
+  click can spend money.
+* **Append-only cache**. Refresh writes a new row rather than
+  overwriting an existing one; the cache history surfaces the fetch
+  trail (including failures) so operators can audit spend.
+* **Per-source short-circuits**. `lookup() / fetch()` reject unknown
+  sources and reject `tradingview` / `earningshub` (registered but
+  not implemented) before reaching `_firecrawl_fetch` so the
+  placeholder panels cannot accidentally cost money.
+
+At the documented design, a single labeller opening 100 sample pages
+in a day with the default 24-hour TTL costs at most
+2 × 100 = 200 Firecrawl calls (Investing.com + KAP IR per sample);
+re-opens the same day are 0 calls.
+
+### Adding new sources
+
+Each source has:
+
+1. A URL builder — pure function `(entity_ticker: str) -> str`.
+2. An extraction prompt — currently a free-text instruction passed
+   to firecrawl's structured-extraction call (or, in the v1
+   markdown-scrape fallback, the `_extract_<source>` parser that
+   pulls the small comparable dict).
+3. An entry in `_REGISTERED_SOURCES` with `implemented=True`.
+
+The registered-but-unimplemented `tradingview` / `earningshub`
+entries are templates: copy the dict shape, swap the URL pattern +
+extraction prompt + parser, set `implemented=True`, and add a unit
+test for the parser. The dashboard auto-renders any new entry on the
+next page load — no template code change required.
+
+### Migration 0064
+
+Creates `audit.external_corroborator_cache`:
+
+* `(source, entity_ticker, fetched_at DESC)` index for the lookup
+  query.
+* `fetch_status` CHECK constraint
+  (`ok | error | rate_limited | blocked`).
+* `audit_writer` has INSERT only; UPDATE is intentionally never
+  granted — refresh writes a new row rather than mutating one.
+* `audit_reader` + `aslan_dashboard` have SELECT.
+
+### Privilege boundary on the refresh POST
+
+`POST /dq/spot-check/<sample_id>/corroborator/<source>/refresh` runs
+under the labeller's authenticated session (production deployments
+authenticate against `audit_writer`). The dashboard role itself has
+SELECT-only on the cache table; a misconfigured dashboard with no
+write-capable session simply renders the panel without working
+Refresh buttons (the GET path stays available).
+
+### Sources of truth
+
+* Migration: `0064_dq_external_corroborator_cache.py`.
+* Module: `src/aslan_core/dq/corroborator.py` — public surface
+  `lookup() / fetch() / refresh() / registered_sources() /
+  is_implemented()`. Single network seam `_firecrawl_fetch`.
+* SQL fragments: `src/aslan_core/dq/_sql.py` —
+  `INSERT_CORROBORATOR_CACHE`, `SELECT_CORROBORATOR_LATEST`.
+* View models: `src/aslan_core/dashboard/view_models.py` —
+  `DqSpotCheckCorroboratorPanelVM` + `DqSpotCheckCorroboratorPayloadPairVM`.
+* Page wiring: `src/aslan_core/dashboard/pages/dq_spot_check.py` —
+  `_build_corroborator_section`, `_build_corroborator_panel`,
+  `dq_spot_check_corroborator_refresh` POST handler.
+* Tests:
+  * `tests/integration/test_migration_0064_external_corroborator_cache.py`
+    (6 tests — table shape, CHECK constraint, index, dashboard role
+    SELECT-allowed, INSERT-denied, UPDATE-denied)
+  * `tests/integration/dq/test_corroborator_roundtrip.py` (12 tests
+    — lookup cache miss/hit/stale/unknown-source/non-positive-age,
+    fetch on miss/hit/error, refresh ignores cache/unimplemented/
+    unknown-source, kap_ir Turkish-text preservation)
+  * `tests/integration/dashboard/test_dq_spot_check_corroborator.py`
+    (10 tests — panel renders no-cache/fresh/stale/no-ticker, refresh
+    POST happy path / 400 bad UUID / 404 unknown source / 400
+    unimplemented / 404 unknown sample / 400 no ticker)
+  * `tests/unit/dq/test_corroborator_pure.py` (14 tests — registry,
+    URL builders, English investing.com extraction, Turkish KAP IR
+    extraction with Şirket Adı / Sektör / BIST Kodu preserved
+    verbatim, graceful-degrade SDK / CLI / both-unavailable)
+  * `tests/unit/dq/test_corroborator_no_external_io.py` (4 tests —
+    AST canary that no module-level network import, no out-of-band
+    `subprocess.run`, no urlopen / get / post / request over HTTP
+    string literal, and `refresh()` calls `_firecrawl_fetch` only)
+
