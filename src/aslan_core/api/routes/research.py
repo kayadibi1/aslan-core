@@ -1,4 +1,4 @@
-# ruff: noqa: S608
+﻿# ruff: noqa: S608
 # (S608 disabled file-wide: every SQL string in this module is built
 # from a fixed set of literal fragments selected by `if ... is not None`
 # branches; user input is bound via SQLAlchemy `text()` parameters, never
@@ -299,7 +299,7 @@ async def financials_canonical(
     as_of: str | None = Query(default=None),
     restatement_basis: str | None = Query(
         default=None,
-        regex="^(as_reported|cpi_normalized)$",
+        pattern="^(as_reported|cpi_normalized)$",
         description="Optional filter; defaults to both bases.",
     ),
     limit: int = Query(default=50, ge=1, le=500),
@@ -431,7 +431,7 @@ async def financials_line_items(
     period_end_to: datetime | None = Query(default=None),
     restatement_basis: str | None = Query(
         default=None,
-        regex="^(nominal|as_reported|restated|adjusted|cpi_normalized)$",
+        pattern="^(nominal|as_reported|restated|adjusted|cpi_normalized)$",
     ),
     limit: int = Query(default=50, ge=1, le=500),
 ) -> dict[str, Any]:
@@ -1003,7 +1003,7 @@ async def quality_scores(
     period_end_to: datetime | None = Query(default=None),
     restatement_basis: str | None = Query(
         default=None,
-        regex="^(nominal|as_reported|restated|adjusted|cpi_normalized)$",
+        pattern="^(nominal|as_reported|restated|adjusted|cpi_normalized)$",
     ),
     limit: int = Query(default=50, ge=1, le=500),
 ) -> dict[str, Any]:

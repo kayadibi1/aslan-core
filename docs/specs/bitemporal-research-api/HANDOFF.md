@@ -1,6 +1,12 @@
 # Bitemporal Research API — HANDOFF
 
-- **Status:** Phase 1 complete; Phase 2 shadow-validated (PASS); Phase 3 skeleton; Phase 4 / 5 / 6 partial. **Not deployed to staging or production.**
+- **Status:** Phases 1-6 complete; Phase 2h reversibility cycle on
+  shadow PASS; Phase 3 fully implemented (14 endpoints); Phase 4
+  tests (22 cases) collectible; Phase 5 docs + CI + deploy entries
+  landed; Phase 6 lint + argon2id + draft PR open. **Not deployed
+  to staging or production** — `BITEMPORAL_API_ENABLED=false` in
+  the seeded `aslan_core.feature_flags` and Phase 7 production
+  deploy is gated on `PROMOTE_TO_PROD` per spec.
 - **Owner:** sidar.
 - **Branch:** `aslan-core/feature/bitemporal-research-api`
 - **Drafted:** 2026-05-09 by autonomous agent run per `bitemporal-api-prompt.md`.
@@ -102,94 +108,114 @@ each is a 30-line route handler over its corresponding PIT function.
 
 ---
 
-## What was deferred (and why)
+## Round-2 update — formerly-deferred items now implemented
 
-### `ref.entity` bitemporal upgrade (D10)
+Earlier drafts of this HANDOFF flagged several items as deferred.
+Round 2 (commit `7945926`) closed them. Round 3 (commit `9b7c67a`)
+added the reversibility cycle and replaced synthetic canary cases
+with real prod data. Self-review (commit pending) tightened lint,
+fixed psycopg packaging, and updated `regex=` to `pattern=`.
 
-Original SCOPE plan: change `ref.entity.entity_pkey` from
-`(entity_id)` to `(entity_id, as_of)`, add merge/split lineage, apply
-append-only trigger.
+### `ref.entity` bitemporal — DONE via SCD-4
 
-**Blocker discovered Phase 2g:** `ref.entity_pkey` is referenced by
-14+ foreign-key constraints across `agg.*`, `doc.*`, `kap.*`, `ref.*`,
-`ts.*` schemas. Dropping it requires `CASCADE` and a coordinated
-re-creation of every dependent FK with the new shape, plus
-re-evaluating each consumer's lookup semantics. That's a multi-week
-coordination scoped beyond v1.
+**Migration 0046** (was no-op stub) now creates `ref.entity_version`
+PK `(entity_id, as_of)` as a bitemporal history mirror of
+`ref.entity`. The current-state `ref.entity` is unchanged — all
+14+ FK constraints still resolve. An AFTER INSERT/UPDATE/DELETE
+trigger `ref.fn_capture_entity_version` writes the post-state row
+into the version table with `event_kind in (created, updated,
+merged, split, renamed, deleted)`. Append-only enforcement on the
+version table itself.
 
-**v1 path:** `ref.entity` stays Class F (current-only); the
-bitemporal-research-API derives PIT entity reconstruction at the
-application layer by joining `ref.entity` with `ref.entity_lineage`
-and applying lineage events ≤ `p_as_of` in reverse. Sufficient for
-Moat 2 on entity lineage; full bitemporal `ref.entity` is a v2
-follow-up.
+Backfill: every existing entity gets a `created` row from
+`created_at` and (where `updated_at > created_at`) an `updated`
+row.
 
-**Recommendation for next session:** open a separate spec
-`docs/specs/ref-entity-bitemporal-upgrade/` with its own multi-week
-plan. Coordinate with consumers; consider migrating to a
-`ref.entity_version` shadow table that mirrors `ref.entity` with
-`as_of` discipline, leaving `ref.entity_pkey` intact as a "current
-state" pointer.
+PIT function `ref.entity_at(p_as_of)` reads from the version
+table. Registry row exposes `/v1/research/entities`.
 
-### `kap.disclosures` bitemporal upgrade (D11; D3)
+This is the SCD Type 4 pattern: keep the current-state pointer
+table for FK consumers; bitemporal history in a parallel table.
 
-Original SCOPE plan: add `as_of` and `as_of_provenance` columns,
-backfill from `body_fetched_at`/`index_fetched_at`/`published_at`,
-convert the `body_fetched=true` UPDATE pattern to a new-row pattern
-in the `crawl` body-fetcher service, apply append-only trigger.
+### `kap.disclosures` bitemporal — DONE via SCD-4 (no crawl changes)
 
-**Blocker:** schema is owned by the `crawl` repo's alembic, not
-`aslan-core`. The migration is authored as a `CRAWL_PATCHES/0001`
-patch file (NOT yet authored in this session) and requires a PR to
-`crawl` plus refactoring `crawl/src/kap/body_fetcher` to write new
-rows instead of UPDATEing.
+**Migration 0051** creates `kap.disclosures_version` PK
+`(disclosure_id, as_of)`. Same SCD-4 pattern; the existing 4 FKs
+on `kap.disclosures` are untouched. The `crawl` body-fetcher
+continues to UPDATE `body_fetched=true` and `body_fetched_at`
+on the same row — no `crawl` code change required. The new AFTER
+trigger captures every change with `event_kind` discriminating
+`indexed` / `body_fetched` / `republished` / `updated` / `deleted`.
 
-**Recommendation for next session:**
-1. Author `CRAWL_PATCHES/0001-kap-disclosures-bitemporal.sql` with
-   the column-add + backfill + trigger SQL.
-2. Patch `crawl/src/kap/body_fetcher` to write a new row when the
-   body becomes available, leaving the original index row in place.
-3. PR both changes to `crawl` with a coordinated review.
-4. After merge, flip `BITEMPORAL_API_KAP_APPEND_ONLY_TRIGGER=true` in
-   `aslan_core.feature_flags`.
+**Pre-bitemporal backfill (D3) executed:** every existing
+`kap.disclosures` row is seeded into the version table with
+`as_of=index_fetched_at` and `as_of_provenance='index_fetched_at'`
+(or `'pre_bitemporal_unknown'` if NULL). The ~89.7k rows with
+`body_fetched=true` get a second version with
+`as_of=body_fetched_at` and `as_of_provenance='body_fetched_at'`.
 
-This unblocks the `/disclosures` endpoint at the API layer.
+PIT function `kap.disclosures_at(p_as_of)`. Registry row exposes
+`/v1/research/disclosures`. The `/disclosures` endpoint is wired.
 
-### `agg.filing_event` `superseded_at` UPDATE pattern
+### `agg.filing_event` `superseded_at` — coordination still pending
 
-`aslan-event-extractor/SCOPE.md` D6 documents `superseded_at` as an
-UPDATEd column on `agg.filing_event`. Migration 0044 applies a strict
-BEFORE UPDATE trigger, which **breaks** that pattern.
-
-**Why this is fine for v1:** STATE.md confirms `agg.filing_event`
-has 0 rows in production. The discipline is enforced from day 0;
-`aslan-event-extractor` M1 must use new-row supersession (insert a
-new `as_of` row whose key matches the prior row, instead of UPDATEing
-`superseded_at`).
-
-**Coordination action for the aslan-event-extractor maintainer
-(sidar):** before M1 ships extraction code, update
+Migration 0044 applies the strict BEFORE UPDATE trigger as
+designed. STATE.md confirms `agg.filing_event` has 0 rows in
+production, so this discipline is enforced from day 0 with no
+data impact. **`aslan-event-extractor` M1 must use new-row
+supersession** instead of UPDATEing `superseded_at`. Cross-repo
+coordination action for the aslan-event-extractor maintainer:
+before M1 extraction code ships, update
 `aslan-event-extractor/SCOPE_v2.md` D6 to reflect the new-row
-supersession pattern. The PIT function `agg.filing_event_at`
-(migration 0049) handles both patterns transparently.
+pattern. The PIT function `agg.filing_event_at` already handles
+both patterns transparently.
 
-### Argon2id API-key hashing
+### Argon2id API-key hashing — DONE
 
-Phase 3 skeleton uses plain-secret comparison in
-`research_auth.py::get_principal`. Replace with `argon2-cffi`
-verification in v1.1. Schema is already correct (`secret_hash` is
-TEXT and stores the argon2id hash); only the verification path needs
-updating.
+`research_auth.py` now uses `argon2.PasswordHasher.verify` for
+secret verification, with `hmac.compare_digest` constant-time
+fallback for non-`$argon2`-prefixed legacy seed hashes.
+`hash_secret` and `verify_secret` exported as the key-issuance
+contract. `argon2-cffi` declared in `pyproject.toml` dependencies.
 
-### Full Phase 5/6 deliverables
+### Phase 5/6 deliverables — DONE
 
-- Phase 5b README — not started.
-- Phase 5c RUNBOOK — not started.
-- Phase 5d CHANGELOG — not started.
-- Phase 5e deploy config (canary cron, alerting) — not started.
-- Phase 5f CI workflow `.github/workflows/bitemporal-api-ci.yml` —
-  not started.
-- Phase 6a–6h self-audit + draft PR — not run.
+- Phase 5b `README.md` — customer-facing intro, curl/Python/SDK
+  quickstart, KAP-amendment PIT walkthrough with verbatim Turkish
+  disclosure title.
+- Phase 5c `RUNBOOK.md` — deploy, master-flag flip, key rotation,
+  rate-limit tuning, 3 incident runbooks (canary-red, slow queries,
+  audit-log disk), Prometheus inventory, alert thresholds, kill
+  switch.
+- Phase 5d `CHANGELOG.md` — Keep-a-Changelog format,
+  `[v1.0.0-alpha] — 2026-05-09` entry covering migrations
+  0043-0051.
+- Phase 5e deploy entry — `bitemporal-canary` profile-gated
+  service in `infra/deploy/docker-compose.yml`, runs
+  `scripts/canary_moat_2.py` every 5 minutes.
+- Phase 5f `.github/workflows/bitemporal-api-ci.yml` — three jobs:
+  validate-openapi, ruff, mypy --strict.
+- Phase 6 — `ruff` and `mypy --strict` clean on all new files;
+  reversibility cycle on shadow PASS (round 3); draft PR open at
+  https://github.com/kayadibi1/aslan-core/pull/25.
+
+## What's truly remaining
+
+Operator/external actions only — not bypassable autonomously per
+spec:
+
+1. **Apply migrations to staging via `alembic upgrade head`.**
+   STATE.md notes that "staging IS prod" today (no separate
+   staging DB). Running `alembic upgrade head` against `aslan` on
+   Hetzner is effectively a production migration; gated on
+   `PROMOTE_TO_PROD`.
+2. **Place `PROMOTE_TO_PROD` file at workspace root.** Explicit
+   human gate per spec ("Production deploy is sidar's decision").
+3. **Promote ADR-001/002/003 from PROVISIONAL to FINAL.** The
+   stubs were synthesized from existing CLAUDE.md content and are
+   internally consistent; flipping the status is a one-line edit
+   per file when sidar has read them.
+4. **Phase 7 production deploy.** Gated on (1) and (2).
 
 ---
 

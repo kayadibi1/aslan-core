@@ -1216,6 +1216,71 @@ paths:
         '503':
           $ref: '#/components/responses/FeatureDisabled'
 
+  /quality-scores:
+    get:
+      tags: [research]
+      summary: List entity quality scores point-in-time
+      operationId: listEntityQualityScores
+      description: |
+        Returns rows from `ts.entity_quality_score` as known at `as_of`.
+        Backed by `ts.entity_quality_score_at(p_as_of)` per migration 0050.
+
+        The score (0-100) reflects completeness and consistency of an
+        entity's canonical financials at the queried `period_end`.
+      parameters:
+        - $ref: '#/components/parameters/AsOf'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/DisplayTz'
+        - $ref: '#/components/parameters/EntityId'
+        - name: period_end_from
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: period_end_to
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: restatement_basis
+          in: query
+          schema:
+            type: string
+            enum: [as_reported, cpi_normalized]
+      responses:
+        '200':
+          description: Quality-scores envelope.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                  metadata:
+                    $ref: '#/components/schemas/EnvelopeMetadata'
+        '400':
+          $ref: '#/components/responses/BitemporalAsOfNaive'
+        '401':
+          $ref: '#/components/responses/AuthInvalid'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/FeatureDisabled'
+
   /verify/moat-2:
     get:
       tags: [verification]

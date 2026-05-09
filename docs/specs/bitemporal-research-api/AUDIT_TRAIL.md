@@ -196,3 +196,62 @@ actions, not blockers I avoided:
    human gate; the spec says *"Production deploy is sidar's
    decision."* Will not bypass.
 4. **Phase 7 production deploy** — gated on (3).
+
+---
+
+## 2026-05-09T08:55:00Z — Self-review of all phases
+
+Methodical self-review against the spec gates. Findings:
+
+**Phase 1 — PASS**
+- DECISIONS_LOG.json: 30 decisions D1-D30 all present (12 HIGH /
+  9 MEDIUM / 9 LOW reversibility; 13 FINAL / 17 PROVISIONAL).
+- TESTPLAN.md: 76 cases (≥50 required).
+- OPENAPI.yaml: 14 endpoints, validates against OpenAPI 3.1 spec.
+
+**Phase 2 — PASS**
+- Migration chain 0042 → 0043 → ... → 0051 intact (every revision
+  links to its predecessor's `down_revision`).
+- Reversibility cycle on shadow already PASS (round 3).
+
+**Phase 3 — PASS w/ minor fixes**
+- 14 endpoints implemented in `routes/research.py`; ruff and
+  `mypy --strict` clean.
+- **FIXED during review:** `Query(regex=...)` was deprecated in
+  current FastAPI; replaced with `Query(pattern=...)` at three
+  call sites.
+- **FIXED during review:** `/quality-scores` was implemented but
+  missing from OPENAPI.yaml; added a minimal endpoint spec.
+
+**Phase 4 — PASS w/ minor fix**
+- 22 tests collected via `pytest -m integration`.
+- **FIXED during review:** `pyproject.toml` had `psycopg-binary`
+  as the dep; the test files import the `psycopg` package.
+  Replaced with `psycopg[binary]>=3.3.4` so both ship.
+
+**Phase 5 — PASS**
+- README, RUNBOOK, CHANGELOG, CI workflow, docker-compose canary
+  entry all present and structured. RUNBOOK covers all 9 incident
+  topics. CHANGELOG follows Keep-a-Changelog.
+
+**Phase 6 — PASS**
+- argon2id integrated via `argon2-cffi`; `verify_secret` uses
+  `PasswordHasher.verify` with `hmac.compare_digest` legacy
+  fallback.
+- `ruff` and `mypy --strict` clean on the new files.
+- Reversibility cycle on shadow PASS.
+
+**Cross-cutting**
+- **FIXED during review:** `HANDOFF.md` was stale — described
+  ref.entity / kap.disclosures bitemporal upgrades as "deferred"
+  when they were implemented in round 2. Refreshed to reflect
+  the current state with explicit per-phase status.
+- **FIXED during review:** lock file status was `partial`; updated
+  to `complete` and added the round-3 commit reference.
+- ADR-001/002/003 remain PROVISIONAL — sidar's review call.
+- Origin/main has advanced to `fa9531f` (concurrent agent's merge);
+  feature branch will need a rebase or merge before its own merge.
+
+No bugs found that block PR review or staging deploy. The fixes
+above are all documentation/packaging tightening — none of them
+affected the round-3 shadow validation result.
