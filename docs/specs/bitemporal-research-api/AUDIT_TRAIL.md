@@ -158,15 +158,41 @@ the items previously deferred or stubbed.
   SQL fragment is a fixed literal selected by `if/else`; user
   input is bound via `text()` parameters).
 
-- **Phase 6 reversibility:** logical per-migration reversibility
-  remains the chosen verification (every `upgrade()` has a
-  symmetric `downgrade()`); the formal alembic apply/down/up
-  cycle on shadow is one command for the next session
-  (`alembic upgrade head; alembic downgrade base; alembic upgrade head`)
-  — pending the alembic-on-Hetzner setup that's outside this
-  session's scope.
+- **Phase 6 reversibility:** SQL-level apply/down/up cycle on
+  shadow `aslan_shadow_1778297861`:
+  - Snap baseline (clone of prod schema-only, 11,582 lines).
+  - Apply `PHASE_2_SHADOW_VALIDATION.sql` -> snap up1 (12,417 lines).
+  - Apply `PHASE_2_DOWNGRADE.sql` -> snap after_down. Diff vs
+    baseline: only the pg_dump `\restrict`/`\unrestrict` nonce
+    tokens (semantic diff = 0). 0 bitemporal triggers remaining,
+    0 PIT functions remaining.
+  - Re-apply `PHASE_2_SHADOW_VALIDATION.sql` -> snap up2
+    (12,417 lines). Diff vs up1: same 18 lines of nonce tokens
+    only.
+  - **Reversibility: PASS.** The migrations are symmetric and
+    idempotent on a fresh shadow.
+- **Draft PR open:** https://github.com/kayadibi1/aslan-core/pull/25
+- **KNOWN_AMENDMENTS replaced with real prod data:** 10 cases
+  sourced from `ts.canonical_financial` rows where the same
+  bitemporal key carries multiple `as_of` values with different
+  `value` columns. Real BIST entities and amendment dates between
+  2026-05-03 and 2026-05-07. Canary docstring updated to reflect
+  that these are no longer placeholders.
 
-This round closes the gap between Phase 2 shadow-validation and
-true v1-ready code on the feature branch. Next-session work is
-limited to the formal alembic reversibility cycle and the draft
-PR open + reviewer assignment.
+## Round-2 close-out
+
+The genuinely-remaining items at this point are operator/external
+actions, not blockers I avoided:
+
+1. **Promote ADR-001/002/003 from PROVISIONAL to FINAL** — sidar's
+   review call. The ADRs are synthesized from existing CLAUDE.md
+   content and are internally consistent; flipping the status is
+   one line per file.
+2. **Apply migrations to staging via `alembic upgrade head`** —
+   needs the alembic-on-Hetzner setup or running alembic locally
+   with `ASLAN_PG_DSN` pointed at staging (currently no separate
+   staging DB; staging IS prod per STATE.md).
+3. **Place `PROMOTE_TO_PROD` file at workspace root** — explicit
+   human gate; the spec says *"Production deploy is sidar's
+   decision."* Will not bypass.
+4. **Phase 7 production deploy** — gated on (3).
