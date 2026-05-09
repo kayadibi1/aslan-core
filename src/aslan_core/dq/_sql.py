@@ -167,3 +167,43 @@ UPDATE_BLOOMBERG_RUN_CLOSE = text(
     "  closed_at = now(), closed_by = :closed_by "
     "WHERE run_id = :run_id AND closed_at IS NULL"
 )
+
+
+# ── dq M5: regression_flag ───────────────────────────────────────
+
+
+INSERT_REGRESSION_FLAG = text(
+    "INSERT INTO audit.regression_flag("
+    "  source, record_table, record_pk, metric, "
+    "  prior_value, current_value, shift_pct, threshold_pct, detected_at"
+    ") VALUES ("
+    "  :source, :record_table, CAST(:record_pk AS JSONB), :metric, "
+    "  :prior_value, :current_value, :shift_pct, :threshold_pct, :detected_at"
+    ") RETURNING flag_id"
+)
+
+UPDATE_REGRESSION_FLAG_STATUS = text(
+    "UPDATE audit.regression_flag SET "
+    "  status = :status, "
+    "  reviewer = :reviewer, "
+    "  reviewed_at = now(), "
+    "  review_note = :review_note "
+    "WHERE flag_id = :flag_id"
+)
+
+SELECT_REGRESSION_FLAG_BY_ID = text(
+    "SELECT flag_id, source, record_table, record_pk, metric, "
+    "  prior_value, current_value, shift_pct, threshold_pct, "
+    "  detected_at, status, reviewer, reviewed_at, review_note, recorded_at "
+    "FROM audit.regression_flag WHERE flag_id = :flag_id"
+)
+
+SELECT_REGRESSION_FLAGS_OPEN = text(
+    "SELECT flag_id, source, record_table, record_pk, metric, "
+    "  prior_value, current_value, shift_pct, threshold_pct, "
+    "  detected_at, status, reviewer, reviewed_at, review_note, recorded_at "
+    "FROM audit.regression_flag "
+    "WHERE status = 'open' "
+    "ORDER BY detected_at DESC "
+    "LIMIT :limit"
+)

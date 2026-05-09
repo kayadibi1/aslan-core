@@ -50,6 +50,36 @@ class ValidationFailure:
 
 
 @dataclass(frozen=True, slots=True)
+class RegressionFlag:
+    """One row from ``audit.regression_flag``.
+
+    The dq.regression module returns this shape from
+    ``pending_flags()``. ``status`` is the only intentionally-mutable
+    field on the row and starts at ``'open'`` for every newly inserted
+    flag; reviewer flow flips it to one of ``reviewed`` / ``dismissed``
+    / ``confirmed_bug``. ``shift_pct`` is signed (positive when the
+    metric grew period-over-period); the detector uses ``abs(shift_pct)
+    > threshold_pct`` as the firing condition.
+    """
+
+    flag_id: int
+    source: str
+    record_table: str
+    record_pk: dict[str, Any]
+    metric: str
+    prior_value: Any | None  # NUMERIC; ``str`` (Decimal-text) at the wire layer
+    current_value: Any | None
+    shift_pct: Any  # NUMERIC; never NULL
+    threshold_pct: Any
+    detected_at: datetime
+    status: str
+    reviewer: str | None
+    reviewed_at: datetime | None
+    review_note: str | None
+    recorded_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class SpotCheckSample:
     """One pending or labelled row from `audit.spot_check_sample`.
 
