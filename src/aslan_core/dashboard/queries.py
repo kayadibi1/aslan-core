@@ -40,7 +40,9 @@ output and constructs the final frozen VM at render time.
 
 from __future__ import annotations
 
+import json
 from typing import Any
+from uuid import UUID
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -57,6 +59,11 @@ from aslan_core.dashboard.view_models import (
     DqOverviewVM,
     DqRecencyRowVM,
     DqRecencyVM,
+    DqSpotCheckQueueVM,
+    DqSpotCheckRecordPkPairVM,
+    DqSpotCheckResultRowVM,
+    DqSpotCheckSampleDetailVM,
+    DqSpotCheckSampleRowVM,
     IngestionRowVM,
     IngestionVM,
     OutboxRowVM,
@@ -814,6 +821,146 @@ async def dq_coverage(session: AsyncSession) -> DqCoverageVM:
     return DqCoverageVM(rows=rows)
 
 
+# ── DQ M2: spot-check ─────────────────────────────────────────────
+
+
+def _summarise_record_pk(record_pk: Any) -> str:
+    """Render a JSON record_pk as a short ``k=v, k=v`` string.
+
+    The dashboard never round-trips arbitrary JSON through the template
+    — the per-key `record_pk_pairs` carries the structured shape; this
+    summary is for the queue table only."""
+    if record_pk is None:
+        return ""
+    if isinstance(record_pk, str):
+        try:
+            record_pk = json.loads(record_pk)
+        except (ValueError, TypeError):
+            return record_pk
+    if not isinstance(record_pk, dict):
+        return str(record_pk)
+    return ", ".join(f"{k}={v}" for k, v in sorted(record_pk.items()))
+
+
+def _record_pk_pairs(record_pk: Any) -> list[DqSpotCheckRecordPkPairVM]:
+    if isinstance(record_pk, str):
+        try:
+            record_pk = json.loads(record_pk)
+        except (ValueError, TypeError):
+            return []
+    if not isinstance(record_pk, dict):
+        return []
+    return [
+        DqSpotCheckRecordPkPairVM(key=str(k), value=str(v))
+        for k, v in sorted(record_pk.items())
+    ]
+
+
+async def dq_spot_check_queue(
+    session: AsyncSession, *, limit: int = 50
+) -> DqSpotCheckQueueVM:
+    """Pending samples + 7-day completion count for /dq/spot-check."""
+    pending = (
+        await session.execute(
+            text(
+                "SELECT sample_id, source, drawn_at, record_table, "
+                "  record_pk, stratum "
+                "FROM audit.spot_check_sample "
+                "WHERE labelled = false "
+                "ORDER BY drawn_at DESC "
+                "LIMIT :limit"
+            ),
+            {"limit": limit},
+        )
+    ).all()
+    completions = (
+        await session.execute(
+            text(
+                "SELECT count(*)::int AS n FROM audit.spot_check_sample "
+                "WHERE labelled = true "
+                "  AND labelled_at >= now() - INTERVAL '7 days'"
+            )
+        )
+    ).scalar_one()
+    rows: list[DqSpotCheckSampleRowVM] = []
+    for r in pending:
+        rows.append(
+            DqSpotCheckSampleRowVM(
+                sample_id=r.sample_id,
+                source=r.source,
+                drawn_at=r.drawn_at,
+                record_table=r.record_table,
+                record_pk_summary=_summarise_record_pk(r.record_pk),
+                stratum=r.stratum,
+            )
+        )
+    return DqSpotCheckQueueVM(
+        pending_rows=rows,
+        recent_completions=int(completions),
+    )
+
+
+async def dq_spot_check_sample_detail(
+    session: AsyncSession, *, sample_id: UUID
+) -> DqSpotCheckSampleDetailVM | None:
+    """Sample detail + existing label results for /dq/spot-check/<id>."""
+    sample_row = (
+        await session.execute(
+            text(
+                "SELECT sample_id, source, drawn_at, record_table, "
+                "  record_pk, stratum, labelled, labelled_at, labeller "
+                "FROM audit.spot_check_sample "
+                "WHERE sample_id = :sid"
+            ),
+            {"sid": sample_id},
+        )
+    ).one_or_none()
+    if sample_row is None:
+        return None
+
+    result_rows = (
+        await session.execute(
+            text(
+                "SELECT field, db_value, truth_value, matches, "
+                "  variance_pct, label_note, labeller, recorded_at "
+                "FROM audit.spot_check_result "
+                "WHERE sample_id = :sid "
+                "ORDER BY recorded_at"
+            ),
+            {"sid": sample_id},
+        )
+    ).all()
+    results: list[DqSpotCheckResultRowVM] = [
+        DqSpotCheckResultRowVM(
+            field=r.field,
+            db_value=r.db_value,
+            truth_value=r.truth_value,
+            matches=bool(r.matches),
+            variance_pct=float(r.variance_pct) if r.variance_pct is not None else None,
+            label_note=r.label_note,
+            labeller=r.labeller,
+            recorded_at=r.recorded_at,
+        )
+        for r in result_rows
+    ]
+    raw_bytes_status = (
+        "kap-replay-pending" if sample_row.source == "kap" else "api-replay-pending"
+    )
+    return DqSpotCheckSampleDetailVM(
+        sample_id=sample_row.sample_id,
+        source=sample_row.source,
+        drawn_at=sample_row.drawn_at,
+        record_table=sample_row.record_table,
+        record_pk_pairs=_record_pk_pairs(sample_row.record_pk),
+        stratum=sample_row.stratum,
+        labelled=bool(sample_row.labelled),
+        labelled_at=sample_row.labelled_at,
+        labeller=sample_row.labeller,
+        raw_bytes_status=raw_bytes_status,
+        existing_results=results,
+    )
+
+
 __all__ = [
     "audit_recent",
     "deadletter_recent",
@@ -821,6 +968,8 @@ __all__ = [
     "dq_coverage",
     "dq_overview",
     "dq_recency",
+    "dq_spot_check_queue",
+    "dq_spot_check_sample_detail",
     "ingestion_recent",
     "outbox_recent",
     "overview",

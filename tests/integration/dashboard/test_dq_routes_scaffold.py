@@ -35,16 +35,19 @@ pytestmark = pytest.mark.integration
 # Routes still backed by the M0 stub body (don't touch the DB).
 STUB_ROUTES = [
     "/dq/validation",
-    "/dq/spot-check",
     "/dq/bloomberg",
     "/dq/scorecard",
 ]
 
-# M1 routes that hit audit.* tables. Tested via the configured app.
-M1_ROUTES = [
+# M1 + M2 routes that hit audit.* tables. Tested via the configured app.
+# /dq/spot-check moved off the stub list in M2 — see
+# tests/integration/dashboard/test_dq_spot_check.py for the
+# pending-queue + sample-form coverage.
+M1_M2_ROUTES = [
     "/dq/overview",
     "/dq/recency",
     "/dq/coverage",
+    "/dq/spot-check",
 ]
 
 
@@ -67,12 +70,12 @@ async def _configured_dashboard(
     yield
 
 
-@pytest.mark.parametrize("path", M1_ROUTES)
+@pytest.mark.parametrize("path", M1_M2_ROUTES)
 @pytest.mark.asyncio(loop_scope="session")
-async def test_dq_m1_route_renders(_configured_dashboard: None, path: str) -> None:
-    """The three M1 routes render against the configured testcontainer
-    DB. Empty-data path: no recency_observation / coverage_snapshot
-    rows are required for the routes to return 200."""
+async def test_dq_m1_m2_route_renders(_configured_dashboard: None, path: str) -> None:
+    """The four M1+M2 routes render against the configured testcontainer
+    DB. Empty-data path: no recency_observation / coverage_snapshot /
+    spot_check_sample rows are required for the routes to return 200."""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.get(path)
     assert resp.status_code == 200

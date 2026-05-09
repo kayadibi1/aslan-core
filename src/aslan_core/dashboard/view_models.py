@@ -348,6 +348,81 @@ class DqCoverageVM(_VMBase):
     rows: list[DqCoverageRowVM]
 
 
+# ── DQ M2: spot-check ─────────────────────────────────────────────
+
+
+class DqSpotCheckSampleRowVM(_VMBase):
+    """One pending sample on the /dq/spot-check queue.
+
+    `record_pk_summary` is a short text rendering of the JSON PK so
+    the queue table can show the labeller "what is this sample about"
+    without leaking arbitrary JSON shapes through the type system.
+    """
+
+    sample_id: UUID
+    source: str
+    drawn_at: datetime
+    record_table: str
+    record_pk_summary: str
+    stratum: str | None
+
+
+class DqSpotCheckQueueVM(_VMBase):
+    """Pending-queue view for /dq/spot-check."""
+
+    pending_rows: list[DqSpotCheckSampleRowVM]
+    recent_completions: int
+    """Count of rows where labelled=true and labelled_at is in the
+    trailing 7 days. Surfaces the labelling cadence at a glance."""
+
+
+class DqSpotCheckResultRowVM(_VMBase):
+    """One labelled result row, shown on the per-sample form below
+    the per-field input boxes."""
+
+    field: str
+    db_value: str | None
+    truth_value: str | None
+    matches: bool
+    variance_pct: float | None
+    label_note: str | None
+    labeller: str
+    recorded_at: datetime
+
+
+class DqSpotCheckRecordPkPairVM(_VMBase):
+    """One (key, value) entry from the sample's record_pk JSON,
+    rendered as text. The DB-row pane on /dq/spot-check/<id> shows
+    these in order so the labeller can identify the underlying source
+    record without the template having to interpret arbitrary JSON."""
+
+    key: str
+    value: str
+
+
+class DqSpotCheckSampleDetailVM(_VMBase):
+    """Per-sample form view for /dq/spot-check/<sample_id>."""
+
+    sample_id: UUID
+    source: str
+    drawn_at: datetime
+    record_table: str
+    record_pk_pairs: list[DqSpotCheckRecordPkPairVM]
+    stratum: str | None
+    labelled: bool
+    labelled_at: datetime | None
+    labeller: str | None
+    raw_bytes_status: str
+    """Human-readable status of the raw-bytes pane:
+      * 'kap-replay-pending' — KAP sample, body fetch from MinIO
+        deferred to M2.1; v1 renders the doc.filing summary instead.
+      * 'api-replay-pending' — non-KAP sample, API replay is M2.1.
+    The pane shows this string in v1; live MinIO bytes land in M2.1
+    once the per-source filing-id resolution is wired in.
+    """
+    existing_results: list[DqSpotCheckResultRowVM]
+
+
 # ── DQ M0 stubs ────────────────────────────────────────────────────
 
 
