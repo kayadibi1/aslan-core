@@ -50,5 +50,11 @@ specific edge cases) is in the workspace handoff. Summary:
   `src/aslan_core/dq/probes/{kap,bist,tefas,mkk}.py` with real
   upstream queries (HTTP-poll KAP, ref.calendar_tr for BIST holiday
   gating, per-fund rolling-90d-median for TEFAS, MKK API).
-* M2 — spot-check labelling workflow against
-  `agg.filing_event_label`.
+* M2 — **shipped on this branch**. Spot-check labelling workflow
+  is live: migration 0058 (`audit.spot_check_sample` +
+  `audit.spot_check_result`), `aslan_core.dq.spot_check` module,
+  `aslan-core audit spot-check-draw` CLI (Mon 06:00 UTC cron),
+  `/dq/spot-check` pending queue + per-sample labelling form
+  (GET + POST). Best-effort mirror into `agg.filing_event_label`
+  for KAP samples. Workspace handoff carries the operating-cycle
+  detail under `## Spot-check labelling workflow (M2)`.
