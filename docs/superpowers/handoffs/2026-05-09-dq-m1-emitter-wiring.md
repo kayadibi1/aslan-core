@@ -591,3 +591,101 @@ extras refresh.
   * Email rich-body coverage in `tests/unit/dq/test_sinks.py`
 
 
+## NG1 Public status page deployment
+
+NG1 surfaces a public, no-auth `/status` page rendering the
+per-source freshness + coverage roll-up from `audit.recency_observation`
++ `audit.coverage_snapshot`. Sibling to the internal dashboard
+(`aslan_core.dashboard`); reuses the same FastHTML stack but with a
+separate process, separate port, separate (least-priv) DB role.
+
+### Run command
+
+```
+aslan public-status serve --port 8081 --host 127.0.0.1
+```
+
+* Reads `ASLAN_PUBLIC_STATUS_DSN` for the `public_status_reader`
+  role. Without it the CLI exits with a usage error pointing at
+  migration 0063.
+* Loopback by default. Non-loopback bind requires
+  `--i-know-this-is-unsafe` — the page is intended to be fronted by
+  a CDN / reverse proxy; binding directly to a public interface
+  skips the rate limiting + structured access logging the fronting
+  layer would supply.
+
+### Recommended deployment shape
+
+* Dedicated container with a read-only DB user
+  (`public_status_reader` from migration 0063 — USAGE on schema
+  `audit` only, SELECT on `audit.recency_observation` +
+  `audit.coverage_snapshot` only). Even a SQL-injection escape
+  cannot reach `streams.outbox.payload`, `doc.filing_body`,
+  `audit.events`, or any other internal surface; the role lacks
+  USAGE on every other schema.
+* DNS: `status.aslan.<domain>` → `:8081` on the container host.
+* CDN: optional. The `/status` route already sets
+  `Cache-Control: public, max-age=60` so a fronting CDN absorbs
+  ~all traffic between cron writes (which run every 5 min).
+* Monitoring: external uptime check (UptimeRobot / similar) at a
+  30-second interval against `https://status.aslan.<domain>/status`
+  — the page is the dogfood signal for the rest of the system.
+
+### Migration 0063
+
+Creates the `public_status_reader` role with:
+
+* LOGIN with its own password (`ASLAN_PUBLIC_STATUS_PASSWORD` env
+  var; dev fallback `DEV_ONLY_REPLACE_ME` when `ASLAN_ENV=dev`).
+* `default_transaction_read_only=on` as a soft floor.
+* USAGE on schema `audit` only.
+* SELECT on `audit.recency_observation` +
+  `audit.coverage_snapshot` only.
+
+Defense-in-depth posture: separated from the `aslan_dashboard`
+role so a misconfigured public-status process logs in to a role
+that simply cannot reach internal surfaces — not "is told not to
+look" via in-process VMs but is denied at the privilege gate by
+PostgreSQL.
+
+### What the page surfaces
+
+* Headline: `Overall: X% Fresh` (unweighted average across
+  observed sources; UNKNOWN sources excluded so a never-observed
+  source does not drag the headline to 0).
+* Per-source rows for KAP / EVDS / BIST / TEFAS / MKK with badge
+  (Operational / Degraded / Outage / Unknown), freshness % derived
+  from lag vs SLA (linear from 1× SLA = 100% to 2× SLA = 0%, where
+  2× is the alert threshold per `audit.recency_sla.alert_at_2x`),
+  coverage % from latest `coverage_snapshot.coverage_pct`, and the
+  most-recent upstream timestamp rendered as a coarse age label
+  ("2 min ago", "3 hr ago", etc.).
+* Footer: "Powered by Aslan Terminal" + Terms link.
+
+NO incident history, NO subscribers, NO admin features.
+Forward-compatible — the schema reads only from existing tables;
+when paying users justify deeper trust commitments (incident
+history, postmortems, subscriptions) those features layer on
+without DB changes.
+
+### Sources of truth
+
+* Package: `src/aslan_core/public_status/` — sibling to
+  `aslan_core.dashboard`. Contains `app.py` (FastHTML app +
+  `configure_app`), `pages/status.py` (route + body builder),
+  `queries.py` (two `text(...)` literals + pure-function row
+  computation), `view_models.py` (frozen pydantic VMs), and
+  `render.py` (minimal HTML scaffolding + `Cache-Control` header).
+* CLI: `src/aslan_core/cli/public_status.py` — `public-status
+  serve` subcommand wired into `aslan_core.cli.main`.
+* Migration: `0063_dq_public_status_role.py`.
+* Tests:
+  * `tests/integration/test_migration_0063_public_status_role.py`
+    (18 tests — role + GRANT boundary, deny-list across audit.*
+    and non-audit schemas, INSERT denial)
+  * `tests/integration/test_public_status_route.py` (7 tests —
+    no-auth invariant, no-auth-import canary, Cache-Control header,
+    page structure, empty-data UNKNOWN path, fresh-KAP OK path)
+  * `tests/unit/test_public_status_queries.py` (24 tests — pure-
+    function coverage of `_humanize_age`, `_freshness_pct`,
+    `_classify_badge`, `_build_row`, `_build_status`)
