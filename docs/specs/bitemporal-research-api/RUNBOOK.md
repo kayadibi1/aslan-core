@@ -21,7 +21,7 @@ git push origin feature/bitemporal-research-api
 #    research router is gated by BITEMPORAL_API_ENABLED).
 ssh hetzner 'cd ~/aslan-core && git fetch && git checkout feature/bitemporal-research-api && git pull --ff-only'
 
-# 3. Apply migrations to staging (alembic; 0043-0050).
+# 3. Apply migrations to staging (alembic; 0043-0051).
 ssh hetzner 'cd ~/aslan-core/infra/deploy && docker compose run --rm --entrypoint "alembic upgrade head" api'
 
 # 4. Verify invariants.
@@ -38,7 +38,7 @@ Production deploys are gated by the `PROMOTE_TO_PROD` workspace marker
 
 1. Clone production DB into a Hetzner shadow:
    `pg_dump aslan | docker exec -i aslan-dashboard-postgres-1 psql -U aslan -d aslan_shadow_<ts>`.
-2. Apply 0043-0050 to the shadow; run
+2. Apply 0043-0051 to the shadow; run
    `scripts/check_bitemporal_invariants.py` against shadow DSN — must
    be 10/10.
 3. Run `scripts/canary_moat_2.py --target shadow --no-persist` — must

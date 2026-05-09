@@ -181,7 +181,8 @@ INVARIANTS: tuple[Invariant, ...] = (
               ON a.namespace = b.namespace
              AND a.value = b.value
              AND a.ctid <> b.ctid
-             AND a.daterange && b.daterange;
+             AND daterange(a.valid_from, a.valid_to, '[)') &&
+                 daterange(b.valid_from, b.valid_to, '[)');
         """,
     ),
     Invariant(

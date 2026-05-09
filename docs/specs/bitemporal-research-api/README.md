@@ -23,8 +23,9 @@ Get a key by emailing `api@aslanterminal.com` (v1; self-service portal
 deferred to v1.1). Each key carries a rate tier (`internal`, `partner`,
 `public`) and an optional `pii_unredacted` scope; see SCOPE.md D5/D6/D30.
 
-Public verification endpoints (`/v1/verify/moat-2`, `/v1/research/healthz`,
-`/v1/research/version`) require no auth.
+Public verification endpoints (`/v1/research/verify/moat-2`,
+`/v1/research/healthz`, `/v1/research/version`,
+`/v1/research/openapi.json`) require no auth.
 
 ---
 
@@ -115,7 +116,7 @@ curl -sS .../disclosures/KAP-2024-1018871?as_of=2024-03-12T12:00:00Z \
 Same `disclosure_id`, two `as_of` answers, two truths. A backtest
 running with `as_of=2024-03-09` cannot peek at the corrected text — by
 design. This is the Moat 2 contract; the canary at
-[/v1/verify/moat-2](#) verifies it continuously against
+[/v1/research/verify/moat-2](#) verifies it continuously against
 ≥10 hand-curated amendment cases.
 
 Turkish text is preserved verbatim (per ADR-002); we never auto-translate.

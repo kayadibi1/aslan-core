@@ -28,8 +28,13 @@ by `BITEMPORAL_API_ENABLED=false` until Phase 7e per
     `agg.filing_event`, `ref.identifier`.
   - `0045_canonical_financial_restatement_kind` — verified existing
     `restatement_basis` covers TAS 29 chain (effective no-op).
-  - `0046_ref_entity_bitemporal_upgrade` — deferred (PK cascade across
-    14+ FKs); reconstruction at API layer via `ref.entity_lineage`.
+  - `0046_ref_entity_bitemporal_upgrade` — implemented as SCD-4
+    (current-state pointer + `ref.entity_version` history mirror).
+    AFTER INSERT/UPDATE/DELETE trigger captures every change with
+    `event_kind in (created, updated, merged, split, renamed,
+    deleted)`. Backfill from existing rows. PIT function
+    `ref.entity_at(p_as_of)`. Preserves all 14+ FK references to
+    `ref.entity_pkey`.
   - `0047_ref_entity_lineage` — new bitemporal merge/split table.
   - `0048_research_api_support_tables` — `aslan_core.api_key`,
     `api_query_audit`, `api_rate_limit_state`, `feature_flags`
@@ -79,22 +84,18 @@ by `BITEMPORAL_API_ENABLED=false` until Phase 7e per
 
 ### Known limitations
 
-- `kap.disclosures` not yet bitemporal — schema is owned by `crawl`
-  repo; awaiting `CRAWL_PATCHES/0001` PR. Endpoints
-  `/v1/research/disclosures*` are stubbed in OpenAPI but return
-  `503 FEATURE_DISABLED` until
-  `BITEMPORAL_API_KAP_APPEND_ONLY_TRIGGER` is flipped.
-- `ref.entity` upgrade deferred (D10); see
-  [HANDOFF.md "What was deferred"](./HANDOFF.md#what-was-deferred-and-why).
-- Argon2id verification not yet wired in the auth path; provisional
-  plain-secret comparison ships in alpha (acceptable for internal-only
-  release; replaced in v1.0.0-beta).
-- Endpoints not yet implemented (skeleton in OpenAPI only):
-  `/financials/line-items`, `/entities`, `/entities/{id}`,
-  `/disclosures`, `/disclosures/{id}`, `/filings`, `/events`,
-  `/quality-scores`, `/openapi.json`.
-- Phase 6 self-audit (mypy strict, ruff, black, reversibility cycle)
-  not yet run end-to-end.
+- All 14 endpoints implemented (rounds 2-6); cursor pagination
+  emits `next_cursor` but the keyset-WHERE resumption is a v1.0.0-beta
+  follow-up (TODO comments in place at every list endpoint).
+- Argon2id auth integrated; the `verify_secret` helper retains a
+  `hmac.compare_digest` fallback for non-`$argon2`-prefixed legacy
+  hashes — to be removed after one release cycle.
+- All 14 endpoints implemented including `/quality-scores` and
+  `/openapi.json`. The OpenAPI 3.1 contract validates and is served
+  at both `/v1/research/openapi.json` (custom route) and the
+  FastAPI default `/openapi.json`.
+- Phase 6 self-audit run: ruff + mypy --strict clean on every new
+  file; reversibility cycle on shadow PASS (round 3).
 
 ---
 

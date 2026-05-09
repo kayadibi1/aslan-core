@@ -87,14 +87,13 @@ def create_api_app() -> FastAPI:
     app.add_middleware(BaseHTTPMiddleware, dispatch=research_audit_middleware)
 
     # Research-API exception handlers (RFC 7807 per D16, structured
-    # error logging per D25). Handlers no-op for non-/v1/research/*
-    # paths and delegate back to the existing app-wide handler.
-    # NOTE: register_research_exception_handlers must run BEFORE
-    # register_exception_handlers because FastAPI applies handlers
-    # in registration order — we want our research-path branch to
-    # match first.
-    register_research_exception_handlers(app)
+    # error logging per D25). FastAPI keeps ONE handler per exception
+    # class; the LAST registration wins. So generic handlers register
+    # first, research handlers second — research path-checks then
+    # delegate back to a generic-shaped response for non-research
+    # URLs internally.
     register_exception_handlers(app)
+    register_research_exception_handlers(app)
 
     return app
 

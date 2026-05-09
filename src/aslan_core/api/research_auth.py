@@ -85,11 +85,25 @@ class FeatureFlagState:
     text_values: dict[str, str]
 
 
-_PUBLIC_PATHS = ("/verify/moat-2", "/healthz", "/version")
+_PUBLIC_PATHS = frozenset(
+    {
+        "/v1/research/verify/moat-2",
+        "/v1/research/healthz",
+        "/v1/research/version",
+        "/v1/research/openapi.json",
+    }
+)
 
 
 def _is_public(path: str) -> bool:
-    return any(path.endswith(p) for p in _PUBLIC_PATHS)
+    """Exact-match check on the full request path.
+
+    Suffix matching used to be the implementation; it permits a future
+    private route like ``/v1/research/admin/version`` to bypass auth
+    because it ends with ``/version``. The exact-match form rejects
+    that drift.
+    """
+    return path in _PUBLIC_PATHS
 
 
 async def _load_feature_flags(session: AsyncSession) -> FeatureFlagState:

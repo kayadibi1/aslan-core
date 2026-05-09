@@ -22,8 +22,15 @@ on:
       - "docs/specs/bitemporal-research-api/**"
       - "src/aslan_core/api/research_envelope.py"
       - "src/aslan_core/api/research_auth.py"
+      - "src/aslan_core/api/research_observability.py"
+      - "src/aslan_core/api/research_logging.py"
       - "src/aslan_core/api/routes/research.py"
+      - "src/aslan_core/api/__init__.py"
+      - "src/aslan_core/db/migrations/versions/20260509_*_004*.py"
+      - "src/aslan_core/db/migrations/versions/20260509_*_005*.py"
+      - "tests/research/**"
       - "scripts/check_bitemporal_invariants.py"
+      - "scripts/check_bitemporal_invariants.sql"
       - "scripts/canary_moat_2.py"
       - ".github/workflows/bitemporal-api-ci.yml"
 
@@ -55,6 +62,8 @@ jobs:
             src/aslan_core/api/routes/research.py \
             src/aslan_core/api/research_envelope.py \
             src/aslan_core/api/research_auth.py \
+            src/aslan_core/api/research_observability.py \
+            src/aslan_core/api/research_logging.py \
             scripts/check_bitemporal_invariants.py \
             scripts/canary_moat_2.py
 
@@ -75,4 +84,20 @@ jobs:
           uv run mypy --strict \
             src/aslan_core/api/research_envelope.py \
             src/aslan_core/api/research_auth.py \
+            src/aslan_core/api/research_observability.py \
+            src/aslan_core/api/research_logging.py \
             src/aslan_core/api/routes/research.py
+
+  collect-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-groups
+      - name: Pytest collect (research tests, integration marker)
+        # We can't run integration tests in CI (no Postgres), but we
+        # collect them so import-level breakage on test files is caught.
+        run: |
+          uv run pytest tests/research/ --collect-only -m integration -q

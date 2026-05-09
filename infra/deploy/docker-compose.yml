@@ -311,10 +311,16 @@ services:
       - -c
       - |
         set -e
-        echo "bitemporal-canary: starting; interval=${BITEMPORAL_CANARY_INTERVAL_SECONDS}s"
+        # The double-dollar prevents Compose's parse-time variable
+        # expansion; the SHELL inside the container reads
+        # ${BITEMPORAL_CANARY_INTERVAL_SECONDS} from the service's
+        # `environment:` block above. Otherwise Compose interpolates
+        # the host-side env at parse time (often empty), and `sleep ""`
+        # under set -e exits the loop after one iteration.
+        echo "bitemporal-canary: starting; interval=$${BITEMPORAL_CANARY_INTERVAL_SECONDS:-300}s"
         while true; do
           /app/.venv/bin/python scripts/canary_moat_2.py || true
-          sleep "${BITEMPORAL_CANARY_INTERVAL_SECONDS}"
+          sleep "$${BITEMPORAL_CANARY_INTERVAL_SECONDS:-300}"
         done
     depends_on:
       postgres:
