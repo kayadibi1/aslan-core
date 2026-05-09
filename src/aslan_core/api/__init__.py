@@ -52,7 +52,10 @@ def create_api_app() -> FastAPI:
     """
     # Lazy imports — keep inside the function body so mypy skips them when
     # analysing this module directly.
+    from starlette.middleware.base import BaseHTTPMiddleware
+
     from aslan_core.api.middleware import register_exception_handlers
+    from aslan_core.api.research_observability import research_audit_middleware
     from aslan_core.api.routes.auth import router as auth_router
     from aslan_core.api.routes.catalog import router as catalog_router
     from aslan_core.api.routes.entities import router as entities_router
@@ -72,6 +75,10 @@ def create_api_app() -> FastAPI:
     # Bitemporal Research API — gated by BITEMPORAL_API_ENABLED feature flag.
     # Mounts at /v1/research; the router defines its own prefix internally.
     app.include_router(research_router)
+
+    # Research-API cross-cutting middleware (D18 audit, D25 metrics).
+    # Filters by path inside the dispatcher, so it is safe to add globally.
+    app.add_middleware(BaseHTTPMiddleware, dispatch=research_audit_middleware)
 
     register_exception_handlers(app)
 

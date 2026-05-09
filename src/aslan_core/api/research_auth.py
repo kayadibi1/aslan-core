@@ -226,18 +226,17 @@ async def get_principal(
             detail={"code": "AUTH_INVALID", "title": "API key expired"},
         )
 
-    # Side-effect: best-effort last_used_at touch (does not block on failure).
-    try:
-        await session.execute(
-            text(
-                "UPDATE aslan_core.api_key SET last_used_at = now() "
-                "WHERE key_id = :key_id"
-            ),
-            {"key_id": str(key_id)},
-        )
-        await session.commit()
-    except Exception:  # noqa: S110 — best-effort last_used touch
-        pass
+    # last_used_at is intentionally NOT touched here. Doing so would
+    # require committing the request session mid-flight (corrupting
+    # the transaction boundary for the route handler) or opening a
+    # second connection (overhead per request). Operators that need
+    # last-used can derive it from aslan_core.api_query_audit:
+    #   SELECT api_key_id, max(requested_at) FROM aslan_core.api_query_audit
+    #   GROUP BY api_key_id;
+    # The api_key.last_used_at column is preserved in the schema for
+    # forward-compat; if a cheaper ad-hoc touch is needed in the
+    # future, wire it via a NOTIFY-driven background updater rather
+    # than inlining it in the auth path.
 
     return ApiKeyPrincipal(
         key_id=row.key_id,

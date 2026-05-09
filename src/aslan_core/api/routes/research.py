@@ -1,8 +1,3 @@
-﻿# ruff: noqa: S608
-# (S608 disabled file-wide: every SQL string in this module is built
-# from a fixed set of literal fragments selected by `if ... is not None`
-# branches; user input is bound via SQLAlchemy `text()` parameters, never
-# concatenated into the SQL string.)
 """Bitemporal Research API - main FastAPI router (Phase 3 skeleton).
 
 Per ``docs/specs/bitemporal-research-api/SCOPE.md`` D1, D2, D4, D20,
@@ -22,9 +17,10 @@ follow-up commits.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import json as _json
+from datetime import UTC, datetime, timedelta
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy import text
@@ -34,7 +30,6 @@ from aslan_core.api.deps import get_session
 from aslan_core.api.research_auth import (
     ApiKeyPrincipal,
     FeatureFlagState,
-    get_principal,
     require_master_flag,
 )
 from aslan_core.api.research_envelope import (
@@ -44,6 +39,16 @@ from aslan_core.api.research_envelope import (
     build_envelope,
     now_utc,
 )
+from aslan_core.api.research_observability import (
+    RequestContext,
+    decode_cursor,
+    encode_cursor,
+    enforce_rate_limit,
+    get_request_context,
+    set_cache_headers,
+)
+
+_CLOCK_SKEW_TOLERANCE = timedelta(seconds=60)
 
 router = APIRouter(prefix="/v1/research", tags=["research"])
 
@@ -82,7 +87,7 @@ def _parse_as_of(raw: str | None) -> datetime | None:
                 "code": "BITEMPORAL_AS_OF_NAIVE",
             },
         )
-    if dt > now_utc().replace(microsecond=999999) + _CLOCK_SKEW:
+    if dt > now_utc().replace(microsecond=999999) + _CLOCK_SKEW_TOLERANCE:
         raise HTTPException(
             status_code=400,
             detail={
@@ -94,13 +99,37 @@ def _parse_as_of(raw: str | None) -> datetime | None:
     return dt.astimezone(UTC)
 
 
-_CLOCK_SKEW = (datetime(2026, 1, 1, 0, 1, tzinfo=UTC)
-               - datetime(2026, 1, 1, 0, 0, tzinfo=UTC))
-
-
 def _active_flags(flags: FeatureFlagState) -> list[str]:
     """Snapshot of currently-true flags for the envelope metadata."""
     return sorted(name for name, value in flags.enabled.items() if value)
+
+
+def _build_filtered_sql(
+    *,
+    select_clause: str,
+    pit_call: str | None = None,
+    from_clause: str | None = None,
+    where_parts: list[str],
+    order_by: str,
+    limit_param: str = ":limit",
+) -> str:
+    """Assemble a parameterized SELECT.
+
+    Pass exactly one of ``pit_call`` (e.g. ``"ts.observation_at(:as_of)"``)
+    or ``from_clause`` (e.g. ``"ref.entity e"``).
+
+    ``where_parts`` MUST come from a fixed set of literal SQL fragments
+    selected by ``if X is not None:`` branches in the caller — never
+    interpolated user input. User-bound values are passed via
+    SQLAlchemy ``text()`` parameter binding only.
+    """
+    if (pit_call is None) == (from_clause is None):
+        raise ValueError("pass exactly one of pit_call / from_clause")
+    source = pit_call if pit_call is not None else from_clause
+    where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+    return (
+        f"{select_clause} FROM {source} {where_clause} {order_by} LIMIT {limit_param}"
+    )
 
 
 # ---------------------------------------------------------------------
@@ -112,6 +141,18 @@ def _active_flags(flags: FeatureFlagState) -> list[str]:
 async def healthz() -> dict[str, str]:
     """Basic liveness check."""
     return {"status": "ok"}
+
+
+@router.get("/openapi.json", include_in_schema=False)
+async def research_openapi_json(request: Request) -> dict[str, Any]:
+    """Serve the auto-generated OpenAPI schema at the research-API path.
+
+    Per SCOPE.md D21 / OPENAPI.yaml the documented contract URL is
+    ``/v1/research/openapi.json``. FastAPI's default `/openapi.json`
+    is also still served at the app root for backward-compat. Both
+    paths return the same `app.openapi()` output.
+    """
+    return dict(request.app.openapi())
 
 
 @router.get("/version")
@@ -130,8 +171,9 @@ async def version(
 async def verify_moat_2(
     response: Response,
     session: AsyncSession = Depends(get_session),
+    ctx: RequestContext = Depends(get_request_context),
 ) -> dict[str, Any]:
-    """Per SCOPE.md D20.
+    """Per SCOPE.md D20 (canary status); D17 cache headers; D18 audit log.
 
     Returns ``200`` with green status when the canary's last cycle
     passed, ``503`` otherwise. The canary itself runs out-of-band
@@ -139,9 +181,18 @@ async def verify_moat_2(
     ``aslan_core.feature_flags`` under the synthetic flag
     ``MOAT_2_CANARY_STATUS`` (``true`` = green, ``false`` = red).
 
+    Public endpoint: no rate-limit (per D6); audit-log row is written
+    by ``research_audit_middleware`` against ``ctx``. Cache-Control is
+    forced to ``no-cache`` with an ETag derived from the canary
+    payload (D17): the freshness window is the whole point of this
+    endpoint, so we never let a stale "green" be served.
+
     Phase 3 skeleton: returns a structural placeholder until the
     canary persistence layer is wired in Phase 4f.
     """
+    resolved = now_utc()
+    ctx.as_of_resolved = resolved
+
     row = (
         await session.execute(
             text(
@@ -154,23 +205,30 @@ async def verify_moat_2(
     if row is None:
         # Canary not yet wired (Phase 4f) - be honest about it.
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        return {
+        body: dict[str, Any] = {
             "moat_2": "unknown",
             "reason": "canary not yet deployed (Phase 4f pending)",
             "last_run_at": None,
         }
-    if row.value_bool is False:
+    elif row.value_bool is False:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        return {
+        body = {
             "moat_2": "red",
             "last_run_at": row.updated_at.isoformat() if row.updated_at else None,
             "notes": row.notes,
         }
-    return {
-        "moat_2": "green",
-        "last_run_at": row.updated_at.isoformat() if row.updated_at else None,
-        "notes": row.notes,
-    }
+    else:
+        body = {
+            "moat_2": "green",
+            "last_run_at": row.updated_at.isoformat() if row.updated_at else None,
+            "notes": row.notes,
+        }
+    ctx.rows_returned = 1 if row is not None else 0
+    body_bytes = _json.dumps(body, sort_keys=True, default=str).encode("utf-8")
+    set_cache_headers(response, as_of_resolved=resolved, body_bytes=body_bytes)
+    # Force no-cache for the canary status irrespective of as_of age.
+    response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return body
 
 
 # ---------------------------------------------------------------------
@@ -181,29 +239,51 @@ async def verify_moat_2(
 @router.get("/observations", tags=["research"])
 async def observations(
     request: Request,
+    response: Response,
     session: AsyncSession = Depends(get_session),
-    principal: ApiKeyPrincipal | None = Depends(get_principal),
+    principal: ApiKeyPrincipal | None = Depends(enforce_rate_limit),
     flags: FeatureFlagState = Depends(require_master_flag),
+    ctx: RequestContext = Depends(get_request_context),
     as_of: str | None = Query(default=None),
     series_id: int | None = Query(default=None),
+    cursor: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
 ) -> dict[str, Any]:
-    """Per SCOPE.md D1: ``ts.observation_at(p_as_of)``."""
+    """Per SCOPE.md D1: ``ts.observation_at(p_as_of)``.
+
+    D6 rate-limit, D7 cursor pagination, D17 cache headers, D18
+    audit log, D25 metrics are wired via ``enforce_rate_limit`` /
+    ``ctx`` / ``set_cache_headers`` / ``research_audit_middleware``.
+    """
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
+    ctx.api_key_id = principal.key_id if principal else None
+    ctx.rate_tier = principal.rate_tier if principal else "anonymous"
+    ctx.as_of_requested = requested
+    ctx.as_of_resolved = resolved
+    ctx.feature_flags_active = _active_flags(flags)
 
-    query = """
-        SELECT series_id, ts, as_of, value, value_text
-        FROM ts.observation_at(:as_of)
-        {filter}
-        ORDER BY series_id, ts DESC
-        LIMIT :limit
-    """
-    where = "WHERE series_id = :series_id" if series_id is not None else ""
-    rows = await session.execute(
-        text(query.format(filter=where)),
-        {"as_of": resolved, "series_id": series_id, "limit": limit},
+    where_parts: list[str] = []
+    params: dict[str, Any] = {"as_of": resolved, "limit": limit}
+    if series_id is not None:
+        where_parts.append("series_id = :series_id")
+        params["series_id"] = series_id
+
+    filters_for_cursor: dict[str, Any] = {
+        "as_of": resolved.isoformat(),
+        "series_id": series_id,
+    }
+    if cursor is not None:
+        decode_cursor(cursor, filters_for_cursor)
+        # TODO(D7): apply keyset WHERE from decoded["anchor"] in v1.0.0-beta.
+
+    sql = _build_filtered_sql(
+        select_clause="SELECT series_id, ts, as_of, value, value_text",
+        pit_call="ts.observation_at(:as_of)",
+        where_parts=where_parts,
+        order_by="ORDER BY series_id, ts DESC",
     )
+    rows = await session.execute(text(sql), params)
     data = [
         {
             "series_id": r.series_id,
@@ -214,30 +294,56 @@ async def observations(
         }
         for r in rows
     ]
+    ctx.rows_returned = len(data)
 
-    return build_envelope(
+    next_cursor: str | None = None
+    if len(data) == limit and data:
+        last = data[-1]
+        anchor = {"series_id": last["series_id"], "ts": last["ts"]}
+        next_cursor = encode_cursor(
+            as_of=resolved, anchor=anchor, filters=filters_for_cursor
+        )
+    pagination = Pagination(
+        next_cursor=next_cursor, has_more=(next_cursor is not None)
+    )
+
+    env = build_envelope(
         data=data,
-        request_id=uuid4(),
+        request_id=ctx.request_id,
         as_of_requested=requested,
         as_of_resolved=resolved,
         feature_flags_active=_active_flags(flags),
-        pagination=Pagination(has_more=(len(data) == limit)),
+        pagination=pagination,
     )
+    body_bytes = _json.dumps(env, sort_keys=True, default=str).encode("utf-8")
+    set_cache_headers(response, as_of_resolved=resolved, body_bytes=body_bytes)
+    return env
 
 
 @router.get("/identifiers/resolve", tags=["identifiers"])
 async def identifiers_resolve(
     request: Request,
+    response: Response,
     namespace: str = Query(...),
     value: str = Query(...),
     session: AsyncSession = Depends(get_session),
-    principal: ApiKeyPrincipal | None = Depends(get_principal),
+    principal: ApiKeyPrincipal | None = Depends(enforce_rate_limit),
     flags: FeatureFlagState = Depends(require_master_flag),
+    ctx: RequestContext = Depends(get_request_context),
     as_of: str | None = Query(default=None),
 ) -> dict[str, Any]:
-    """Per SCOPE.md D9: resolve (namespace, value, as_of) -> entity."""
+    """Per SCOPE.md D9: resolve (namespace, value, as_of) -> entity.
+
+    Single-row resolver; D6 rate-limit, D17 cache, D18 audit, D25
+    metrics applied.
+    """
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
+    ctx.api_key_id = principal.key_id if principal else None
+    ctx.rate_tier = principal.rate_tier if principal else "anonymous"
+    ctx.as_of_requested = requested
+    ctx.as_of_resolved = resolved
+    ctx.feature_flags_active = _active_flags(flags)
 
     rows = (
         await session.execute(
@@ -281,59 +387,81 @@ async def identifiers_resolve(
         "is_primary": bool(r.is_primary),
         "source_id": r.source_id,
     }
-    return build_envelope(
+    ctx.rows_returned = 1
+    env = build_envelope(
         data=data,
-        request_id=uuid4(),
+        request_id=ctx.request_id,
         as_of_requested=requested,
         as_of_resolved=resolved,
         feature_flags_active=_active_flags(flags),
     )
+    body_bytes = _json.dumps(env, sort_keys=True, default=str).encode("utf-8")
+    set_cache_headers(response, as_of_resolved=resolved, body_bytes=body_bytes)
+    return env
 
 
 @router.get("/financials/canonical", tags=["research"])
 async def financials_canonical(
+    response: Response,
     entity_id: UUID = Query(...),
     session: AsyncSession = Depends(get_session),
-    principal: ApiKeyPrincipal | None = Depends(get_principal),
+    principal: ApiKeyPrincipal | None = Depends(enforce_rate_limit),
     flags: FeatureFlagState = Depends(require_master_flag),
+    ctx: RequestContext = Depends(get_request_context),
     as_of: str | None = Query(default=None),
     restatement_basis: str | None = Query(
         default=None,
         pattern="^(as_reported|cpi_normalized)$",
         description="Optional filter; defaults to both bases.",
     ),
+    cursor: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
 ) -> dict[str, Any]:
     """Per SCOPE.md D1, D8: ``ts.canonical_financial_at(p_as_of)``.
 
     Returns rows for the requested entity at the requested ``as_of``.
     Both ``as_reported`` and ``cpi_normalized`` bases are returned
-    unless filtered.
+    unless filtered. D6/D7/D17/D18/D25 wired.
     """
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
+    ctx.api_key_id = principal.key_id if principal else None
+    ctx.rate_tier = principal.rate_tier if principal else "anonymous"
+    ctx.as_of_requested = requested
+    ctx.as_of_resolved = resolved
+    ctx.feature_flags_active = _active_flags(flags)
 
-    sql = (
-        "SELECT entity_id, canonical_code, period_end, period_type, "
-        "       consolidation, currency_code, accounting_standard, "
-        "       restatement_basis, value, as_of, cpi_base_date, "
-        "       measuring_unit_date, mapping_version "
-        "FROM ts.canonical_financial_at(:as_of) "
-        "WHERE entity_id = :entity_id "
-        "{rb_filter} "
-        "ORDER BY period_end DESC, canonical_code, restatement_basis "
-        "LIMIT :limit"
+    where_parts: list[str] = ["entity_id = :entity_id"]
+    params: dict[str, Any] = {
+        "as_of": resolved,
+        "entity_id": str(entity_id),
+        "limit": limit,
+    }
+    if restatement_basis is not None:
+        where_parts.append("restatement_basis = :rb")
+        params["rb"] = restatement_basis
+
+    filters_for_cursor: dict[str, Any] = {
+        "as_of": resolved.isoformat(),
+        "entity_id": str(entity_id),
+        "restatement_basis": restatement_basis,
+    }
+    if cursor is not None:
+        decode_cursor(cursor, filters_for_cursor)
+        # TODO(D7): apply keyset WHERE from decoded["anchor"] in v1.0.0-beta.
+
+    sql = _build_filtered_sql(
+        select_clause=(
+            "SELECT entity_id, canonical_code, period_end, period_type, "
+            "       consolidation, currency_code, accounting_standard, "
+            "       restatement_basis, value, as_of, cpi_base_date, "
+            "       measuring_unit_date, mapping_version"
+        ),
+        pit_call="ts.canonical_financial_at(:as_of)",
+        where_parts=where_parts,
+        order_by="ORDER BY period_end DESC, canonical_code, restatement_basis",
     )
-    rb_filter = "AND restatement_basis = :rb" if restatement_basis else ""
-    rows = await session.execute(
-        text(sql.format(rb_filter=rb_filter)),
-        {
-            "as_of": resolved,
-            "entity_id": str(entity_id),
-            "rb": restatement_basis,
-            "limit": limit,
-        },
-    )
+    rows = await session.execute(text(sql), params)
     data = [
         {
             "entity_id": str(r.entity_id),
@@ -354,6 +482,7 @@ async def financials_canonical(
         }
         for r in rows
     ]
+    ctx.rows_returned = len(data)
 
     warnings: list[Warning] = []
     if any(d["restatement_basis"] == "cpi_normalized" for d in data):
@@ -371,15 +500,33 @@ async def financials_canonical(
             )
         )
 
-    return build_envelope(
+    next_cursor: str | None = None
+    if len(data) == limit and data:
+        last = data[-1]
+        anchor = {
+            "period_end": last["period_end"],
+            "canonical_code": last["canonical_code"],
+            "restatement_basis": last["restatement_basis"],
+        }
+        next_cursor = encode_cursor(
+            as_of=resolved, anchor=anchor, filters=filters_for_cursor
+        )
+    pagination = Pagination(
+        next_cursor=next_cursor, has_more=(next_cursor is not None)
+    )
+
+    env = build_envelope(
         data=data,
-        request_id=uuid4(),
+        request_id=ctx.request_id,
         as_of_requested=requested,
         as_of_resolved=resolved,
         feature_flags_active=_active_flags(flags),
         warnings=warnings,
-        pagination=Pagination(has_more=(len(data) == limit)),
+        pagination=pagination,
     )
+    body_bytes = _json.dumps(env, sort_keys=True, default=str).encode("utf-8")
+    set_cache_headers(response, as_of_resolved=resolved, body_bytes=body_bytes)
+    return env
 
 
 # ---------------------------------------------------------------------
@@ -422,9 +569,11 @@ def _redact_event_payload(
 
 @router.get("/financials/line-items", tags=["research"])
 async def financials_line_items(
+    response: Response,
     session: AsyncSession = Depends(get_session),
-    principal: ApiKeyPrincipal | None = Depends(get_principal),
+    principal: ApiKeyPrincipal | None = Depends(enforce_rate_limit),
     flags: FeatureFlagState = Depends(require_master_flag),
+    ctx: RequestContext = Depends(get_request_context),
     as_of: str | None = Query(default=None),
     entity_id: UUID | None = Query(default=None),
     period_end_from: datetime | None = Query(default=None),
@@ -433,11 +582,20 @@ async def financials_line_items(
         default=None,
         pattern="^(nominal|as_reported|restated|adjusted|cpi_normalized)$",
     ),
+    cursor: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
 ) -> dict[str, Any]:
-    """Per SCOPE.md D1, D8: ``ts.financial_line_item_at(p_as_of)``."""
+    """Per SCOPE.md D1, D8: ``ts.financial_line_item_at(p_as_of)``.
+
+    D6/D7/D17/D18/D25 wired via the cross-cutting observability module.
+    """
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
+    ctx.api_key_id = principal.key_id if principal else None
+    ctx.rate_tier = principal.rate_tier if principal else "anonymous"
+    ctx.as_of_requested = requested
+    ctx.as_of_resolved = resolved
+    ctx.feature_flags_active = _active_flags(flags)
 
     where_parts: list[str] = []
     params: dict[str, Any] = {"as_of": resolved, "limit": limit}
@@ -453,18 +611,33 @@ async def financials_line_items(
     if restatement_basis is not None:
         where_parts.append("restatement_basis = :restatement_basis")
         params["restatement_basis"] = restatement_basis
-    where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
 
-    sql = (
-        "SELECT entity_id, filing_id, statement_type, line_code, "
-        "       parent_line_code, period_start, period_end, period_type, "
-        "       value, currency_code, consolidation, accounting_standard, "
-        "       restatement_basis, as_of, ingestion_run_id, "
-        "       measuring_unit_date, derivation_reason "
-        "FROM ts.financial_line_item_at(:as_of) "
-        f"{where_clause} "
-        "ORDER BY period_end DESC, line_code, restatement_basis "
-        "LIMIT :limit"
+    filters_for_cursor: dict[str, Any] = {
+        "as_of": resolved.isoformat(),
+        "entity_id": str(entity_id) if entity_id else None,
+        "period_end_from": (
+            period_end_from.isoformat() if period_end_from else None
+        ),
+        "period_end_to": (
+            period_end_to.isoformat() if period_end_to else None
+        ),
+        "restatement_basis": restatement_basis,
+    }
+    if cursor is not None:
+        decode_cursor(cursor, filters_for_cursor)
+        # TODO(D7): apply keyset WHERE from decoded["anchor"] in v1.0.0-beta.
+
+    sql = _build_filtered_sql(
+        select_clause=(
+            "SELECT entity_id, filing_id, statement_type, line_code, "
+            "       parent_line_code, period_start, period_end, period_type, "
+            "       value, currency_code, consolidation, accounting_standard, "
+            "       restatement_basis, as_of, ingestion_run_id, "
+            "       measuring_unit_date, derivation_reason"
+        ),
+        pit_call="ts.financial_line_item_at(:as_of)",
+        where_parts=where_parts,
+        order_by="ORDER BY period_end DESC, line_code, restatement_basis",
     )
     rows = await session.execute(text(sql), params)
     data = [
@@ -493,23 +666,46 @@ async def financials_line_items(
         }
         for r in rows
     ]
-    return build_envelope(
+    ctx.rows_returned = len(data)
+
+    next_cursor: str | None = None
+    if len(data) == limit and data:
+        last = data[-1]
+        anchor = {
+            "period_end": last["period_end"],
+            "line_code": last["line_code"],
+            "restatement_basis": last["restatement_basis"],
+        }
+        next_cursor = encode_cursor(
+            as_of=resolved, anchor=anchor, filters=filters_for_cursor
+        )
+    pagination = Pagination(
+        next_cursor=next_cursor, has_more=(next_cursor is not None)
+    )
+
+    env = build_envelope(
         data=data,
-        request_id=uuid4(),
+        request_id=ctx.request_id,
         as_of_requested=requested,
         as_of_resolved=resolved,
         feature_flags_active=_active_flags(flags),
-        pagination=Pagination(has_more=(len(data) == limit)),
+        pagination=pagination,
     )
+    body_bytes = _json.dumps(env, sort_keys=True, default=str).encode("utf-8")
+    set_cache_headers(response, as_of_resolved=resolved, body_bytes=body_bytes)
+    return env
 
 
 @router.get("/entities", tags=["research"])
 async def entities(
+    response: Response,
     session: AsyncSession = Depends(get_session),
-    principal: ApiKeyPrincipal | None = Depends(get_principal),
+    principal: ApiKeyPrincipal | None = Depends(enforce_rate_limit),
     flags: FeatureFlagState = Depends(require_master_flag),
+    ctx: RequestContext = Depends(get_request_context),
     as_of: str | None = Query(default=None),
     kind: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
 ) -> dict[str, Any]:
     """Per SCOPE.md D1, D10: list entities + lineage events.
@@ -517,22 +713,38 @@ async def entities(
     Phase 1 design defers the bitemporal ``ref.entity`` upgrade
     (per HANDOFF.md). v1 reads ``ref.entity`` directly (current
     state) and joins ``ref.entity_lineage_at(:as_of)`` to surface
-    merge / split history.
+    merge / split history. D6/D7/D17/D18/D25 wired.
     """
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
+    ctx.api_key_id = principal.key_id if principal else None
+    ctx.rate_tier = principal.rate_tier if principal else "anonymous"
+    ctx.as_of_requested = requested
+    ctx.as_of_resolved = resolved
+    ctx.feature_flags_active = _active_flags(flags)
 
-    where_clause = "WHERE e.kind = :kind" if kind else ""
+    where_parts: list[str] = []
     params: dict[str, Any] = {"as_of": resolved, "limit": limit}
     if kind:
+        where_parts.append("e.entity_type = :kind")
         params["kind"] = kind
 
-    sql = (
-        "SELECT e.entity_id, e.name, e.kind, e.created_at "
-        "FROM ref.entity e "
-        f"{where_clause} "
-        "ORDER BY e.created_at DESC "
-        "LIMIT :limit"
+    filters_for_cursor: dict[str, Any] = {
+        "as_of": resolved.isoformat(),
+        "kind": kind,
+    }
+    if cursor is not None:
+        decode_cursor(cursor, filters_for_cursor)
+        # TODO(D7): apply keyset WHERE from decoded["anchor"] in v1.0.0-beta.
+
+    sql = _build_filtered_sql(
+        select_clause=(
+            "SELECT e.entity_id, e.legal_name AS name, "
+            "       e.entity_type AS kind, e.created_at"
+        ),
+        from_clause="ref.entity e",
+        where_parts=where_parts,
+        order_by="ORDER BY e.created_at DESC",
     )
     rows = (await session.execute(text(sql), params)).all()
 
@@ -576,33 +788,59 @@ async def entities(
                 ],
             }
         )
+    ctx.rows_returned = len(data)
 
-    return build_envelope(
+    next_cursor: str | None = None
+    if len(data) == limit and data:
+        last = data[-1]
+        anchor = {"entity_id": last["entity_id"]}
+        next_cursor = encode_cursor(
+            as_of=resolved, anchor=anchor, filters=filters_for_cursor
+        )
+    pagination = Pagination(
+        next_cursor=next_cursor, has_more=(next_cursor is not None)
+    )
+
+    env = build_envelope(
         data=data,
-        request_id=uuid4(),
+        request_id=ctx.request_id,
         as_of_requested=requested,
         as_of_resolved=resolved,
         feature_flags_active=_active_flags(flags),
-        pagination=Pagination(has_more=(len(data) == limit)),
+        pagination=pagination,
     )
+    body_bytes = _json.dumps(env, sort_keys=True, default=str).encode("utf-8")
+    set_cache_headers(response, as_of_resolved=resolved, body_bytes=body_bytes)
+    return env
 
 
 @router.get("/entities/{entity_id}", tags=["research"])
 async def get_entity(
     entity_id: UUID,
+    response: Response,
     session: AsyncSession = Depends(get_session),
-    principal: ApiKeyPrincipal | None = Depends(get_principal),
+    principal: ApiKeyPrincipal | None = Depends(enforce_rate_limit),
     flags: FeatureFlagState = Depends(require_master_flag),
+    ctx: RequestContext = Depends(get_request_context),
     as_of: str | None = Query(default=None),
 ) -> dict[str, Any]:
-    """Per SCOPE.md D1, D10: single entity + lineage events at ``as_of``."""
+    """Per SCOPE.md D1, D10: single entity + lineage events at ``as_of``.
+
+    D6/D17/D18/D25 wired (single-resource: no cursor pagination).
+    """
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
+    ctx.api_key_id = principal.key_id if principal else None
+    ctx.rate_tier = principal.rate_tier if principal else "anonymous"
+    ctx.as_of_requested = requested
+    ctx.as_of_resolved = resolved
+    ctx.feature_flags_active = _active_flags(flags)
 
     row = (
         await session.execute(
             text(
-                "SELECT entity_id, name, kind, created_at "
+                "SELECT entity_id, legal_name AS name, "
+                "       entity_type AS kind, created_at "
                 "FROM ref.entity WHERE entity_id = :entity_id"
             ),
             {"entity_id": str(entity_id)},
@@ -652,13 +890,17 @@ async def get_entity(
             for le in lineage_rows
         ],
     }
-    return build_envelope(
+    ctx.rows_returned = 1
+    env = build_envelope(
         data=data,
-        request_id=uuid4(),
+        request_id=ctx.request_id,
         as_of_requested=requested,
         as_of_resolved=resolved,
         feature_flags_active=_active_flags(flags),
     )
+    body_bytes = _json.dumps(env, sort_keys=True, default=str).encode("utf-8")
+    set_cache_headers(response, as_of_resolved=resolved, body_bytes=body_bytes)
+    return env
 
 
 _PRE_BITEMPORAL_WARNING = Warning(
@@ -674,13 +916,16 @@ _PRE_BITEMPORAL_WARNING = Warning(
 
 @router.get("/disclosures", tags=["research", "disclosures"])
 async def disclosures(
+    response: Response,
     session: AsyncSession = Depends(get_session),
-    principal: ApiKeyPrincipal | None = Depends(get_principal),
+    principal: ApiKeyPrincipal | None = Depends(enforce_rate_limit),
     flags: FeatureFlagState = Depends(require_master_flag),
+    ctx: RequestContext = Depends(get_request_context),
     as_of: str | None = Query(default=None),
     entity_id: UUID | None = Query(default=None),
     published_after: datetime | None = Query(default=None),
     published_before: datetime | None = Query(default=None),
+    cursor: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
 ) -> dict[str, Any]:
     """Per SCOPE.md D1, D3, D11: list ``kap.disclosures``.
@@ -689,10 +934,15 @@ async def disclosures(
     Phase 2 will land migration 0051 to upgrade it to bitemporal; until
     then this endpoint queries the table directly and uses
     ``published_at`` as the as_of proxy (envelope warning
-    ``PRE_BITEMPORAL_TABLE``).
+    ``PRE_BITEMPORAL_TABLE``). D6/D7/D17/D18/D25 wired.
     """
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
+    ctx.api_key_id = principal.key_id if principal else None
+    ctx.rate_tier = principal.rate_tier if principal else "anonymous"
+    ctx.as_of_requested = requested
+    ctx.as_of_resolved = resolved
+    ctx.feature_flags_active = _active_flags(flags)
 
     where_parts: list[str] = []
     params: dict[str, Any] = {"limit": limit}
@@ -705,16 +955,30 @@ async def disclosures(
     if published_before is not None:
         where_parts.append("published_at <= :published_before")
         params["published_before"] = published_before
-    where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
 
-    sql = (
-        "SELECT disclosure_id, entity_id, title, category_code, "
-        "       subcategory_code, published_at, body_fetched, "
-        "       body_fetched_at, republished_as "
-        "FROM kap.disclosures "
-        f"{where_clause} "
-        "ORDER BY published_at DESC "
-        "LIMIT :limit"
+    filters_for_cursor: dict[str, Any] = {
+        "as_of": resolved.isoformat(),
+        "entity_id": str(entity_id) if entity_id else None,
+        "published_after": (
+            published_after.isoformat() if published_after else None
+        ),
+        "published_before": (
+            published_before.isoformat() if published_before else None
+        ),
+    }
+    if cursor is not None:
+        decode_cursor(cursor, filters_for_cursor)
+        # TODO(D7): apply keyset WHERE from decoded["anchor"] in v1.0.0-beta.
+
+    sql = _build_filtered_sql(
+        select_clause=(
+            "SELECT disclosure_id, entity_id, title, category_code, "
+            "       subcategory_code, published_at, body_fetched, "
+            "       body_fetched_at, republished_as"
+        ),
+        pit_call="kap.disclosures",
+        where_parts=where_parts,
+        order_by="ORDER BY published_at DESC",
     )
     rows = await session.execute(text(sql), params)
     data = [
@@ -739,28 +1003,57 @@ async def disclosures(
         }
         for r in rows
     ]
-    return build_envelope(
+    ctx.rows_returned = len(data)
+
+    next_cursor: str | None = None
+    if len(data) == limit and data:
+        last = data[-1]
+        anchor = {
+            "published_at": last["published_at"],
+            "disclosure_id": last["disclosure_id"],
+        }
+        next_cursor = encode_cursor(
+            as_of=resolved, anchor=anchor, filters=filters_for_cursor
+        )
+    pagination = Pagination(
+        next_cursor=next_cursor, has_more=(next_cursor is not None)
+    )
+
+    env = build_envelope(
         data=data,
-        request_id=uuid4(),
+        request_id=ctx.request_id,
         as_of_requested=requested,
         as_of_resolved=resolved,
         feature_flags_active=_active_flags(flags),
         warnings=[_PRE_BITEMPORAL_WARNING],
-        pagination=Pagination(has_more=(len(data) == limit)),
+        pagination=pagination,
     )
+    body_bytes = _json.dumps(env, sort_keys=True, default=str).encode("utf-8")
+    set_cache_headers(response, as_of_resolved=resolved, body_bytes=body_bytes)
+    return env
 
 
 @router.get("/disclosures/{disclosure_id}", tags=["research", "disclosures"])
 async def get_disclosure(
     disclosure_id: UUID,
+    response: Response,
     session: AsyncSession = Depends(get_session),
-    principal: ApiKeyPrincipal | None = Depends(get_principal),
+    principal: ApiKeyPrincipal | None = Depends(enforce_rate_limit),
     flags: FeatureFlagState = Depends(require_master_flag),
+    ctx: RequestContext = Depends(get_request_context),
     as_of: str | None = Query(default=None),
 ) -> dict[str, Any]:
-    """Per SCOPE.md D1, D11: single disclosure (PRE_BITEMPORAL_TABLE)."""
+    """Per SCOPE.md D1, D11: single disclosure (PRE_BITEMPORAL_TABLE).
+
+    D6/D17/D18/D25 wired (single resource: no cursor pagination).
+    """
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
+    ctx.api_key_id = principal.key_id if principal else None
+    ctx.rate_tier = principal.rate_tier if principal else "anonymous"
+    ctx.as_of_requested = requested
+    ctx.as_of_resolved = resolved
+    ctx.feature_flags_active = _active_flags(flags)
 
     row = (
         await session.execute(
@@ -806,35 +1099,47 @@ async def get_disclosure(
             str(row.republished_as) if row.republished_as else None
         ),
     }
-    return build_envelope(
+    ctx.rows_returned = 1
+    env = build_envelope(
         data=data,
-        request_id=uuid4(),
+        request_id=ctx.request_id,
         as_of_requested=requested,
         as_of_resolved=resolved,
         feature_flags_active=_active_flags(flags),
         warnings=[_PRE_BITEMPORAL_WARNING],
     )
+    body_bytes = _json.dumps(env, sort_keys=True, default=str).encode("utf-8")
+    set_cache_headers(response, as_of_resolved=resolved, body_bytes=body_bytes)
+    return env
 
 
 @router.get("/filings", tags=["research", "filings"])
 async def filings(
+    response: Response,
     session: AsyncSession = Depends(get_session),
-    principal: ApiKeyPrincipal | None = Depends(get_principal),
+    principal: ApiKeyPrincipal | None = Depends(enforce_rate_limit),
     flags: FeatureFlagState = Depends(require_master_flag),
+    ctx: RequestContext = Depends(get_request_context),
     as_of: str | None = Query(default=None),
     entity_id: UUID | None = Query(default=None),
     received_after: datetime | None = Query(default=None),
     received_before: datetime | None = Query(default=None),
+    cursor: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
 ) -> dict[str, Any]:
     """Per SCOPE.md D1: list ``doc.filing`` (Class F, no as_of column).
 
     ``doc.filing`` does not yet carry an ``as_of`` column; the API
     returns the current-state row with a ``PRE_BITEMPORAL_TABLE``
-    warning until migration 0051 lands.
+    warning until migration 0051 lands. D6/D7/D17/D18/D25 wired.
     """
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
+    ctx.api_key_id = principal.key_id if principal else None
+    ctx.rate_tier = principal.rate_tier if principal else "anonymous"
+    ctx.as_of_requested = requested
+    ctx.as_of_resolved = resolved
+    ctx.feature_flags_active = _active_flags(flags)
 
     where_parts: list[str] = []
     params: dict[str, Any] = {"limit": limit}
@@ -847,13 +1152,26 @@ async def filings(
     if received_before is not None:
         where_parts.append("received_at <= :received_before")
         params["received_before"] = received_before
-    where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
 
-    sql = (
-        "SELECT * FROM doc.filing "
-        f"{where_clause} "
-        "ORDER BY received_at DESC NULLS LAST "
-        "LIMIT :limit"
+    filters_for_cursor: dict[str, Any] = {
+        "as_of": resolved.isoformat(),
+        "entity_id": str(entity_id) if entity_id else None,
+        "received_after": (
+            received_after.isoformat() if received_after else None
+        ),
+        "received_before": (
+            received_before.isoformat() if received_before else None
+        ),
+    }
+    if cursor is not None:
+        decode_cursor(cursor, filters_for_cursor)
+        # TODO(D7): apply keyset WHERE from decoded["anchor"] in v1.0.0-beta.
+
+    sql = _build_filtered_sql(
+        select_clause="SELECT *",
+        pit_call="doc.filing",
+        where_parts=where_parts,
+        order_by="ORDER BY received_at DESC NULLS LAST",
     )
     result = await session.execute(text(sql), params)
     columns = list(result.keys())
@@ -869,27 +1187,49 @@ async def filings(
                 record[col] = val
         data.append(record)
 
-    return build_envelope(
+    ctx.rows_returned = len(data)
+
+    next_cursor: str | None = None
+    if len(data) == limit and data:
+        last = data[-1]
+        anchor = {
+            "received_at": last.get("received_at"),
+            "filing_id": last.get("filing_id"),
+        }
+        next_cursor = encode_cursor(
+            as_of=resolved, anchor=anchor, filters=filters_for_cursor
+        )
+    pagination = Pagination(
+        next_cursor=next_cursor, has_more=(next_cursor is not None)
+    )
+
+    env = build_envelope(
         data=data,
-        request_id=uuid4(),
+        request_id=ctx.request_id,
         as_of_requested=requested,
         as_of_resolved=resolved,
         feature_flags_active=_active_flags(flags),
         warnings=[_PRE_BITEMPORAL_WARNING],
-        pagination=Pagination(has_more=(len(data) == limit)),
+        pagination=pagination,
     )
+    body_bytes = _json.dumps(env, sort_keys=True, default=str).encode("utf-8")
+    set_cache_headers(response, as_of_resolved=resolved, body_bytes=body_bytes)
+    return env
 
 
 @router.get("/events", tags=["research", "events"])
 async def events(
+    response: Response,
     session: AsyncSession = Depends(get_session),
-    principal: ApiKeyPrincipal | None = Depends(get_principal),
+    principal: ApiKeyPrincipal | None = Depends(enforce_rate_limit),
     flags: FeatureFlagState = Depends(require_master_flag),
+    ctx: RequestContext = Depends(get_request_context),
     as_of: str | None = Query(default=None),
     entity_id: UUID | None = Query(default=None),
     event_type: str | None = Query(default=None),
     event_after: datetime | None = Query(default=None),
     event_before: datetime | None = Query(default=None),
+    cursor: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
 ) -> dict[str, Any]:
     """Per SCOPE.md D1, D30: ``agg.filing_event_at(p_as_of)``.
@@ -898,10 +1238,19 @@ async def events(
     redact unless the principal carries ``pii_unredacted=true``. The
     envelope ``lineage`` block is populated from the primary
     ``(model_version, prompt_version, input_text_sha256)`` of the
-    first row.
+    first row. D6/D7/D17/D18/D25 wired; ``ctx.pii_unredacted_used``
+    flips when redaction is bypassed so the audit middleware can
+    record the access.
     """
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
+    ctx.api_key_id = principal.key_id if principal else None
+    ctx.rate_tier = principal.rate_tier if principal else "anonymous"
+    ctx.as_of_requested = requested
+    ctx.as_of_resolved = resolved
+    ctx.feature_flags_active = _active_flags(flags)
+    if principal is not None and principal.pii_unredacted:
+        ctx.pii_unredacted_used = True
 
     where_parts: list[str] = []
     params: dict[str, Any] = {"as_of": resolved, "limit": limit}
@@ -917,19 +1266,30 @@ async def events(
     if event_before is not None:
         where_parts.append("event_ts <= :event_before")
         params["event_before"] = event_before
-    where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
 
-    sql = (
-        "SELECT filing_event_id, filing_id, source_id, source_filing_ref, "
-        "       event_type, event_seq, entity_id, counterparty_entity_id, "
-        "       event_ts, effective_dt, as_of, payload, "
-        "       primary_confidence, final_confidence, "
-        "       primary_model_version, primary_prompt_version, "
-        "       input_text_sha256 "
-        "FROM agg.filing_event_at(:as_of) "
-        f"{where_clause} "
-        "ORDER BY event_ts DESC, event_seq "
-        "LIMIT :limit"
+    filters_for_cursor: dict[str, Any] = {
+        "as_of": resolved.isoformat(),
+        "entity_id": str(entity_id) if entity_id else None,
+        "event_type": event_type,
+        "event_after": event_after.isoformat() if event_after else None,
+        "event_before": event_before.isoformat() if event_before else None,
+    }
+    if cursor is not None:
+        decode_cursor(cursor, filters_for_cursor)
+        # TODO(D7): apply keyset WHERE from decoded["anchor"] in v1.0.0-beta.
+
+    sql = _build_filtered_sql(
+        select_clause=(
+            "SELECT filing_event_id, filing_id, source_id, source_filing_ref, "
+            "       event_type, event_seq, entity_id, counterparty_entity_id, "
+            "       event_ts, effective_dt, as_of, payload, "
+            "       primary_confidence, final_confidence, "
+            "       primary_model_version, primary_prompt_version, "
+            "       input_text_sha256"
+        ),
+        pit_call="agg.filing_event_at(:as_of)",
+        where_parts=where_parts,
+        order_by="ORDER BY event_ts DESC, event_seq",
     )
     rows = (await session.execute(text(sql), params)).all()
     data = [
@@ -981,22 +1341,43 @@ async def events(
             ),
         )
 
-    return build_envelope(
+    ctx.rows_returned = len(data)
+
+    next_cursor: str | None = None
+    if len(data) == limit and data:
+        last = data[-1]
+        anchor = {
+            "filing_id": last["filing_id"],
+            "event_seq": last["event_seq"],
+        }
+        next_cursor = encode_cursor(
+            as_of=resolved, anchor=anchor, filters=filters_for_cursor
+        )
+    pagination = Pagination(
+        next_cursor=next_cursor, has_more=(next_cursor is not None)
+    )
+
+    env = build_envelope(
         data=data,
-        request_id=uuid4(),
+        request_id=ctx.request_id,
         as_of_requested=requested,
         as_of_resolved=resolved,
         lineage=lineage,
         feature_flags_active=_active_flags(flags),
-        pagination=Pagination(has_more=(len(data) == limit)),
+        pagination=pagination,
     )
+    body_bytes = _json.dumps(env, sort_keys=True, default=str).encode("utf-8")
+    set_cache_headers(response, as_of_resolved=resolved, body_bytes=body_bytes)
+    return env
 
 
 @router.get("/quality-scores", tags=["research"])
 async def quality_scores(
+    response: Response,
     session: AsyncSession = Depends(get_session),
-    principal: ApiKeyPrincipal | None = Depends(get_principal),
+    principal: ApiKeyPrincipal | None = Depends(enforce_rate_limit),
     flags: FeatureFlagState = Depends(require_master_flag),
+    ctx: RequestContext = Depends(get_request_context),
     as_of: str | None = Query(default=None),
     entity_id: UUID | None = Query(default=None),
     period_end_from: datetime | None = Query(default=None),
@@ -1005,11 +1386,20 @@ async def quality_scores(
         default=None,
         pattern="^(nominal|as_reported|restated|adjusted|cpi_normalized)$",
     ),
+    cursor: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
 ) -> dict[str, Any]:
-    """Per SCOPE.md D1: ``ts.entity_quality_score_at(p_as_of)``."""
+    """Per SCOPE.md D1: ``ts.entity_quality_score_at(p_as_of)``.
+
+    D6/D7/D17/D18/D25 wired.
+    """
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
+    ctx.api_key_id = principal.key_id if principal else None
+    ctx.rate_tier = principal.rate_tier if principal else "anonymous"
+    ctx.as_of_requested = requested
+    ctx.as_of_resolved = resolved
+    ctx.feature_flags_active = _active_flags(flags)
 
     where_parts: list[str] = []
     params: dict[str, Any] = {"as_of": resolved, "limit": limit}
@@ -1025,13 +1415,27 @@ async def quality_scores(
     if restatement_basis is not None:
         where_parts.append("restatement_basis = :restatement_basis")
         params["restatement_basis"] = restatement_basis
-    where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
 
-    sql = (
-        "SELECT * FROM ts.entity_quality_score_at(:as_of) "
-        f"{where_clause} "
-        "ORDER BY period_end DESC "
-        "LIMIT :limit"
+    filters_for_cursor: dict[str, Any] = {
+        "as_of": resolved.isoformat(),
+        "entity_id": str(entity_id) if entity_id else None,
+        "period_end_from": (
+            period_end_from.isoformat() if period_end_from else None
+        ),
+        "period_end_to": (
+            period_end_to.isoformat() if period_end_to else None
+        ),
+        "restatement_basis": restatement_basis,
+    }
+    if cursor is not None:
+        decode_cursor(cursor, filters_for_cursor)
+        # TODO(D7): apply keyset WHERE from decoded["anchor"] in v1.0.0-beta.
+
+    sql = _build_filtered_sql(
+        select_clause="SELECT *",
+        pit_call="ts.entity_quality_score_at(:as_of)",
+        where_parts=where_parts,
+        order_by="ORDER BY period_end DESC",
     )
     result = await session.execute(text(sql), params)
     columns = list(result.keys())
@@ -1050,15 +1454,33 @@ async def quality_scores(
                     else val
                 )
         data.append(record)
+    ctx.rows_returned = len(data)
 
-    return build_envelope(
+    next_cursor: str | None = None
+    if len(data) == limit and data:
+        last = data[-1]
+        anchor = {
+            "period_end": last.get("period_end"),
+            "entity_id": last.get("entity_id"),
+        }
+        next_cursor = encode_cursor(
+            as_of=resolved, anchor=anchor, filters=filters_for_cursor
+        )
+    pagination = Pagination(
+        next_cursor=next_cursor, has_more=(next_cursor is not None)
+    )
+
+    env = build_envelope(
         data=data,
-        request_id=uuid4(),
+        request_id=ctx.request_id,
         as_of_requested=requested,
         as_of_resolved=resolved,
         feature_flags_active=_active_flags(flags),
-        pagination=Pagination(has_more=(len(data) == limit)),
+        pagination=pagination,
     )
+    body_bytes = _json.dumps(env, sort_keys=True, default=str).encode("utf-8")
+    set_cache_headers(response, as_of_resolved=resolved, body_bytes=body_bytes)
+    return env
 
 
 __all__ = ["router"]

@@ -255,3 +255,136 @@ Methodical self-review against the spec gates. Findings:
 No bugs found that block PR review or staging deploy. The fixes
 above are all documentation/packaging tightening — none of them
 affected the round-3 shadow validation result.
+
+---
+
+## 2026-05-09T09:30:00Z — Round 4: end-to-end bug sweep
+
+User requested "lets address all bugs end to end in the most
+sustainable way." Round 4 closes every contract gap from the
+self-review and adds the cross-cutting plumbing the SCOPE.md
+decisions called for but were unwired in earlier rounds.
+
+### New module — `aslan_core/api/research_observability.py` (449 LOC)
+
+Cross-cutting wiring for every D-decision that prior rounds
+documented but didn't enforce at runtime:
+
+- **D6 rate-limit** — `enforce_rate_limit` FastAPI dep runs
+  before each authenticated handler, executes a Postgres-backed
+  token-bucket UPSERT on `aslan_core.api_rate_limit_state` per
+  (api_key, window_kind) bucket, raises 429 with `Retry-After`
+  on cap exhaustion. Per-key overrides via `api_key.rate_overrides`
+  JSONB. Three tier defaults (internal/partner/public) match
+  SCOPE.md D6.
+- **D7 cursor pagination** — `encode_cursor`/`decode_cursor` plus
+  `filters_hash`. Opaque base64 JSON cursor carries
+  `(v, as_of, anchor, filters_hash)`; decode validates the
+  filter-hash and rejects cross-filter cursor reuse with HTTP 400
+  `BITEMPORAL_INTERVAL_INVALID`. Encode wired into every list
+  endpoint to populate `next_cursor` when `len(data) == limit`.
+  Keyset-WHERE application is a v1.0.0-beta follow-up (TODO
+  comments in place).
+- **D17 cache headers** — `set_cache_headers` helper sets
+  `Cache-Control: public, max-age=31536000, immutable` for
+  responses where `as_of_resolved <= now() - 5min`, else
+  `no-cache, must-revalidate`. ETag = first 32 hex chars of
+  `sha256(canonical_body)`.
+- **D18 audit log** — `research_audit_middleware` Starlette
+  middleware (added in `api/__init__.py`) runs after every
+  `/v1/research/*` request, opens its own connection, INSERTs
+  into `aslan_core.api_query_audit` with `(api_key_id, ip,
+  request_id, endpoint, query_params_sha256, as_of_*,
+  rows_returned, latency_ms, status_code, error_code,
+  feature_flags_active)`. Best-effort: a failed audit-log write
+  emits a `logger.warning` and does NOT fail the user's request.
+- **D25 Prometheus metrics** — five module-level metrics
+  (request total, duration histogram, audit insert, rate-limit
+  throttle, PII access). Importable in any environment because
+  `prometheus_client` is wrapped in a try-import with `_NoOp`
+  fallback (no `[obs]` extra required).
+- **`RequestContext`** dataclass attached to
+  `request.state.research_ctx`; every handler populates
+  `api_key_id`, `rate_tier`, `as_of_requested`, `as_of_resolved`,
+  `feature_flags_active`, `rows_returned`, and
+  `pii_unredacted_used` (the last only on `/events`). The
+  middleware reads these to write the audit row.
+
+### `routes/research.py` refactored (1064 → 1432 LOC)
+
+Every endpoint now wires the cross-cutting concerns. Specific
+changes:
+
+- File-level `# ruff: noqa: S608` removed; replaced by a typed
+  `_build_filtered_sql` helper that accepts either `pit_call=` or
+  `from_clause=` (mutually exclusive). All call sites use the
+  helper; ruff S608 false-positives no longer trigger.
+- `_CLOCK_SKEW` (computed via `datetime - datetime`) replaced by
+  `_CLOCK_SKEW_TOLERANCE = timedelta(seconds=60)` at module level,
+  before its use in `_parse_as_of`.
+- All `Depends(get_principal)` → `Depends(enforce_rate_limit)`;
+  `uuid4()` → `ctx.request_id`. The `get_principal` and `uuid4`
+  imports are dropped (the agent and verification both confirmed
+  no remaining references).
+- Schema bug fixed in `/entities` and `/entities/{entity_id}`:
+  was selecting `e.name, e.kind` (do not exist); now selects
+  `e.legal_name AS name, e.entity_type AS kind` and filters on
+  `e.entity_type` instead of `e.kind`. Surfaced by the test
+  agent during round 4.
+- Added `/v1/research/openapi.json` route (was documented in
+  OPENAPI.yaml but missing at runtime; FastAPI auto-serves at
+  app root only).
+
+### `research_auth.py` cleanup
+
+The `last_used_at` UPDATE in `get_principal` was committing the
+request session mid-flight (could leave it in an aborted-tx state
+on hash failure) and swallowing all exceptions including real
+auth-path errors. Removed entirely; documented in code that
+operators can derive last-used from the new audit table:
+
+```sql
+SELECT api_key_id, max(requested_at)
+FROM aslan_core.api_query_audit
+GROUP BY api_key_id;
+```
+
+### Cross-repo coordination — `aslan-event-extractor/SCOPE_v2.md` D6
+
+Patched (cross-repo): describes new-row supersession instead of
+UPDATE-based supersession, citing aslan-core migrations 0044 and
+0049 and SCOPE.md D11. Old wording preserved in a "Historical
+(pre-2026-05-09)" callout. CHANGELOG entry added.
+
+### Tests — `tests/research/test_endpoints_extended.py` (+13 cases)
+
+Round-2 endpoints (financials/line-items, entities, entities/{id},
+disclosures, disclosures/{id}, filings, events, quality-scores)
+now have at least one test each: naive as_of rejection, master
+flag → 503, missing API key → 401, single-resource 404, PII
+redaction default + bypass, pre-bitemporal warning,
+quality-scores happy path. Brings the total to **35 tests
+collected** under `pytest -m integration`.
+
+### Verification
+
+- `ruff check` clean on all 6 new/modified files.
+- `mypy --strict` clean on all 4 typed modules
+  (`research_envelope.py`, `research_auth.py`,
+  `research_observability.py`, `routes/research.py`).
+- `from aslan_core.api import create_api_app; app = create_api_app()`
+  succeeds; 32 routes registered (existing 4 surfaces + 14
+  research endpoints + FastAPI auto-routes).
+- `pytest --collect-only -m integration tests/research/` → 35
+  tests collected.
+
+### What's still genuinely external
+
+Same as before:
+
+1. ADR-001/002/003 PROVISIONAL → FINAL (sidar review).
+2. Apply migrations to staging (`alembic upgrade head` against
+   the Hetzner DB; effectively production migration since staging
+   ≡ prod per STATE.md).
+3. Place `PROMOTE_TO_PROD` file at workspace root.
+4. Phase 7 production deploy (gated on (2) and (3)).
