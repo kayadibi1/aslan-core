@@ -118,3 +118,12 @@ async def test_bloomberg_comparison_run_table_exists(engine: AsyncEngine) -> Non
 
 async def test_bloomberg_comparison_cell_table_exists(engine: AsyncEngine) -> None:
     assert await _table_exists(engine, "audit", "bloomberg_comparison_cell")
+
+
+async def test_regression_flag_table_exists(engine: AsyncEngine) -> None:
+    assert await _table_exists(engine, "audit", "regression_flag")
+
+
+async def test_scorecard_snapshot_table_exists(engine: AsyncEngine) -> None:
+    """Migration 0062 — weekly scorecard rows."""
+    assert await _table_exists(engine, "audit", "scorecard_snapshot")

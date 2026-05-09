@@ -207,6 +207,79 @@ async def test_email_sink_malformed_url_raises() -> None:
         await sink.deliver(payload={}, severity="info", rule_name="x")
 
 
+@pytest.mark.asyncio
+async def test_email_sink_rich_body_uses_payload_html() -> None:
+    """When payload carries body_html (M6 weekly scorecard cron), the
+    sink uses it verbatim and promotes the message to multipart/alternative.
+
+    payload['subject'] overrides the generic
+    '[ASLAN AUDIT] [<sev>] <rule>' subject; payload['body_text']
+    becomes the text/plain alternative body.
+    """
+    captured: dict[str, Any] = {}
+
+    def fake_sender(**kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    settings = _settings(
+        ASLAN_AUDIT_SMTP_URL=SecretStr("smtp://relay.example.com"),
+        ASLAN_AUDIT_EMAIL_TO="sidar@aslan.example",
+    )
+    sink = EmailSink(settings=settings, sender=fake_sender)
+    rich_subject = "[ASLAN AUDIT] Weekly scorecard — week of 2026-04-27"
+    rich_html = "<html><body><h2>SENTINEL_HTML</h2></body></html>"
+    rich_text = "SENTINEL_TEXT — plaintext fallback"
+    ok = await sink.deliver(
+        payload={
+            "subject": rich_subject,
+            "body_html": rich_html,
+            "body_text": rich_text,
+            "rows_written": 10,
+        },
+        severity="info",
+        rule_name="weekly_scorecard",
+    )
+    assert ok is True
+    msg: EmailMessage = captured["msg"]
+    assert msg["Subject"] == rich_subject
+    # Multipart with text/plain primary + text/html alternative.
+    assert msg.is_multipart()
+    parts = list(msg.walk())
+    plain_parts = [p for p in parts if p.get_content_type() == "text/plain"]
+    html_parts = [p for p in parts if p.get_content_type() == "text/html"]
+    assert plain_parts and "SENTINEL_TEXT" in plain_parts[0].get_content()
+    assert html_parts and "SENTINEL_HTML" in html_parts[0].get_content()
+
+
+@pytest.mark.asyncio
+async def test_email_sink_falls_back_to_generic_when_no_body_html() -> None:
+    """The legacy generic JSON-dump path still fires when payload has
+    no body_html (covers all M3-era rules: recency_sla_breach,
+    coverage_below_target, ...)."""
+    captured: dict[str, Any] = {}
+
+    def fake_sender(**kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    settings = _settings(
+        ASLAN_AUDIT_SMTP_URL=SecretStr("smtp://relay.example.com"),
+        ASLAN_AUDIT_EMAIL_TO="ops@aslan.example",
+    )
+    sink = EmailSink(settings=settings, sender=fake_sender)
+    await sink.deliver(
+        payload={"source": "kap", "lag_seconds": 600},
+        severity="error",
+        rule_name="recency_sla_breach",
+    )
+    msg: EmailMessage = captured["msg"]
+    assert msg["Subject"] == "[ASLAN AUDIT] [error] recency_sla_breach"
+    # Single-part text/plain body containing the JSON dump.
+    assert not msg.is_multipart()
+    body = msg.get_content()
+    assert "lag_seconds" in body
+    assert "Aslan audit alert" in body
+
+
 # ── Slack ──────────────────────────────────────────────────────────
 
 

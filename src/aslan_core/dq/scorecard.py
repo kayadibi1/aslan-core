@@ -240,15 +240,20 @@ async def _metric_kap_recency(
     )
 
 
+# Joins audit.evds_release_calendar to ts.observation through
+# ts.series_catalog. series_code lives on series_catalog; observation
+# carries series_id (FK) and timestamp column ``ts``. The LEFT JOIN
+# keeps the expected count accurate when no observation lands.
 _SELECT_EVDS_FRESHNESS = text(
     "SELECT "
     "  count(*)::int AS expected, "
-    "  count(o.series_code)::int AS observed "
+    "  count(o.series_id)::int AS observed "
     "FROM audit.evds_release_calendar c "
+    "LEFT JOIN ts.series_catalog sc ON sc.series_code = c.series_code "
     "LEFT JOIN ts.observation o "
-    "  ON o.series_code = c.series_code "
-    "  AND o.observed_at >= c.expected_at "
-    "  AND o.observed_at < c.expected_at + (c.grace_seconds || ' seconds')::interval "
+    "  ON o.series_id = sc.series_id "
+    "  AND o.ts >= c.expected_at "
+    "  AND o.ts < c.expected_at + (c.grace_seconds || ' seconds')::interval "
     "WHERE c.expected_at >= :start_at AND c.expected_at < :end_at"
 )
 
@@ -266,9 +271,11 @@ async def _metric_evds_freshness(
             status="warn",
             notes="audit.evds_release_calendar not present",
         )
-    if not await _table_present(session, "ts", "observation"):
-        # No observation table on this branch — surface as a warn so
-        # the email digest carries the gap.
+    if not await _table_present(session, "ts", "observation") or not await _table_present(
+        session, "ts", "series_catalog"
+    ):
+        # No observation/catalog tables on this branch — surface as a
+        # warn so the email digest carries the gap.
         row = (
             await session.execute(
                 text(
@@ -285,7 +292,7 @@ async def _metric_evds_freshness(
             target=">= 95%",
             actual="—",
             status="warn",
-            notes=f"ts.observation not present; expected {expected} releases",
+            notes=f"ts.observation/series_catalog not present; expected {expected} releases",
         )
     row = (
         await session.execute(
