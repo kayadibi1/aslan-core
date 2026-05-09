@@ -96,6 +96,7 @@ _NAV_ITEMS: tuple[tuple[str, str], ...] = (
     ("Timeseries", "/timeseries"),
     ("Audit", "/audit"),
     ("Redactions", "/redactions"),
+    ("Review", "/review"),
 )
 
 
