@@ -11,9 +11,22 @@ sends one message addressed to all recipients (BCC semantics — each
 gets a separate envelope copy via SMTP RCPT TO so recipient lists
 aren't disclosed).
 
-The body is the JSON payload pretty-printed plus a single-line human
-summary derived from ``rule_name`` + ``severity``. Subject is
-``[ASLAN AUDIT] [<severity>] <rule_name>``.
+Two body modes:
+
+  * **Generic** (default) — when ``payload`` does NOT carry a
+    ``body_html`` key. The body is the JSON payload pretty-printed
+    plus a single-line human summary derived from ``rule_name`` +
+    ``severity``. Subject is ``[ASLAN AUDIT] [<severity>] <rule_name>``.
+
+  * **Rich** — when ``payload`` carries a ``body_html`` (and optionally
+    a ``subject``) key. The sink uses those verbatim instead of the
+    generic JSON dump. This is how the M6 weekly scorecard cron's
+    digest reaches sidar: the cron renders the HTML body itself, stuffs
+    it into ``audit.event(event_type='scorecard_generated').payload.body_html``,
+    and the dispatcher copies the payload into the
+    ``audit.alert_dispatch.payload`` row, which the email sink reads
+    here. The ``body_text`` key, if present, becomes the ``text/plain``
+    fallback for non-HTML mail clients.
 
 stdlib ``smtplib`` is synchronous; the deliver() coroutine wraps the
 blocking send via ``asyncio.to_thread`` so the dispatcher loop stays
@@ -118,20 +131,56 @@ class EmailSink:
         )
 
         from_addr = username or f"audit@{host}"
-        subject = f"[ASLAN AUDIT] [{severity}] {rule_name}"
-        body = (
-            f"Aslan audit alert\n"
-            f"=================\n\n"
-            f"Rule:     {rule_name}\n"
-            f"Severity: {severity}\n\n"
-            f"Payload (JSON):\n"
-            f"{json.dumps(payload, indent=2, sort_keys=True, default=str)}\n"
-        )
+        # Detect the rich-body mode used by the M6 weekly scorecard
+        # cron. Payload contract: when ``payload['body_html']`` is a
+        # non-empty string, the sink takes the body straight from the
+        # payload (rendered server-side by the cron) and uses
+        # ``payload.get('subject')`` (falling back to the generic
+        # subject) plus ``payload.get('body_text')`` (falling back to
+        # an auto-generated stripped-tags placeholder) for the
+        # text/plain alternative.
+        rich_body_html = payload.get("body_html")
+        rich_subject = payload.get("subject")
+        rich_body_text = payload.get("body_text")
+        is_rich = isinstance(rich_body_html, str) and rich_body_html != ""
+        if is_rich:
+            subject = (
+                rich_subject
+                if isinstance(rich_subject, str) and rich_subject
+                else f"[ASLAN AUDIT] [{severity}] {rule_name}"
+            )
+        else:
+            subject = f"[ASLAN AUDIT] [{severity}] {rule_name}"
         msg = EmailMessage()
         msg["Subject"] = subject
         msg["From"] = from_addr
         msg["To"] = ", ".join(recipients)
-        msg.set_content(body)
+        if is_rich:
+            assert isinstance(rich_body_html, str)  # narrowed above
+            text_body = (
+                rich_body_text
+                if isinstance(rich_body_text, str) and rich_body_text
+                else (
+                    f"Aslan audit alert ({rule_name}, severity={severity}).\n"
+                    f"This message also contains an HTML body — view in a "
+                    f"browser-capable mail client for the full scorecard.\n"
+                )
+            )
+            # text/plain primary + text/html alternative (per
+            # EmailMessage convention; the latter call promotes the
+            # message to multipart/alternative).
+            msg.set_content(text_body)
+            msg.add_alternative(rich_body_html, subtype="html")
+        else:
+            body = (
+                f"Aslan audit alert\n"
+                f"=================\n\n"
+                f"Rule:     {rule_name}\n"
+                f"Severity: {severity}\n\n"
+                f"Payload (JSON):\n"
+                f"{json.dumps(payload, indent=2, sort_keys=True, default=str)}\n"
+            )
+            msg.set_content(body)
 
         if self._sender is not None:
             # Test path: invoke the injected callable directly.
