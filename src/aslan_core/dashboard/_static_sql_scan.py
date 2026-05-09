@@ -322,6 +322,9 @@ _FULL_TABLE_GRANTS: frozenset[str] = frozenset(
         "audit.evds_release_calendar",
         "audit.coverage_snapshot",
         "audit.validation_failure",
+        # dq M-AU-05 (migration 0058): spot-check workflow tables.
+        "audit.spot_check_sample",
+        "audit.spot_check_result",
     }
 )
 

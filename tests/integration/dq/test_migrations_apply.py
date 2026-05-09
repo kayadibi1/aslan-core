@@ -86,3 +86,27 @@ async def test_coverage_snapshot_table_exists(engine: AsyncEngine) -> None:
 
 async def test_validation_failure_table_exists(engine: AsyncEngine) -> None:
     assert await _table_exists(engine, "audit", "validation_failure")
+
+
+async def test_spot_check_sample_table_exists(engine: AsyncEngine) -> None:
+    assert await _table_exists(engine, "audit", "spot_check_sample")
+
+
+async def test_spot_check_result_table_exists(engine: AsyncEngine) -> None:
+    assert await _table_exists(engine, "audit", "spot_check_result")
+
+
+async def test_spot_check_pending_index_exists(engine: AsyncEngine) -> None:
+    """Partial index used by the pending-queue lookup; spec §5.5."""
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT indexname FROM pg_indexes "
+                    "WHERE schemaname = 'audit' "
+                    "  AND tablename = 'spot_check_sample' "
+                    "  AND indexname = 'scs_pending'"
+                )
+            )
+        ).scalar_one_or_none()
+    assert row == "scs_pending"
