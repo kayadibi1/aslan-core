@@ -152,6 +152,13 @@ def _register_pages() -> None:
     from aslan_core.dashboard.pages import audit as _audit  # noqa: F401
     from aslan_core.dashboard.pages import deadletter as _deadletter  # noqa: F401
     from aslan_core.dashboard.pages import documents as _documents  # noqa: F401
+    from aslan_core.dashboard.pages import dq_bloomberg as _dq_bloomberg  # noqa: F401
+    from aslan_core.dashboard.pages import dq_coverage as _dq_coverage  # noqa: F401
+    from aslan_core.dashboard.pages import dq_overview as _dq_overview  # noqa: F401
+    from aslan_core.dashboard.pages import dq_recency as _dq_recency  # noqa: F401
+    from aslan_core.dashboard.pages import dq_scorecard as _dq_scorecard  # noqa: F401
+    from aslan_core.dashboard.pages import dq_spot_check as _dq_spot_check  # noqa: F401
+    from aslan_core.dashboard.pages import dq_validation as _dq_validation  # noqa: F401
     from aslan_core.dashboard.pages import errors as _errors  # noqa: F401
     from aslan_core.dashboard.pages import ingestion as _ingestion  # noqa: F401
     from aslan_core.dashboard.pages import outbox as _outbox  # noqa: F401
