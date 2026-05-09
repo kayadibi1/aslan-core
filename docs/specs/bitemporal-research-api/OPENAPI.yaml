@@ -1,0 +1,2705 @@
+openapi: 3.1.0
+info:
+  title: Aslan Terminal Research API
+  version: 1.0.0-alpha
+  description: |
+    Bitemporal point-in-time research API. Moat 2 of the Aslan Terminal
+    Bloomberg-bar platform.
+
+    Every endpoint accepts an optional `as_of` (ISO8601 with TZ) parameter
+    and returns the platform's view of a fact **as it was known at that
+    wall-clock instant**. Later revisions of the fact do not retroactively
+    alter the answer for past `as_of` values.
+
+    See:
+    - SCOPE.md (binding decisions D1-D30)
+    - ADR-003 (the seven moats; Moat 2 is bitemporal correctness)
+    - workspace CLAUDE.md (mission and quality bar)
+
+    The service is read-only in v1. Write paths live in `aslan-event-extractor`
+    (agg.*) and `crawl` (kap.*). All Turkish content is preserved verbatim
+    per ADR-002 (no auto-translation).
+  termsOfService: https://docs.aslanterminal.com/terms
+  contact:
+    name: Aslan Terminal API team
+    email: api@aslanterminal.com
+    url: https://docs.aslanterminal.com
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+  x-aslan-replayability: true
+  x-aslan-moat: 2
+  x-aslan-feature-flags:
+    - name: BITEMPORAL_API_ENABLED
+      role: master
+      default_staging: false
+      default_prod: false
+      decision: D27
+    - name: BITEMPORAL_API_INTERVAL_QUERIES
+      default_staging: true
+      default_prod: true
+      decision: D2
+    - name: BITEMPORAL_API_ALLOW_NULL_AS_OF
+      default_staging: true
+      default_prod: true
+      decision: D3
+    - name: BITEMPORAL_API_AUTH_ADDITIONAL_SCHEMES
+      default_staging: empty
+      default_prod: empty
+      decision: D5
+    - name: BITEMPORAL_API_RATE_LIMIT_ENFORCED
+      default_staging: true
+      default_prod: true
+      decision: D6
+    - name: BITEMPORAL_API_CURSOR_VERSION
+      default_staging: 1
+      default_prod: 1
+      decision: D7
+    - name: BITEMPORAL_API_TAS29_RESTATEMENT_CHAIN
+      default_staging: false
+      default_prod: false
+      decision: D8
+    - name: BITEMPORAL_API_ENTITY_MERGE_LINEAGE
+      default_staging: false
+      default_prod: false
+      decision: D10
+    - name: BITEMPORAL_API_KAP_APPEND_ONLY_TRIGGER
+      default_staging: false
+      default_prod: false
+      decision: D11
+    - name: BITEMPORAL_API_ENVELOPE_VERSION
+      default_staging: 1
+      default_prod: 1
+      decision: D15
+    - name: BITEMPORAL_API_ERROR_FORMAT_VERSION
+      default_staging: 1
+      default_prod: 1
+      decision: D16
+    - name: BITEMPORAL_API_AUDIT_LOG_ENABLED
+      default_staging: true
+      default_prod: true
+      decision: D18
+    - name: BITEMPORAL_API_COST_LIMITS_ENFORCED
+      default_staging: true
+      default_prod: true
+      decision: D19
+    - name: BITEMPORAL_API_V2_PREVIEW
+      default_staging: false
+      default_prod: false
+      decision: D23
+    - name: BITEMPORAL_TABLE_REGISTRY_CI_ENFORCED
+      default_staging: true
+      default_prod: true
+      decision: D28
+    - name: BITEMPORAL_API_PII_EXPOSURE
+      default_staging: false
+      default_prod: false
+      decision: D30
+
+servers:
+  - url: https://api.staging.aslanterminal.com/v1/research
+    description: Staging environment (Hetzner DE, EU-region)
+    x-aslan-env: staging
+  - url: https://api.aslanterminal.com/v1/research
+    description: Production environment (Hetzner DE, EU-region)
+    x-aslan-env: production
+
+security:
+  - ApiKeyAuth: []
+
+tags:
+  - name: research
+    description: |
+      Bitemporal research surfaces over `ts.*`, `ref.*`, `doc.*`, `kap.*`,
+      and `agg.*` data. Every endpoint accepts `as_of` for point-in-time
+      queries and `as_of_range` for version-chain queries.
+  - name: identifiers
+    description: Cross-source entity resolution via `ref.identifier` (Moat 6).
+  - name: disclosures
+    description: |
+      KAP disclosures with pre-bitemporal handling (D3). 462k rows total,
+      ~89.7k carry sensible `as_of`; the remainder are NULL-as_of and
+      surface only with `include_pre_bitemporal=true`.
+  - name: filings
+    description: |
+      `doc.filing` PIT exposure. Empty until `aslan-event-extractor` M0
+      backfill (`extract-migrate-doc-filing`) runs.
+  - name: events
+    description: |
+      `agg.filing_event` PIT exposure. Empty until `aslan-event-extractor`
+      M1 populates.
+  - name: verification
+    description: |
+      Public verification of platform invariants. Moat 2 canary status is
+      published here unauthenticated for customers, journalists, and
+      regulators per ADR-003.
+  - name: ops
+    description: Health, version, and operational meta-endpoints.
+
+paths:
+  /observations:
+    get:
+      tags: [research]
+      summary: List time-series observations point-in-time
+      operationId: listObservations
+      description: |
+        Returns rows from `ts.observation` as known at `as_of`. Backed by
+        the SQL function `ts.observation_at(p_as_of timestamptz)`.
+
+        - Default `as_of` is `NOW()`.
+        - `as_of_range` returns the full version chain in [T1, T2).
+        - `series_id` filter is mandatory for sub-100ms p99 (D19, P2).
+      parameters:
+        - $ref: '#/components/parameters/AsOf'
+        - $ref: '#/components/parameters/AsOfRange'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/DisplayTz'
+        - name: series_id
+          in: query
+          required: true
+          description: Catalog series identifier (e.g. `BIST.GARAN.close`).
+          schema:
+            type: string
+            example: BIST.GARAN.close
+        - name: ts_from
+          in: query
+          required: false
+          description: Lower bound (inclusive) on observation timestamp.
+          schema:
+            type: string
+            format: date-time
+            example: 2024-01-01T00:00:00Z
+        - name: ts_to
+          in: query
+          required: false
+          description: Upper bound (exclusive) on observation timestamp.
+          schema:
+            type: string
+            format: date-time
+            example: 2025-01-01T00:00:00Z
+      responses:
+        '200':
+          description: Observations envelope.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            X-RateLimit-Tier:
+              $ref: '#/components/headers/XRateLimitTier'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/XRateLimitRemaining'
+            X-RateLimit-Reset:
+              $ref: '#/components/headers/XRateLimitReset'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Deprecation:
+              $ref: '#/components/headers/Deprecation'
+            Sunset:
+              $ref: '#/components/headers/Sunset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObservationListEnvelope'
+              examples:
+                garan_close_2024_06:
+                  summary: GARAN close prices in June 2024
+                  value:
+                    data:
+                      - series_id: BIST.GARAN.close
+                        ts: 2024-06-03T15:30:00Z
+                        value: 86.45
+                        unit: TRY
+                        as_of: 2024-06-03T15:30:11Z
+                        local_time: 2024-06-03T18:30:11+03:00
+                      - series_id: BIST.GARAN.close
+                        ts: 2024-06-04T15:30:00Z
+                        value: 87.10
+                        unit: TRY
+                        as_of: 2024-06-04T15:30:09Z
+                        local_time: 2024-06-04T18:30:09+03:00
+                    metadata:
+                      as_of_requested: 2024-06-30T23:59:59Z
+                      as_of_resolved: 2024-06-30T23:59:59Z
+                      as_of_range: null
+                      lineage:
+                        source_filing_id: null
+                        raw_bytes_sha256: null
+                        extraction_code_version: null
+                        prompt_version: null
+                        model_identity: null
+                        extraction_seed: null
+                      pagination:
+                        next_cursor: eyJ2IjoxLCJhc19vZiI6IjIwMjQtMDYtMzBUMjM6NTk6NTlaIiwiYW5jaG9yIjp7InNlcmllc19pZCI6IkJJU1QuR0FSQU4uY2xvc2UiLCJ0cyI6IjIwMjQtMDYtMDRUMTU6MzA6MDBaIn0sImRpcmVjdGlvbiI6ImFzYyIsImZpbHRlcnNfaGFzaCI6ImE3ZjMyZDg4In0=
+                        prev_cursor: null
+                        has_more: true
+                        total_count_estimate: 21
+                      feature_flags_active:
+                        - BITEMPORAL_API_ENABLED
+                        - BITEMPORAL_API_RATE_LIMIT_ENFORCED
+                        - BITEMPORAL_API_AUDIT_LOG_ENABLED
+                      warnings: []
+                      request_id: 7f3a9b2c-1d4e-4f5a-9b2c-1d4e4f5a9b2c
+                      served_by: bitemporal-api/abc1234
+        '400':
+          $ref: '#/components/responses/BitemporalAsOfNaive'
+        '401':
+          $ref: '#/components/responses/AuthInvalid'
+        '403':
+          $ref: '#/components/responses/AuthForbidden'
+        '404':
+          $ref: '#/components/responses/PreBitemporalRegion'
+        '409':
+          $ref: '#/components/responses/IdentifierAmbiguous'
+        '413':
+          $ref: '#/components/responses/QueryTooLarge'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/FeatureDisabled'
+
+  /financials/line-items:
+    get:
+      tags: [research]
+      summary: List financial line items point-in-time
+      operationId: listFinancialLineItems
+      description: |
+        Returns rows from `ts.financial_line_item` as known at `as_of`. Backed
+        by `ts.financial_line_item_at(p_as_of)`. UNIQUE on
+        `(entity_id, filing_id, statement_type, line_code, consolidation,
+        period_end, as_of)`.
+      parameters:
+        - $ref: '#/components/parameters/AsOf'
+        - $ref: '#/components/parameters/AsOfRange'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/DisplayTz'
+        - $ref: '#/components/parameters/EntityId'
+        - name: filing_id
+          in: query
+          schema:
+            type: string
+            example: KAP-2024-1234567
+        - name: statement_type
+          in: query
+          schema:
+            type: string
+            enum: [balance_sheet, income_statement, cash_flow, equity_changes]
+            example: income_statement
+        - name: line_code
+          in: query
+          schema:
+            type: string
+            example: revenue_total
+        - name: consolidation
+          in: query
+          schema:
+            type: string
+            enum: [solo, consolidated]
+            example: consolidated
+        - name: period_end
+          in: query
+          schema:
+            type: string
+            format: date
+            example: 2024-12-31
+      responses:
+        '200':
+          description: Financial line items envelope.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            X-RateLimit-Tier:
+              $ref: '#/components/headers/XRateLimitTier'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/XRateLimitRemaining'
+            X-RateLimit-Reset:
+              $ref: '#/components/headers/XRateLimitReset'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FinancialLineItemListEnvelope'
+              examples:
+                garan_revenue_2024:
+                  summary: GARAN revenue at FY2024
+                  value:
+                    data:
+                      - entity_id: ASL-ENT-00000001
+                        filing_id: KAP-2024-1234567
+                        statement_type: income_statement
+                        line_code: revenue_total
+                        consolidation: consolidated
+                        period_end: 2024-12-31
+                        value: 142500000000
+                        unit: TRY
+                        as_of: 2025-03-12T07:42:18Z
+                        currency: TRY
+                    metadata:
+                      as_of_requested: 2025-04-01T00:00:00Z
+                      as_of_resolved: 2025-04-01T00:00:00Z
+                      as_of_range: null
+                      lineage:
+                        source_filing_id: KAP-2024-1234567
+                        raw_bytes_sha256: 4f1a8c3d9e5b7a2f8c1d3e6b9a4c7f8e1d2a5b8c9e3f6a1d4b7c8e9f2a3b4c5d
+                        extraction_code_version: 0.7.3
+                        prompt_version: financials_v3
+                        model_identity: claude-3-7-sonnet-20250219
+                        extraction_seed: 42
+                      pagination:
+                        next_cursor: null
+                        prev_cursor: null
+                        has_more: false
+                        total_count_estimate: 1
+                      feature_flags_active:
+                        - BITEMPORAL_API_ENABLED
+                        - BITEMPORAL_API_TAS29_RESTATEMENT_CHAIN
+                      warnings: []
+                      request_id: 1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d
+                      served_by: bitemporal-api/abc1234
+        '400':
+          $ref: '#/components/responses/BitemporalAsOfNaive'
+        '401':
+          $ref: '#/components/responses/AuthInvalid'
+        '403':
+          $ref: '#/components/responses/AuthForbidden'
+        '413':
+          $ref: '#/components/responses/QueryTooLarge'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/FeatureDisabled'
+
+  /financials/canonical:
+    get:
+      tags: [research]
+      summary: List canonical (TAS 29-aware) financials point-in-time
+      operationId: listCanonicalFinancials
+      description: |
+        Returns rows from `ts.canonical_financial` as known at `as_of`. Backed
+        by `ts.canonical_financial_at(p_as_of)`.
+
+        Per D8: a TAS 29 inflation-restated value is recorded as a **new
+        row** with later `as_of` and `restatement_kind='tas29'`. PIT queries
+        at the older `as_of` return the nominal value; PIT queries at the
+        newer `as_of` return the restated value. Both rows persist forever.
+
+        The `restatement_chain` mat-view walks the chain per
+        `(entity_id, period_end, line_item_id)`.
+      parameters:
+        - $ref: '#/components/parameters/AsOf'
+        - $ref: '#/components/parameters/AsOfRange'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/DisplayTz'
+        - $ref: '#/components/parameters/EntityId'
+        - name: period_end
+          in: query
+          schema:
+            type: string
+            format: date
+            example: 2024-12-31
+        - name: line_item_id
+          in: query
+          schema:
+            type: string
+            example: revenue_total
+        - name: restatement_kind
+          in: query
+          description: Filter by restatement provenance.
+          schema:
+            type: string
+            enum: [nominal, tas29, ifrs_restate, errata]
+            example: tas29
+      responses:
+        '200':
+          description: Canonical financials envelope.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            X-RateLimit-Tier:
+              $ref: '#/components/headers/XRateLimitTier'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/XRateLimitRemaining'
+            X-RateLimit-Reset:
+              $ref: '#/components/headers/XRateLimitReset'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CanonicalFinancialListEnvelope'
+              examples:
+                tas29_restatement_chain:
+                  summary: TAS 29 restatement chain for GARAN revenue FY2023
+                  value:
+                    data:
+                      - entity_id: ASL-ENT-00000001
+                        period_end: 2023-12-31
+                        line_item_id: revenue_total
+                        value: 78400000000
+                        unit: TRY
+                        restatement_kind: nominal
+                        as_of: 2024-03-15T08:12:33Z
+                      - entity_id: ASL-ENT-00000001
+                        period_end: 2023-12-31
+                        line_item_id: revenue_total
+                        value: 142800000000
+                        unit: TRY
+                        restatement_kind: tas29
+                        as_of: 2025-02-10T11:04:02Z
+                    metadata:
+                      as_of_requested: null
+                      as_of_resolved: 2026-05-09T00:00:00Z
+                      as_of_range:
+                        - 2024-01-01T00:00:00Z
+                        - 2026-01-01T00:00:00Z
+                      lineage:
+                        source_filing_id: KAP-2024-1234567
+                        raw_bytes_sha256: 4f1a8c3d9e5b7a2f8c1d3e6b9a4c7f8e1d2a5b8c9e3f6a1d4b7c8e9f2a3b4c5d
+                        extraction_code_version: 0.7.3
+                        prompt_version: canonical_v2
+                        model_identity: claude-3-7-sonnet-20250219
+                        extraction_seed: 42
+                      pagination:
+                        next_cursor: null
+                        prev_cursor: null
+                        has_more: false
+                        total_count_estimate: 2
+                      feature_flags_active:
+                        - BITEMPORAL_API_ENABLED
+                        - BITEMPORAL_API_TAS29_RESTATEMENT_CHAIN
+                        - BITEMPORAL_API_INTERVAL_QUERIES
+                      warnings: []
+                      request_id: 9b8a7c6d-5e4f-3a2b-1c0d-9e8f7a6b5c4d
+                      served_by: bitemporal-api/abc1234
+        '400':
+          $ref: '#/components/responses/BitemporalAsOfNaive'
+        '401':
+          $ref: '#/components/responses/AuthInvalid'
+        '403':
+          $ref: '#/components/responses/AuthForbidden'
+        '413':
+          $ref: '#/components/responses/QueryTooLarge'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/FeatureDisabled'
+
+  /entities:
+    get:
+      tags: [research]
+      summary: List entities point-in-time
+      operationId: listEntities
+      description: |
+        Returns rows from `ref.entity` as known at `as_of`. Backed by
+        `ref.entity_at(p_as_of)`. Entities carry `merged_from_entity_ids`
+        per D10; PIT queries at `as_of < merge_time` see pre-merge
+        entities, at `as_of >= merge_time` see only the post-merge entity.
+      parameters:
+        - $ref: '#/components/parameters/AsOf'
+        - $ref: '#/components/parameters/AsOfRange'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/DisplayTz'
+        - name: name
+          in: query
+          description: Substring match against canonical entity name (case-insensitive).
+          schema:
+            type: string
+            example: Garanti
+        - name: country
+          in: query
+          schema:
+            type: string
+            example: TR
+        - name: kind
+          in: query
+          schema:
+            type: string
+            enum: [issuer, fund, sovereign, person, government, other]
+            example: issuer
+      responses:
+        '200':
+          description: Entities envelope.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            X-RateLimit-Tier:
+              $ref: '#/components/headers/XRateLimitTier'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/XRateLimitRemaining'
+            X-RateLimit-Reset:
+              $ref: '#/components/headers/XRateLimitReset'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EntityListEnvelope'
+              examples:
+                garanti:
+                  summary: Garanti BBVA Bank as of today
+                  value:
+                    data:
+                      - entity_id: ASL-ENT-00000001
+                        canonical_name: Türkiye Garanti Bankası A.Ş.
+                        kind: issuer
+                        country: TR
+                        merged_from_entity_ids: []
+                        split_from_entity_id: null
+                        as_of: 2026-01-15T10:00:00Z
+                    metadata:
+                      as_of_requested: null
+                      as_of_resolved: 2026-05-09T00:00:00Z
+                      as_of_range: null
+                      lineage:
+                        source_filing_id: null
+                        raw_bytes_sha256: null
+                        extraction_code_version: null
+                        prompt_version: null
+                        model_identity: null
+                        extraction_seed: null
+                      pagination:
+                        next_cursor: null
+                        prev_cursor: null
+                        has_more: false
+                        total_count_estimate: 1
+                      feature_flags_active:
+                        - BITEMPORAL_API_ENABLED
+                        - BITEMPORAL_API_ENTITY_MERGE_LINEAGE
+                      warnings: []
+                      request_id: 5d4c3b2a-1e0f-4a5b-6c7d-8e9f0a1b2c3d
+                      served_by: bitemporal-api/abc1234
+        '400':
+          $ref: '#/components/responses/BitemporalAsOfNaive'
+        '401':
+          $ref: '#/components/responses/AuthInvalid'
+        '403':
+          $ref: '#/components/responses/AuthForbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/FeatureDisabled'
+
+  /entities/{entity_id}:
+    get:
+      tags: [research]
+      summary: Get a single entity point-in-time
+      operationId: getEntity
+      description: |
+        Returns the `ref.entity` row for `entity_id` as known at `as_of`.
+        Returns `404 BITEMPORAL_PRE_BITEMPORAL_REGION` if the entity did not
+        yet exist at the requested `as_of`.
+      parameters:
+        - name: entity_id
+          in: path
+          required: true
+          description: Aslan-canonical entity ID.
+          schema:
+            type: string
+            pattern: '^ASL-ENT-[0-9]{8}$'
+            example: ASL-ENT-00000001
+        - $ref: '#/components/parameters/AsOf'
+        - $ref: '#/components/parameters/DisplayTz'
+      responses:
+        '200':
+          description: Entity envelope.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            X-RateLimit-Tier:
+              $ref: '#/components/headers/XRateLimitTier'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/XRateLimitRemaining'
+            X-RateLimit-Reset:
+              $ref: '#/components/headers/XRateLimitReset'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EntityEnvelope'
+              examples:
+                garanti_pit:
+                  summary: GARAN as known on 2023-06-15
+                  value:
+                    data:
+                      entity_id: ASL-ENT-00000001
+                      canonical_name: Türkiye Garanti Bankası A.Ş.
+                      kind: issuer
+                      country: TR
+                      merged_from_entity_ids: []
+                      split_from_entity_id: null
+                      as_of: 2023-06-15T10:00:00Z
+                    metadata:
+                      as_of_requested: 2023-06-15T14:30:00Z
+                      as_of_resolved: 2023-06-15T14:30:00Z
+                      as_of_range: null
+                      lineage:
+                        source_filing_id: null
+                        raw_bytes_sha256: null
+                        extraction_code_version: null
+                        prompt_version: null
+                        model_identity: null
+                        extraction_seed: null
+                      pagination:
+                        next_cursor: null
+                        prev_cursor: null
+                        has_more: false
+                        total_count_estimate: null
+                      feature_flags_active:
+                        - BITEMPORAL_API_ENABLED
+                      warnings: []
+                      request_id: 8c7b6a5d-4e3f-2a1b-0c9d-8e7f6a5b4c3d
+                      served_by: bitemporal-api/abc1234
+        '400':
+          $ref: '#/components/responses/BitemporalAsOfNaive'
+        '401':
+          $ref: '#/components/responses/AuthInvalid'
+        '404':
+          $ref: '#/components/responses/PreBitemporalRegion'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/FeatureDisabled'
+
+  /identifiers/resolve:
+    get:
+      tags: [research, identifiers]
+      summary: Resolve an identifier to entity_id point-in-time
+      operationId: resolveIdentifier
+      description: |
+        Resolves `(namespace, value)` to an `entity_id` via `ref.identifier`
+        whose `daterange @> as_of`. Backed by `ref.identifier_at(p_as_of)`.
+
+        Per D9: ticker rename closes the old `daterange` and opens a new
+        one; both rows persist. The same `(namespace, value)` may resolve
+        to different `entity_id` at different `as_of`. If multiple rows
+        match (data bug), error `IDENTIFIER_AMBIGUOUS` (HTTP 409).
+      parameters:
+        - name: namespace
+          in: query
+          required: true
+          description: Identifier namespace.
+          schema:
+            type: string
+            enum: [bist_ticker, isin, vkn, mkk_id, kap_company_id, lei, cusip, sedol]
+            example: bist_ticker
+        - name: value
+          in: query
+          required: true
+          description: Identifier value (e.g. `GARAN`).
+          schema:
+            type: string
+            example: GARAN
+        - $ref: '#/components/parameters/AsOf'
+        - $ref: '#/components/parameters/DisplayTz'
+      responses:
+        '200':
+          description: Identifier resolution envelope.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            X-RateLimit-Tier:
+              $ref: '#/components/headers/XRateLimitTier'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/XRateLimitRemaining'
+            X-RateLimit-Reset:
+              $ref: '#/components/headers/XRateLimitReset'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdentifierEnvelope'
+              examples:
+                garan_resolution:
+                  summary: BIST ticker GARAN as of 2024-01-01
+                  value:
+                    data:
+                      namespace: bist_ticker
+                      value: GARAN
+                      entity_id: ASL-ENT-00000001
+                      daterange:
+                        - 2000-06-30T00:00:00Z
+                        - null
+                    metadata:
+                      as_of_requested: 2024-01-01T00:00:00Z
+                      as_of_resolved: 2024-01-01T00:00:00Z
+                      as_of_range: null
+                      lineage:
+                        source_filing_id: null
+                        raw_bytes_sha256: null
+                        extraction_code_version: null
+                        prompt_version: null
+                        model_identity: null
+                        extraction_seed: null
+                      pagination:
+                        next_cursor: null
+                        prev_cursor: null
+                        has_more: false
+                        total_count_estimate: null
+                      feature_flags_active:
+                        - BITEMPORAL_API_ENABLED
+                      warnings: []
+                      request_id: 4f3e2d1c-0b9a-8c7d-6e5f-4a3b2c1d0e9f
+                      served_by: bitemporal-api/abc1234
+        '400':
+          $ref: '#/components/responses/BitemporalAsOfNaive'
+        '401':
+          $ref: '#/components/responses/AuthInvalid'
+        '404':
+          $ref: '#/components/responses/PreBitemporalRegion'
+        '409':
+          $ref: '#/components/responses/IdentifierAmbiguous'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/FeatureDisabled'
+
+  /disclosures:
+    get:
+      tags: [research, disclosures]
+      summary: List KAP disclosures point-in-time
+      operationId: listDisclosures
+      description: |
+        Returns rows from `kap.disclosures` as known at `as_of`. Backed by
+        `kap.disclosures_at(p_as_of)`.
+
+        **Pre-bitemporal handling (D3):** of 462,018 historical rows,
+        ~89,700 carry a sensible `as_of` (derived from `body_fetched_at`,
+        `index_fetched_at`, or `published_at` per provenance). The remaining
+        ~372k rows have `as_of=NULL` and `as_of_provenance='pre_bitemporal_unknown'`.
+
+        - By default these NULL-as_of rows are **excluded** from the response
+          (honest about uncertainty).
+        - Pass `include_pre_bitemporal=true` to include them; the response
+          envelope flags `metadata.warnings` accordingly and each row carries
+          `pre_bitemporal=true`.
+      parameters:
+        - $ref: '#/components/parameters/AsOf'
+        - $ref: '#/components/parameters/AsOfRange'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/DisplayTz'
+        - $ref: '#/components/parameters/IncludePreBitemporal'
+        - name: entity_id
+          in: query
+          schema:
+            type: string
+            example: ASL-ENT-00000001
+        - name: kap_company_id
+          in: query
+          schema:
+            type: string
+            example: '4028'
+        - name: form_type
+          in: query
+          schema:
+            type: string
+            example: ÖDA
+        - name: published_from
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: published_to
+          in: query
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: Disclosures envelope.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            X-RateLimit-Tier:
+              $ref: '#/components/headers/XRateLimitTier'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/XRateLimitRemaining'
+            X-RateLimit-Reset:
+              $ref: '#/components/headers/XRateLimitReset'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DisclosureListEnvelope'
+              examples:
+                garan_oda_2024:
+                  summary: GARAN ÖDA disclosures in 2024 Q1
+                  value:
+                    data:
+                      - disclosure_id: KAP-2024-1234567
+                        kap_company_id: '4028'
+                        entity_id: ASL-ENT-00000001
+                        form_type: ÖDA
+                        title: Kâr Payı Dağıtım Bildirimi
+                        published_at: 2024-03-15T10:00:00Z
+                        body_fetched: true
+                        body_fetched_at: 2024-03-15T10:00:11Z
+                        republished_as: null
+                        as_of: 2024-03-15T10:00:11Z
+                        as_of_provenance: body_fetched_at
+                        pre_bitemporal: false
+                    metadata:
+                      as_of_requested: 2024-03-15T16:00:00Z
+                      as_of_resolved: 2024-03-15T16:00:00Z
+                      as_of_range: null
+                      lineage:
+                        source_filing_id: KAP-2024-1234567
+                        raw_bytes_sha256: 7c2e9a4b1d6f3a8c5e2b9d4f1a7c3e6b8d5a2f9c4e1b7d3a6f8c2e5b9d4a1f7c
+                        extraction_code_version: null
+                        prompt_version: null
+                        model_identity: null
+                        extraction_seed: null
+                      pagination:
+                        next_cursor: null
+                        prev_cursor: null
+                        has_more: false
+                        total_count_estimate: 1
+                      feature_flags_active:
+                        - BITEMPORAL_API_ENABLED
+                        - BITEMPORAL_API_KAP_APPEND_ONLY_TRIGGER
+                        - BITEMPORAL_API_ALLOW_NULL_AS_OF
+                      warnings: []
+                      request_id: 2a1b0c9d-8e7f-6a5b-4c3d-2e1f0a9b8c7d
+                      served_by: bitemporal-api/abc1234
+        '400':
+          $ref: '#/components/responses/BitemporalAsOfNaive'
+        '401':
+          $ref: '#/components/responses/AuthInvalid'
+        '403':
+          $ref: '#/components/responses/AuthForbidden'
+        '413':
+          $ref: '#/components/responses/QueryTooLarge'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/FeatureDisabled'
+
+  /disclosures/{disclosure_id}:
+    get:
+      tags: [research, disclosures]
+      summary: Get a single disclosure point-in-time
+      operationId: getDisclosure
+      description: |
+        Returns the `kap.disclosures` row for `disclosure_id` as known at
+        `as_of`. Per D11, KAP-amended filings produce a new
+        `(disclosure_id, as_of)` row; PIT queries at the older `as_of`
+        return the pre-amendment value, at the newer `as_of` return the
+        post-amendment value.
+      parameters:
+        - name: disclosure_id
+          in: path
+          required: true
+          schema:
+            type: string
+            example: KAP-2024-1234567
+        - $ref: '#/components/parameters/AsOf'
+        - $ref: '#/components/parameters/DisplayTz'
+        - $ref: '#/components/parameters/IncludePreBitemporal'
+      responses:
+        '200':
+          description: Disclosure envelope.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            X-RateLimit-Tier:
+              $ref: '#/components/headers/XRateLimitTier'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/XRateLimitRemaining'
+            X-RateLimit-Reset:
+              $ref: '#/components/headers/XRateLimitReset'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DisclosureEnvelope'
+              examples:
+                amendment_before_after:
+                  summary: KAP amendment scenario — pre-amendment view
+                  value:
+                    data:
+                      disclosure_id: KAP-2024-1234567
+                      kap_company_id: '4028'
+                      entity_id: ASL-ENT-00000001
+                      form_type: ÖDA
+                      title: Kâr Payı Dağıtım Bildirimi
+                      published_at: 2024-03-15T10:00:00Z
+                      body_fetched: true
+                      body_fetched_at: 2024-03-15T10:00:11Z
+                      republished_as: KAP-2024-1234568
+                      as_of: 2024-03-15T10:00:11Z
+                      as_of_provenance: body_fetched_at
+                      pre_bitemporal: false
+                      attributes:
+                        dividend_amount_per_share: '1.50'
+                        currency: TRY
+                    metadata:
+                      as_of_requested: 2024-03-15T12:00:00Z
+                      as_of_resolved: 2024-03-15T12:00:00Z
+                      as_of_range: null
+                      lineage:
+                        source_filing_id: KAP-2024-1234567
+                        raw_bytes_sha256: 7c2e9a4b1d6f3a8c5e2b9d4f1a7c3e6b8d5a2f9c4e1b7d3a6f8c2e5b9d4a1f7c
+                        extraction_code_version: 0.7.3
+                        prompt_version: kap_oda_v4
+                        model_identity: claude-3-7-sonnet-20250219
+                        extraction_seed: 42
+                      pagination:
+                        next_cursor: null
+                        prev_cursor: null
+                        has_more: false
+                        total_count_estimate: null
+                      feature_flags_active:
+                        - BITEMPORAL_API_ENABLED
+                        - BITEMPORAL_API_KAP_APPEND_ONLY_TRIGGER
+                      warnings: []
+                      request_id: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+                      served_by: bitemporal-api/abc1234
+        '400':
+          $ref: '#/components/responses/BitemporalAsOfNaive'
+        '401':
+          $ref: '#/components/responses/AuthInvalid'
+        '404':
+          $ref: '#/components/responses/PreBitemporalRegion'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/FeatureDisabled'
+
+  /filings:
+    get:
+      tags: [research, filings]
+      summary: List doc.filing rows point-in-time
+      operationId: listFilings
+      description: |
+        Returns rows from `doc.filing` as known at `as_of`. Backed by
+        `doc.filing_at(p_as_of)`. **Empty until** the
+        `aslan-event-extractor` M0 backfill (`extract-migrate-doc-filing`)
+        runs (per STATE.md §2: 0 rows at draft time).
+      parameters:
+        - $ref: '#/components/parameters/AsOf'
+        - $ref: '#/components/parameters/AsOfRange'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/DisplayTz'
+        - $ref: '#/components/parameters/EntityId'
+        - name: source_kind
+          in: query
+          schema:
+            type: string
+            enum: [kap, bist, tcmb, mkk, tefas, other]
+            example: kap
+        - name: filed_from
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: filed_to
+          in: query
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: Filings envelope.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            X-RateLimit-Tier:
+              $ref: '#/components/headers/XRateLimitTier'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/XRateLimitRemaining'
+            X-RateLimit-Reset:
+              $ref: '#/components/headers/XRateLimitReset'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FilingListEnvelope'
+              examples:
+                empty:
+                  summary: Empty result (pre-backfill state)
+                  value:
+                    data: []
+                    metadata:
+                      as_of_requested: null
+                      as_of_resolved: 2026-05-09T00:00:00Z
+                      as_of_range: null
+                      lineage:
+                        source_filing_id: null
+                        raw_bytes_sha256: null
+                        extraction_code_version: null
+                        prompt_version: null
+                        model_identity: null
+                        extraction_seed: null
+                      pagination:
+                        next_cursor: null
+                        prev_cursor: null
+                        has_more: false
+                        total_count_estimate: 0
+                      feature_flags_active:
+                        - BITEMPORAL_API_ENABLED
+                      warnings:
+                        - code: DOC_FILING_BACKFILL_PENDING
+                          message: doc.filing is empty pending aslan-event-extractor M0 backfill.
+                          rows_affected: 0
+                      request_id: 3f2e1d0c-9b8a-7c6d-5e4f-3a2b1c0d9e8f
+                      served_by: bitemporal-api/abc1234
+        '400':
+          $ref: '#/components/responses/BitemporalAsOfNaive'
+        '401':
+          $ref: '#/components/responses/AuthInvalid'
+        '403':
+          $ref: '#/components/responses/AuthForbidden'
+        '413':
+          $ref: '#/components/responses/QueryTooLarge'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/FeatureDisabled'
+
+  /events:
+    get:
+      tags: [research, events]
+      summary: List filing events point-in-time
+      operationId: listFilingEvents
+      description: |
+        Returns rows from `agg.filing_event` as known at `as_of`. Backed by
+        `agg.filing_event_at(p_as_of)`. Empty until `aslan-event-extractor`
+        M1 populates.
+
+        Each event carries Moat 7's full lineage tuple: source filing,
+        raw_bytes_sha256, extraction code version, prompt version, model
+        identity, extraction seed.
+      parameters:
+        - $ref: '#/components/parameters/AsOf'
+        - $ref: '#/components/parameters/AsOfRange'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/DisplayTz'
+        - $ref: '#/components/parameters/EntityId'
+        - name: filing_id
+          in: query
+          schema:
+            type: string
+            example: KAP-2024-1234567
+        - name: event_type
+          in: query
+          schema:
+            type: string
+            example: dividend_declared
+        - name: occurred_from
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: occurred_to
+          in: query
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: Filing events envelope.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            X-RateLimit-Tier:
+              $ref: '#/components/headers/XRateLimitTier'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/XRateLimitRemaining'
+            X-RateLimit-Reset:
+              $ref: '#/components/headers/XRateLimitReset'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FilingEventListEnvelope'
+              examples:
+                dividend_declared:
+                  summary: Dividend declared event for GARAN
+                  value:
+                    data:
+                      - event_id: AGG-FE-2024-0000123
+                        filing_id: KAP-2024-1234567
+                        entity_id: ASL-ENT-00000001
+                        event_type: dividend_declared
+                        event_seq: 1
+                        occurred_at: 2024-03-15T10:00:00Z
+                        attributes:
+                          amount_per_share: '1.50'
+                          currency: TRY
+                          ex_date: '2024-04-05'
+                          payable_date: '2024-04-12'
+                        raw_quote: Yönetim Kurulumuzun 15.03.2024 tarihli kararıyla, hissedarlarımıza brüt 1,50 TL kâr payı dağıtılmasına karar verilmiştir.
+                        as_of: 2024-03-15T10:00:33Z
+                        superseded_at: null
+                    metadata:
+                      as_of_requested: 2024-03-15T12:00:00Z
+                      as_of_resolved: 2024-03-15T12:00:00Z
+                      as_of_range: null
+                      lineage:
+                        source_filing_id: KAP-2024-1234567
+                        raw_bytes_sha256: 7c2e9a4b1d6f3a8c5e2b9d4f1a7c3e6b8d5a2f9c4e1b7d3a6f8c2e5b9d4a1f7c
+                        extraction_code_version: 0.9.1
+                        prompt_version: dividend_v6
+                        model_identity: claude-3-7-sonnet-20250219
+                        extraction_seed: 42
+                      pagination:
+                        next_cursor: null
+                        prev_cursor: null
+                        has_more: false
+                        total_count_estimate: 1
+                      feature_flags_active:
+                        - BITEMPORAL_API_ENABLED
+                      warnings: []
+                      request_id: 6c5b4a3d-2e1f-0a9b-8c7d-6e5f4a3b2c1d
+                      served_by: bitemporal-api/abc1234
+        '400':
+          $ref: '#/components/responses/BitemporalAsOfNaive'
+        '401':
+          $ref: '#/components/responses/AuthInvalid'
+        '403':
+          $ref: '#/components/responses/AuthForbidden'
+        '413':
+          $ref: '#/components/responses/QueryTooLarge'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/FeatureDisabled'
+
+  /verify/moat-2:
+    get:
+      tags: [verification]
+      summary: Public Moat 2 canary status
+      operationId: verifyMoat2
+      description: |
+        **Unauthenticated** public verification of Moat 2 (bitemporal
+        point-in-time correctness).
+
+        Returns `200 green` when the canary's most recent cycle had every
+        case passing; returns `503 red` when any case failed.
+
+        Cached server-side for 60 seconds; no per-IP rate limit
+        (DDoS protection is upstream WAF). Per ADR-003 §"Verification
+        endpoint" — anyone (customer, journalist, regulator) can audit
+        the moat without an API key.
+
+        The canary runs every 5 minutes against ≥10 hand-curated
+        historical KAP amendments where `as_of_before` value differs from
+        `as_of_after` value.
+      security: []
+      responses:
+        '200':
+          description: Canary green.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              description: Server-side cache window of 60s.
+              schema:
+                type: string
+              example: public, max-age=60
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Moat2VerificationResult'
+              examples:
+                green:
+                  summary: All cases passing
+                  value:
+                    moat_2: green
+                    last_run_at: 2026-05-09T11:35:00Z
+                    cases_total: 12
+                    cases_passing: 12
+                    failing_cases: []
+                    canary_uptime_hours: 248.5
+                    sample_amendment:
+                      filing_id: KAP-2024-1234567
+                      field: dividend_amount_per_share
+                      as_of_before: 2024-03-15T10:00:11Z
+                      value_before: '1.50'
+                      as_of_after: 2024-03-15T16:30:42Z
+                      value_after: '1.75'
+        '503':
+          description: Canary red — at least one case failing.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Moat2VerificationResult'
+              examples:
+                red:
+                  summary: At least one case failing
+                  value:
+                    moat_2: red
+                    last_run_at: 2026-05-09T11:40:00Z
+                    cases_total: 12
+                    cases_passing: 11
+                    failing_cases:
+                      - case_id: KAP-2023-AMEND-04
+                        filing_id: KAP-2023-9876543
+                        field: capital_increase_amount
+                        as_of_before: 2023-11-02T09:15:00Z
+                        expected_before: '500000000'
+                        observed_before: '750000000'
+                        as_of_after: 2023-11-02T14:45:00Z
+                        expected_after: '750000000'
+                        observed_after: '750000000'
+                        diagnosis: as_of_before query returned post-amendment value — append-only invariant breached
+                    canary_uptime_hours: 0.0
+                    sample_amendment: null
+
+  /healthz:
+    get:
+      tags: [ops]
+      summary: Liveness/readiness probe
+      operationId: healthz
+      description: |
+        Basic health check. Returns `200` when the process is up and the
+        Postgres connection pool is reachable; `503` otherwise. Used by
+        Kubernetes-style liveness/readiness probes and the dashboard
+        upstream LB.
+      security: []
+      responses:
+        '200':
+          description: Service healthy.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              examples:
+                ok:
+                  value:
+                    status: ok
+                    checks:
+                      postgres: ok
+                      feature_flags: ok
+                      audit_log: ok
+                    timestamp: 2026-05-09T11:42:01Z
+        '503':
+          description: Service unhealthy.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              examples:
+                degraded:
+                  value:
+                    status: degraded
+                    checks:
+                      postgres: error
+                      feature_flags: ok
+                      audit_log: ok
+                    error_detail: Connection refused on aslan-dashboard-postgres-1:5432
+                    timestamp: 2026-05-09T11:42:01Z
+
+  /version:
+    get:
+      tags: [ops]
+      summary: Server version and active feature flags
+      operationId: version
+      description: |
+        Returns the server's commit SHA, semver, and a snapshot of which
+        feature flags are active in this environment. Useful for client-
+        side diagnostics and for the SDK to gate features.
+      security: []
+      responses:
+        '200':
+          description: Version response.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Cache-Control:
+              schema:
+                type: string
+              example: public, max-age=60
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VersionResponse'
+              examples:
+                staging:
+                  value:
+                    name: bitemporal-research-api
+                    semver: 1.0.0-alpha
+                    commit_sha: abc1234
+                    built_at: 2026-05-09T08:00:00Z
+                    environment: staging
+                    feature_flags_active:
+                      - BITEMPORAL_API_ENABLED
+                      - BITEMPORAL_API_INTERVAL_QUERIES
+                      - BITEMPORAL_API_ALLOW_NULL_AS_OF
+                      - BITEMPORAL_API_RATE_LIMIT_ENFORCED
+                      - BITEMPORAL_API_AUDIT_LOG_ENABLED
+                      - BITEMPORAL_API_COST_LIMITS_ENFORCED
+                      - BITEMPORAL_TABLE_REGISTRY_CI_ENFORCED
+                    feature_flags_disabled:
+                      - BITEMPORAL_API_TAS29_RESTATEMENT_CHAIN
+                      - BITEMPORAL_API_ENTITY_MERGE_LINEAGE
+                      - BITEMPORAL_API_KAP_APPEND_ONLY_TRIGGER
+                      - BITEMPORAL_API_V2_PREVIEW
+                      - BITEMPORAL_API_PII_EXPOSURE
+
+  /openapi.json:
+    get:
+      tags: [ops]
+      summary: Raw OpenAPI 3.1 document (JSON)
+      operationId: openapiJson
+      description: |
+        Returns this OpenAPI document serialized as JSON. Companion surfaces:
+        Swagger UI at `/v1/research/docs`, ReDoc at `/v1/research/redoc`.
+        Per D21.
+      security: []
+      responses:
+        '200':
+          description: OpenAPI document.
+          content:
+            application/json:
+              schema:
+                type: object
+                description: OpenAPI 3.1 document.
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Aslan-Api-Key
+      description: |
+        Long-lived API key (UUID v4 + 32-byte random secret), stored
+        argon2id-hashed server-side. Per D5. Public verification endpoints
+        (`/verify/moat-2`, `/healthz`, `/version`, `/openapi.json`) skip
+        security.
+
+  parameters:
+    AsOf:
+      name: as_of
+      in: query
+      required: false
+      description: |
+        Point-in-time query timestamp. ISO8601 with explicit timezone
+        (`Z` or `±HH:MM`); naive datetimes are rejected (HTTP 400,
+        `BITEMPORAL_AS_OF_NAIVE`). Default = `NOW()`. Mutually exclusive
+        with `as_of_range`. Per D2 + D13.
+      schema:
+        type: string
+        format: date-time
+      example: 2024-06-15T14:30:00Z
+    AsOfRange:
+      name: as_of_range
+      in: query
+      required: false
+      description: |
+        Half-open interval `[T1,T2)` of ISO8601 timestamps. Returns the
+        full version chain whose `as_of` fell in the interval. Mutually
+        exclusive with `as_of`. Bound by D19 (≤5 years width by default,
+        per-key configurable). Per D2.
+      schema:
+        type: string
+        pattern: '^\[[^,]+,[^)]+\)$'
+      example: '[2024-01-01T00:00:00Z,2025-01-01T00:00:00Z)'
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: |
+        Opaque base64-encoded keyset cursor returned by the previous
+        response. Carries `(v, as_of, anchor, direction, filters_hash)`;
+        server validates `filters_hash` to prevent cursor reuse across
+        different filter sets. Per D7.
+      schema:
+        type: string
+      example: eyJ2IjoxLCJhc19vZiI6IjIwMjQtMDYtMTVUMTQ6MzA6MDBaIn0=
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Page size. Default 50, max 500. Per D7 + D19.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 500
+        default: 50
+      example: 50
+    DisplayTz:
+      name: display_tz
+      in: query
+      required: false
+      description: |
+        IANA timezone identifier (e.g. `Europe/Istanbul`). Adds a
+        `local_time` companion field to every row. Storage stays UTC;
+        `as_of` and `ts` fields remain UTC ISO8601 with `Z`. Per D13.
+      schema:
+        type: string
+      example: Europe/Istanbul
+    IncludePreBitemporal:
+      name: include_pre_bitemporal
+      in: query
+      required: false
+      description: |
+        Include `kap.disclosures` rows with `as_of=NULL` and
+        `as_of_provenance='pre_bitemporal_unknown'` (the ~372k legacy
+        rows). When true the response carries a warning. Per D3.
+      schema:
+        type: boolean
+        default: false
+    EntityId:
+      name: entity_id
+      in: query
+      required: false
+      description: Aslan-canonical entity ID (e.g. `ASL-ENT-00000001`).
+      schema:
+        type: string
+        pattern: '^ASL-ENT-[0-9]{8}$'
+      example: ASL-ENT-00000001
+
+  headers:
+    XRequestId:
+      description: |
+        Server-assigned request ID (UUID). Use this when filing support
+        tickets; the API audit log is keyed by `request_id`.
+      schema:
+        type: string
+        format: uuid
+    XRateLimitTier:
+      description: Authenticated key's rate tier (`internal`, `partner`, `public`). Per D6.
+      schema:
+        type: string
+        enum: [internal, partner, public]
+    XRateLimitRemaining:
+      description: Tokens remaining in the current minute bucket.
+      schema:
+        type: integer
+        minimum: 0
+    XRateLimitReset:
+      description: Epoch-seconds when the current minute bucket refills.
+      schema:
+        type: integer
+        minimum: 0
+    CacheControl:
+      description: |
+        `public, max-age=31536000, immutable` for `as_of <= NOW() - 5min`
+        responses; `no-cache` otherwise. Per D17.
+      schema:
+        type: string
+    ETag:
+      description: |
+        SHA-256 of canonical response body. Clients may revalidate with
+        `If-None-Match`. Per D17.
+      schema:
+        type: string
+    Deprecation:
+      description: |
+        Defined per IETF draft. Set to `true` when the endpoint is
+        deprecated; absent otherwise. Per D24. No endpoints in v1 are
+        deprecated.
+      schema:
+        type: string
+        enum: ['true']
+    Sunset:
+      description: |
+        Defined per RFC 8594. ISO8601 date when the deprecated endpoint
+        will be removed. Minimum 6 months between deprecation and
+        removal. Per D24.
+      schema:
+        type: string
+        format: date-time
+
+  responses:
+    BitemporalAsOfNaive:
+      description: '`as_of` lacked an explicit timezone, or other 400 conditions.'
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            naive_as_of:
+              value:
+                type: https://docs.aslanterminal.com/errors/BITEMPORAL_AS_OF_NAIVE
+                title: as_of missing timezone
+                status: 400
+                detail: 'as_of=2024-06-15T14:30:00 is naive; ISO8601 with Z or ±HH:MM is required.'
+                instance: /v1/research/observations
+                request_id: 7f3a9b2c-1d4e-4f5a-9b2c-1d4e4f5a9b2c
+                code: BITEMPORAL_AS_OF_NAIVE
+                extensions:
+                  received_value: 2024-06-15T14:30:00
+            future_as_of:
+              value:
+                type: https://docs.aslanterminal.com/errors/BITEMPORAL_AS_OF_FUTURE
+                title: as_of in the future
+                status: 400
+                detail: 'as_of=2099-01-01T00:00:00Z is later than NOW() + 60s clock-skew tolerance.'
+                instance: /v1/research/observations
+                request_id: 7f3a9b2c-1d4e-4f5a-9b2c-1d4e4f5a9b2c
+                code: BITEMPORAL_AS_OF_FUTURE
+                extensions:
+                  received_value: 2099-01-01T00:00:00Z
+                  server_now: 2026-05-09T11:42:01Z
+            too_old_as_of:
+              value:
+                type: https://docs.aslanterminal.com/errors/BITEMPORAL_AS_OF_TOO_OLD
+                title: as_of before platform epoch
+                status: 400
+                detail: 'as_of=1900-01-01T00:00:00Z is before the platform epoch 2018-01-01T00:00:00Z.'
+                instance: /v1/research/observations
+                request_id: 7f3a9b2c-1d4e-4f5a-9b2c-1d4e4f5a9b2c
+                code: BITEMPORAL_AS_OF_TOO_OLD
+                extensions:
+                  received_value: 1900-01-01T00:00:00Z
+                  platform_epoch: 2018-01-01T00:00:00Z
+            interval_invalid:
+              value:
+                type: https://docs.aslanterminal.com/errors/BITEMPORAL_INTERVAL_INVALID
+                title: as_of_range malformed
+                status: 400
+                detail: 'as_of_range=[2024-06-01,2024-01-01) has T1>=T2.'
+                instance: /v1/research/observations
+                request_id: 7f3a9b2c-1d4e-4f5a-9b2c-1d4e4f5a9b2c
+                code: BITEMPORAL_INTERVAL_INVALID
+                extensions:
+                  received_value: '[2024-06-01,2024-01-01)'
+    AuthInvalid:
+      description: Bad/missing/expired API key.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        WWW-Authenticate:
+          schema:
+            type: string
+          example: ApiKey realm="aslan-research"
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            missing:
+              value:
+                type: https://docs.aslanterminal.com/errors/AUTH_INVALID
+                title: API key missing or invalid
+                status: 401
+                detail: X-Aslan-Api-Key header missing.
+                instance: /v1/research/observations
+                request_id: 7f3a9b2c-1d4e-4f5a-9b2c-1d4e4f5a9b2c
+                code: AUTH_INVALID
+                extensions: {}
+    AuthForbidden:
+      description: Key valid but lacks scope (e.g. `pii_unredacted`).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            no_pii_scope:
+              value:
+                type: https://docs.aslanterminal.com/errors/AUTH_FORBIDDEN
+                title: API key forbidden from this resource
+                status: 403
+                detail: PII unredaction requires a key with pii_unredacted=true; this key has it false.
+                instance: /v1/research/disclosures
+                request_id: 7f3a9b2c-1d4e-4f5a-9b2c-1d4e4f5a9b2c
+                code: AUTH_FORBIDDEN
+                extensions:
+                  required_scope: pii_unredacted
+                  key_id: f7e6d5c4-b3a2-4918-87f6-e5d4c3b2a190
+    PreBitemporalRegion:
+      description: Resource has no bitemporal data at the requested `as_of`.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            entity_not_yet_known:
+              value:
+                type: https://docs.aslanterminal.com/errors/BITEMPORAL_PRE_BITEMPORAL_REGION
+                title: No bitemporal data at requested as_of
+                status: 404
+                detail: 'Entity ASL-ENT-00000001 has no row with as_of <= 2010-01-01T00:00:00Z.'
+                instance: /v1/research/entities/ASL-ENT-00000001
+                request_id: 7f3a9b2c-1d4e-4f5a-9b2c-1d4e4f5a9b2c
+                code: BITEMPORAL_PRE_BITEMPORAL_REGION
+                extensions:
+                  earliest_known_as_of: 2018-03-15T10:00:00Z
+                  requested_as_of: 2010-01-01T00:00:00Z
+    IdentifierAmbiguous:
+      description: Multiple `ref.identifier` rows match the lookup (data bug).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            ambiguous_ticker:
+              value:
+                type: https://docs.aslanterminal.com/errors/IDENTIFIER_AMBIGUOUS
+                title: Identifier resolves to multiple entities
+                status: 409
+                detail: '(bist_ticker, GARAN, 2024-01-01T00:00:00Z) matched 2 entities; this is a data bug.'
+                instance: /v1/research/identifiers/resolve
+                request_id: 7f3a9b2c-1d4e-4f5a-9b2c-1d4e4f5a9b2c
+                code: IDENTIFIER_AMBIGUOUS
+                extensions:
+                  candidates:
+                    - entity_id: ASL-ENT-00000001
+                      daterange: ['2000-06-30T00:00:00Z', null]
+                    - entity_id: ASL-ENT-00000777
+                      daterange: ['2024-01-01T00:00:00Z', null]
+    QueryTooLarge:
+      description: Query exceeds D19 cost cap.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            range_too_wide:
+              value:
+                type: https://docs.aslanterminal.com/errors/QUERY_TOO_LARGE
+                title: as_of_range exceeds 5-year cap
+                status: 413
+                detail: 'as_of_range width is 7y; cap for tier=partner is 5y. Apply per-key override or paginate.'
+                instance: /v1/research/observations
+                request_id: 7f3a9b2c-1d4e-4f5a-9b2c-1d4e4f5a9b2c
+                code: QUERY_TOO_LARGE
+                extensions:
+                  cap: 1825d
+                  observed: 2557d
+            too_many_entities:
+              value:
+                type: https://docs.aslanterminal.com/errors/QUERY_TOO_LARGE
+                title: Too many entity_ids in filter
+                status: 413
+                detail: '120 distinct entity_ids in filter; cap is 100.'
+                instance: /v1/research/financials/canonical
+                request_id: 7f3a9b2c-1d4e-4f5a-9b2c-1d4e4f5a9b2c
+                code: QUERY_TOO_LARGE
+                extensions:
+                  cap: 100
+                  observed: 120
+    RateLimited:
+      description: Rate-limit bucket exhausted.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Retry-After:
+          description: Seconds until retry is permitted.
+          schema:
+            type: integer
+        X-RateLimit-Tier:
+          $ref: '#/components/headers/XRateLimitTier'
+        X-RateLimit-Remaining:
+          $ref: '#/components/headers/XRateLimitRemaining'
+        X-RateLimit-Reset:
+          $ref: '#/components/headers/XRateLimitReset'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            tier_exceeded:
+              value:
+                type: https://docs.aslanterminal.com/errors/RATE_LIMITED
+                title: Rate limit exceeded
+                status: 429
+                detail: 'partner tier permits 600 req/min; bucket exhausted.'
+                instance: /v1/research/observations
+                request_id: 7f3a9b2c-1d4e-4f5a-9b2c-1d4e4f5a9b2c
+                code: RATE_LIMITED
+                extensions:
+                  tier: partner
+                  retry_after_seconds: 23
+    InternalError:
+      description: Unhandled server error.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            generic:
+              value:
+                type: https://docs.aslanterminal.com/errors/INTERNAL_ERROR
+                title: Internal server error
+                status: 500
+                detail: An unexpected error occurred. Reference request_id when filing a support ticket.
+                instance: /v1/research/observations
+                request_id: 7f3a9b2c-1d4e-4f5a-9b2c-1d4e4f5a9b2c
+                code: INTERNAL_ERROR
+                extensions: {}
+    FeatureDisabled:
+      description: Required feature flag is off (incl. master).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            master_off:
+              value:
+                type: https://docs.aslanterminal.com/errors/FEATURE_DISABLED
+                title: Bitemporal API disabled in this environment
+                status: 503
+                detail: 'BITEMPORAL_API_ENABLED is false; the bitemporal API is not yet promoted in this environment.'
+                instance: /v1/research/observations
+                request_id: 7f3a9b2c-1d4e-4f5a-9b2c-1d4e4f5a9b2c
+                code: FEATURE_DISABLED
+                extensions:
+                  flag: BITEMPORAL_API_ENABLED
+                  state: false
+            tas29_off:
+              value:
+                type: https://docs.aslanterminal.com/errors/FEATURE_DISABLED
+                title: TAS 29 restatement chain disabled
+                status: 503
+                detail: '?restatement_kind=tas29 requires BITEMPORAL_API_TAS29_RESTATEMENT_CHAIN, which is currently false.'
+                instance: /v1/research/financials/canonical
+                request_id: 7f3a9b2c-1d4e-4f5a-9b2c-1d4e4f5a9b2c
+                code: FEATURE_DISABLED
+                extensions:
+                  flag: BITEMPORAL_API_TAS29_RESTATEMENT_CHAIN
+                  state: false
+
+  schemas:
+    Lineage:
+      type: object
+      description: |
+        Lineage tuple for an extracted fact. Per D15 + ADR-003 replayability:
+        every fact must be reconstructable from the source bytes plus this
+        tuple. All fields nullable because not every fact is LLM-extracted
+        (e.g. `ts.observation` rarely carries lineage).
+      properties:
+        source_filing_id:
+          type: [string, 'null']
+          description: Originating filing identifier (e.g. KAP disclosure id).
+          example: KAP-2024-1234567
+        raw_bytes_sha256:
+          type: [string, 'null']
+          pattern: '^[0-9a-f]{64}$'
+          description: SHA-256 hex of the raw source bytes.
+          example: 4f1a8c3d9e5b7a2f8c1d3e6b9a4c7f8e1d2a5b8c9e3f6a1d4b7c8e9f2a3b4c5d
+        extraction_code_version:
+          type: [string, 'null']
+          description: Semver of the extraction code that produced the fact.
+          example: 0.7.3
+        prompt_version:
+          type: [string, 'null']
+          description: Identifier of the LLM prompt version (free-form).
+          example: financials_v3
+        model_identity:
+          type: [string, 'null']
+          description: Anthropic / OpenAI model identity string.
+          example: claude-3-7-sonnet-20250219
+        extraction_seed:
+          type: [integer, 'null']
+          description: Seed used in the extraction call (where supported).
+          example: 42
+      required:
+        - source_filing_id
+        - raw_bytes_sha256
+        - extraction_code_version
+        - prompt_version
+        - model_identity
+        - extraction_seed
+
+    Pagination:
+      type: object
+      description: Cursor-based pagination per D7.
+      properties:
+        next_cursor:
+          type: [string, 'null']
+          description: Opaque cursor for the next page; null on the last page.
+          example: eyJ2IjoxLCJhc19vZiI6IjIwMjQtMDYtMzBUMjM6NTk6NTlaIn0=
+        prev_cursor:
+          type: [string, 'null']
+          description: Opaque cursor for the previous page; null on the first page.
+        has_more:
+          type: boolean
+          description: True if `next_cursor` is non-null.
+        total_count_estimate:
+          type: [integer, 'null']
+          description: |
+            Approximate total row count under the current filter.
+            Postgres `pg_class.reltuples`-derived; best-effort, not exact.
+            Null when not cheap to compute.
+      required:
+        - next_cursor
+        - prev_cursor
+        - has_more
+        - total_count_estimate
+
+    Warning:
+      type: object
+      description: Non-fatal advisory attached to a successful response.
+      properties:
+        code:
+          type: string
+          description: Machine-readable warning code.
+          example: PRE_BITEMPORAL_ROWS_INCLUDED
+        message:
+          type: string
+          description: Human-readable explanation.
+          example: 372,318 rows with as_of=NULL included due to include_pre_bitemporal=true.
+        rows_affected:
+          type: integer
+          minimum: 0
+          example: 372318
+      required: [code, message, rows_affected]
+
+    EnvelopeMetadata:
+      type: object
+      description: |
+        Envelope metadata block per D15. `as_of_requested` reflects the
+        client's literal input (or null for the default); `as_of_resolved`
+        is what the server actually used (e.g. `NOW()` resolved to a
+        concrete timestamp).
+      properties:
+        as_of_requested:
+          type: [string, 'null']
+          format: date-time
+          description: 'Client-supplied `as_of`; null when default (`NOW()`).'
+          example: 2024-06-15T14:30:00Z
+        as_of_resolved:
+          type: string
+          format: date-time
+          description: The server's resolved `as_of` (UTC ISO8601 with `Z`).
+          example: 2024-06-15T14:30:00Z
+        as_of_range:
+          type: [array, 'null']
+          minItems: 2
+          maxItems: 2
+          items:
+            type: string
+            format: date-time
+          description: 'When the request was an interval query, the [T1,T2) bounds.'
+        lineage:
+          $ref: '#/components/schemas/Lineage'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+        feature_flags_active:
+          type: array
+          items:
+            type: string
+          description: Snapshot of feature flags effective for this request.
+          example:
+            - BITEMPORAL_API_ENABLED
+            - BITEMPORAL_API_AUDIT_LOG_ENABLED
+        warnings:
+          type: array
+          items:
+            $ref: '#/components/schemas/Warning'
+        request_id:
+          type: string
+          format: uuid
+          description: Server-assigned request ID; matches `X-Request-Id`.
+          example: 7f3a9b2c-1d4e-4f5a-9b2c-1d4e4f5a9b2c
+        served_by:
+          type: string
+          description: '`bitemporal-api/<commit-sha>` identity of the serving instance.'
+          example: bitemporal-api/abc1234
+      required:
+        - as_of_requested
+        - as_of_resolved
+        - as_of_range
+        - lineage
+        - pagination
+        - feature_flags_active
+        - warnings
+        - request_id
+        - served_by
+
+    Problem:
+      type: object
+      description: RFC 7807 problem document per D16.
+      properties:
+        type:
+          type: string
+          format: uri
+          description: Stable URI naming the error class.
+          example: https://docs.aslanterminal.com/errors/BITEMPORAL_AS_OF_NAIVE
+        title:
+          type: string
+          description: Short human-readable summary.
+          example: as_of missing timezone
+        status:
+          type: integer
+          minimum: 100
+          maximum: 599
+          description: HTTP status code.
+          example: 400
+        detail:
+          type: string
+          description: Long human-readable explanation.
+          example: 'as_of=2024-06-15T14:30:00 is naive; ISO8601 with Z or ±HH:MM is required.'
+        instance:
+          type: string
+          description: Request URI.
+          example: /v1/research/observations
+        request_id:
+          type: string
+          format: uuid
+          description: Server-assigned request ID.
+          example: 7f3a9b2c-1d4e-4f5a-9b2c-1d4e4f5a9b2c
+        code:
+          type: string
+          description: Stable machine code per D16.
+          enum:
+            - BITEMPORAL_AS_OF_NAIVE
+            - BITEMPORAL_AS_OF_FUTURE
+            - BITEMPORAL_AS_OF_TOO_OLD
+            - BITEMPORAL_PRE_BITEMPORAL_REGION
+            - BITEMPORAL_INTERVAL_INVALID
+            - IDENTIFIER_AMBIGUOUS
+            - RATE_LIMITED
+            - AUTH_INVALID
+            - AUTH_FORBIDDEN
+            - QUERY_TOO_LARGE
+            - FEATURE_DISABLED
+            - INTERNAL_ERROR
+        extensions:
+          type: object
+          description: Error-specific structured payload.
+          additionalProperties: true
+      required: [type, title, status, detail, instance, request_id, code, extensions]
+
+    Observation:
+      type: object
+      description: A `ts.observation` row (PIT projection).
+      properties:
+        series_id:
+          type: string
+          example: BIST.GARAN.close
+        ts:
+          type: string
+          format: date-time
+          description: Observation wall-clock timestamp (UTC).
+          example: 2024-06-03T15:30:00Z
+        value:
+          type: number
+          example: 86.45
+        unit:
+          type: string
+          example: TRY
+        as_of:
+          type: string
+          format: date-time
+          description: Platform-known time at which this row was recorded (UTC).
+          example: 2024-06-03T15:30:11Z
+        local_time:
+          type: [string, 'null']
+          format: date-time
+          description: 'Same instant in `display_tz`; null if `display_tz` not supplied.'
+          example: 2024-06-03T18:30:11+03:00
+      required: [series_id, ts, value, unit, as_of]
+
+    FinancialLineItem:
+      type: object
+      description: A `ts.financial_line_item` row (PIT projection).
+      properties:
+        entity_id:
+          type: string
+          example: ASL-ENT-00000001
+        filing_id:
+          type: string
+          example: KAP-2024-1234567
+        statement_type:
+          type: string
+          enum: [balance_sheet, income_statement, cash_flow, equity_changes]
+          example: income_statement
+        line_code:
+          type: string
+          example: revenue_total
+        consolidation:
+          type: string
+          enum: [solo, consolidated]
+          example: consolidated
+        period_end:
+          type: string
+          format: date
+          example: 2024-12-31
+        value:
+          type: number
+          example: 142500000000
+        unit:
+          type: string
+          example: TRY
+        currency:
+          type: string
+          example: TRY
+        as_of:
+          type: string
+          format: date-time
+          example: 2025-03-12T07:42:18Z
+      required:
+        - entity_id
+        - filing_id
+        - statement_type
+        - line_code
+        - consolidation
+        - period_end
+        - value
+        - unit
+        - as_of
+
+    CanonicalFinancial:
+      type: object
+      description: |
+        A `ts.canonical_financial` row (PIT projection). Per D8, TAS 29
+        restatements appear as new rows with later `as_of` and
+        `restatement_kind='tas29'`.
+      properties:
+        entity_id:
+          type: string
+          example: ASL-ENT-00000001
+        period_end:
+          type: string
+          format: date
+          example: 2023-12-31
+        line_item_id:
+          type: string
+          example: revenue_total
+        value:
+          type: number
+          example: 78400000000
+        unit:
+          type: string
+          example: TRY
+        restatement_kind:
+          type: string
+          description: Provenance tag per D8.
+          enum: [nominal, tas29, ifrs_restate, errata]
+          example: nominal
+        as_of:
+          type: string
+          format: date-time
+          example: 2024-03-15T08:12:33Z
+      required:
+        - entity_id
+        - period_end
+        - line_item_id
+        - value
+        - unit
+        - restatement_kind
+        - as_of
+
+    Entity:
+      type: object
+      description: |
+        A `ref.entity` row (PIT projection). Per D10, merges produce a
+        new row with `merged_from_entity_ids` populated; splits populate
+        `split_from_entity_id`.
+      properties:
+        entity_id:
+          type: string
+          pattern: '^ASL-ENT-[0-9]{8}$'
+          example: ASL-ENT-00000001
+        canonical_name:
+          type: string
+          description: Verbatim canonical name (Turkish preserved per ADR-002).
+          example: Türkiye Garanti Bankası A.Ş.
+        kind:
+          type: string
+          enum: [issuer, fund, sovereign, person, government, other]
+          example: issuer
+        country:
+          type: string
+          description: ISO 3166-1 alpha-2.
+          example: TR
+        merged_from_entity_ids:
+          type: array
+          items:
+            type: string
+            pattern: '^ASL-ENT-[0-9]{8}$'
+          description: Entities merged into this one (D10).
+          example: []
+        split_from_entity_id:
+          type: [string, 'null']
+          pattern: '^ASL-ENT-[0-9]{8}$'
+          description: Entity this one was split off from (D10); null otherwise.
+        as_of:
+          type: string
+          format: date-time
+          example: 2026-01-15T10:00:00Z
+      required:
+        - entity_id
+        - canonical_name
+        - kind
+        - country
+        - merged_from_entity_ids
+        - split_from_entity_id
+        - as_of
+
+    Identifier:
+      type: object
+      description: A `ref.identifier` row (PIT projection).
+      properties:
+        namespace:
+          type: string
+          enum: [bist_ticker, isin, vkn, mkk_id, kap_company_id, lei, cusip, sedol]
+          example: bist_ticker
+        value:
+          type: string
+          example: GARAN
+        entity_id:
+          type: string
+          pattern: '^ASL-ENT-[0-9]{8}$'
+          example: ASL-ENT-00000001
+        daterange:
+          type: array
+          minItems: 2
+          maxItems: 2
+          description: '`tstzrange [valid_from, valid_to)`; valid_to=null means open-ended.'
+          items:
+            type: [string, 'null']
+            format: date-time
+          example: ['2000-06-30T00:00:00Z', null]
+      required: [namespace, value, entity_id, daterange]
+
+    Disclosure:
+      type: object
+      description: |
+        A `kap.disclosures` row (PIT projection). Per D3, pre-bitemporal
+        rows carry `pre_bitemporal=true` and `as_of_provenance` documents
+        which column the `as_of` was derived from (or
+        `pre_bitemporal_unknown` for NULL `as_of`).
+      properties:
+        disclosure_id:
+          type: string
+          example: KAP-2024-1234567
+        kap_company_id:
+          type: string
+          example: '4028'
+        entity_id:
+          type: [string, 'null']
+          pattern: '^ASL-ENT-[0-9]{8}$'
+          example: ASL-ENT-00000001
+        form_type:
+          type: string
+          description: KAP form type code (Turkish; preserved verbatim).
+          example: ÖDA
+        title:
+          type: string
+          description: Disclosure title (Turkish; preserved verbatim per ADR-002).
+          example: Kâr Payı Dağıtım Bildirimi
+        published_at:
+          type: string
+          format: date-time
+          description: Official KAP publication time.
+          example: 2024-03-15T10:00:00Z
+        body_fetched:
+          type: boolean
+          example: true
+        body_fetched_at:
+          type: [string, 'null']
+          format: date-time
+          example: 2024-03-15T10:00:11Z
+        republished_as:
+          type: [string, 'null']
+          description: Disclosure ID of the amendment, if this was superseded.
+          example: KAP-2024-1234568
+        as_of:
+          type: [string, 'null']
+          format: date-time
+          description: Platform-known time; null for pre-bitemporal rows (D3).
+          example: 2024-03-15T10:00:11Z
+        as_of_provenance:
+          type: string
+          description: Column the `as_of` was derived from (D3).
+          enum: [received_at, body_fetched_at, index_fetched_at, published_at, inserted_at, pre_bitemporal_unknown]
+          example: body_fetched_at
+        pre_bitemporal:
+          type: boolean
+          description: True for the ~372k legacy rows with NULL `as_of`.
+          example: false
+        attributes:
+          type: object
+          description: |
+            Form-specific structured fields (e.g. dividend_amount_per_share).
+            Open object; per-form-type schemas are documented at
+            docs.aslanterminal.com/forms.
+          additionalProperties: true
+      required:
+        - disclosure_id
+        - kap_company_id
+        - form_type
+        - title
+        - published_at
+        - body_fetched
+        - as_of_provenance
+        - pre_bitemporal
+
+    Filing:
+      type: object
+      description: A `doc.filing` row (PIT projection).
+      properties:
+        filing_id:
+          type: string
+          example: DOC-FIL-00000001
+        entity_id:
+          type: string
+          pattern: '^ASL-ENT-[0-9]{8}$'
+          example: ASL-ENT-00000001
+        source_kind:
+          type: string
+          enum: [kap, bist, tcmb, mkk, tefas, other]
+          example: kap
+        source_filing_id:
+          type: string
+          example: KAP-2024-1234567
+        filed_at:
+          type: string
+          format: date-time
+          example: 2024-03-15T10:00:00Z
+        title:
+          type: string
+          example: Kâr Payı Dağıtım Bildirimi
+        as_of:
+          type: string
+          format: date-time
+          example: 2024-03-15T10:00:33Z
+      required: [filing_id, entity_id, source_kind, source_filing_id, filed_at, title, as_of]
+
+    FilingEvent:
+      type: object
+      description: |
+        An `agg.filing_event` row (PIT projection). Each event carries
+        `superseded_at` per the existing schema; PIT queries respect
+        `as_of` semantics.
+      properties:
+        event_id:
+          type: string
+          example: AGG-FE-2024-0000123
+        filing_id:
+          type: string
+          example: KAP-2024-1234567
+        entity_id:
+          type: string
+          pattern: '^ASL-ENT-[0-9]{8}$'
+          example: ASL-ENT-00000001
+        event_type:
+          type: string
+          description: One of the 32-event taxonomy values (Moat 7).
+          example: dividend_declared
+        event_seq:
+          type: integer
+          minimum: 1
+          example: 1
+        occurred_at:
+          type: string
+          format: date-time
+          example: 2024-03-15T10:00:00Z
+        attributes:
+          type: object
+          description: Event-type-specific structured fields.
+          additionalProperties: true
+        raw_quote:
+          type: string
+          description: Verbatim Turkish quote from the source body.
+          example: Yönetim Kurulumuzun 15.03.2024 tarihli kararıyla, hissedarlarımıza brüt 1,50 TL kâr payı dağıtılmasına karar verilmiştir.
+        as_of:
+          type: string
+          format: date-time
+          example: 2024-03-15T10:00:33Z
+        superseded_at:
+          type: [string, 'null']
+          format: date-time
+          description: Set when a later event row supersedes this one.
+      required:
+        - event_id
+        - filing_id
+        - entity_id
+        - event_type
+        - event_seq
+        - occurred_at
+        - attributes
+        - raw_quote
+        - as_of
+
+    # Per-endpoint envelopes (D15 generic-style via per-endpoint specialization).
+    ObservationListEnvelope:
+      type: object
+      description: Envelope wrapping a list of `Observation` rows.
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Observation'
+        metadata:
+          $ref: '#/components/schemas/EnvelopeMetadata'
+      required: [data, metadata]
+
+    FinancialLineItemListEnvelope:
+      type: object
+      description: Envelope wrapping a list of `FinancialLineItem` rows.
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/FinancialLineItem'
+        metadata:
+          $ref: '#/components/schemas/EnvelopeMetadata'
+      required: [data, metadata]
+
+    CanonicalFinancialListEnvelope:
+      type: object
+      description: Envelope wrapping a list of `CanonicalFinancial` rows.
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/CanonicalFinancial'
+        metadata:
+          $ref: '#/components/schemas/EnvelopeMetadata'
+      required: [data, metadata]
+
+    EntityListEnvelope:
+      type: object
+      description: Envelope wrapping a list of `Entity` rows.
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Entity'
+        metadata:
+          $ref: '#/components/schemas/EnvelopeMetadata'
+      required: [data, metadata]
+
+    EntityEnvelope:
+      type: object
+      description: Envelope wrapping a single `Entity`.
+      properties:
+        data:
+          $ref: '#/components/schemas/Entity'
+        metadata:
+          $ref: '#/components/schemas/EnvelopeMetadata'
+      required: [data, metadata]
+
+    IdentifierEnvelope:
+      type: object
+      description: Envelope wrapping a single `Identifier` resolution.
+      properties:
+        data:
+          $ref: '#/components/schemas/Identifier'
+        metadata:
+          $ref: '#/components/schemas/EnvelopeMetadata'
+      required: [data, metadata]
+
+    DisclosureListEnvelope:
+      type: object
+      description: Envelope wrapping a list of `Disclosure` rows.
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Disclosure'
+        metadata:
+          $ref: '#/components/schemas/EnvelopeMetadata'
+      required: [data, metadata]
+
+    DisclosureEnvelope:
+      type: object
+      description: Envelope wrapping a single `Disclosure`.
+      properties:
+        data:
+          $ref: '#/components/schemas/Disclosure'
+        metadata:
+          $ref: '#/components/schemas/EnvelopeMetadata'
+      required: [data, metadata]
+
+    FilingListEnvelope:
+      type: object
+      description: Envelope wrapping a list of `Filing` rows.
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Filing'
+        metadata:
+          $ref: '#/components/schemas/EnvelopeMetadata'
+      required: [data, metadata]
+
+    FilingEventListEnvelope:
+      type: object
+      description: Envelope wrapping a list of `FilingEvent` rows.
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/FilingEvent'
+        metadata:
+          $ref: '#/components/schemas/EnvelopeMetadata'
+      required: [data, metadata]
+
+    Moat2FailingCase:
+      type: object
+      description: A single canary case that did not match its expected pre/post amendment values.
+      properties:
+        case_id:
+          type: string
+          example: KAP-2023-AMEND-04
+        filing_id:
+          type: string
+          example: KAP-2023-9876543
+        field:
+          type: string
+          example: capital_increase_amount
+        as_of_before:
+          type: string
+          format: date-time
+          example: 2023-11-02T09:15:00Z
+        expected_before:
+          type: string
+          description: Stringified expected value at `as_of_before`.
+          example: '500000000'
+        observed_before:
+          type: string
+          description: Stringified observed value at `as_of_before`.
+          example: '750000000'
+        as_of_after:
+          type: string
+          format: date-time
+          example: 2023-11-02T14:45:00Z
+        expected_after:
+          type: string
+          example: '750000000'
+        observed_after:
+          type: string
+          example: '750000000'
+        diagnosis:
+          type: string
+          description: Free-form diagnosis from the canary script.
+          example: as_of_before query returned post-amendment value — append-only invariant breached
+      required:
+        - case_id
+        - filing_id
+        - field
+        - as_of_before
+        - expected_before
+        - observed_before
+        - as_of_after
+        - expected_after
+        - observed_after
+        - diagnosis
+
+    Moat2SampleAmendment:
+      type: object
+      description: |
+        A representative amendment showing the canary's load-bearing case:
+        `as_of_before` value differs from `as_of_after` value. Per ADR-003.
+      properties:
+        filing_id:
+          type: string
+          example: KAP-2024-1234567
+        field:
+          type: string
+          example: dividend_amount_per_share
+        as_of_before:
+          type: string
+          format: date-time
+          example: 2024-03-15T10:00:11Z
+        value_before:
+          type: string
+          example: '1.50'
+        as_of_after:
+          type: string
+          format: date-time
+          example: 2024-03-15T16:30:42Z
+        value_after:
+          type: string
+          example: '1.75'
+      required:
+        - filing_id
+        - field
+        - as_of_before
+        - value_before
+        - as_of_after
+        - value_after
+
+    Moat2VerificationResult:
+      type: object
+      description: Public canary result per D20 + ADR-003 §"Verification endpoint".
+      properties:
+        moat_2:
+          type: string
+          enum: [green, red]
+          description: green = every case passed last cycle; red = at least one failed.
+          example: green
+        last_run_at:
+          type: string
+          format: date-time
+          example: 2026-05-09T11:35:00Z
+        cases_total:
+          type: integer
+          minimum: 0
+          example: 12
+        cases_passing:
+          type: integer
+          minimum: 0
+          example: 12
+        failing_cases:
+          type: array
+          items:
+            $ref: '#/components/schemas/Moat2FailingCase'
+        canary_uptime_hours:
+          type: number
+          minimum: 0
+          description: Continuous green hours since last red→green transition.
+          example: 248.5
+        sample_amendment:
+          oneOf:
+            - $ref: '#/components/schemas/Moat2SampleAmendment'
+            - type: 'null'
+          description: |
+            A representative amendment from the canary case set. When the
+            canary is green, included as a Moat 2 demonstration; when red,
+            null.
+      required:
+        - moat_2
+        - last_run_at
+        - cases_total
+        - cases_passing
+        - failing_cases
+        - canary_uptime_hours
+
+    HealthResponse:
+      type: object
+      description: Health probe payload.
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+          example: ok
+        checks:
+          type: object
+          description: Per-subsystem status.
+          properties:
+            postgres:
+              type: string
+              enum: [ok, error]
+            feature_flags:
+              type: string
+              enum: [ok, error]
+            audit_log:
+              type: string
+              enum: [ok, error]
+          required: [postgres, feature_flags, audit_log]
+        error_detail:
+          type: string
+          description: Free-form on degraded status.
+        timestamp:
+          type: string
+          format: date-time
+      required: [status, checks, timestamp]
+
+    VersionResponse:
+      type: object
+      description: Server version + active feature flags.
+      properties:
+        name:
+          type: string
+          example: bitemporal-research-api
+        semver:
+          type: string
+          example: 1.0.0-alpha
+        commit_sha:
+          type: string
+          example: abc1234
+        built_at:
+          type: string
+          format: date-time
+          example: 2026-05-09T08:00:00Z
+        environment:
+          type: string
+          enum: [development, staging, production]
+          example: staging
+        feature_flags_active:
+          type: array
+          items:
+            type: string
+        feature_flags_disabled:
+          type: array
+          items:
+            type: string
+      required:
+        - name
+        - semver
+        - commit_sha
+        - built_at
+        - environment
+        - feature_flags_active
+        - feature_flags_disabled
