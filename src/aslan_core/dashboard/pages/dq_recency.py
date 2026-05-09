@@ -6,18 +6,22 @@ M1 will replace the body with the recency table backed by
 
 from __future__ import annotations
 
-from fasthtml.common import H1, Div, P
 from starlette.requests import Request
 from starlette.responses import HTMLResponse
 
+# Side-effect import: registers the shared DqStubVM template against
+# ``DqStubVM`` so render() can find a builder regardless of which dq
+# page is hit first.
+import aslan_core.dashboard.pages.dq_overview  # noqa: F401
 from aslan_core.dashboard.app import app
+from aslan_core.dashboard.render import render
+from aslan_core.dashboard.view_models import DqStubVM
 
 
 @app.get("/dq/recency")  # type: ignore[misc,untyped-decorator,unused-ignore]
 def dq_recency(request: Request) -> HTMLResponse:
-    _ = request
-    body = Div(
-        H1("Data Quality — Recency"),
-        P("M0 scaffold. Recency table will land in M1.", _id="dq-stub"),
+    vm = DqStubVM(
+        title="Data Quality — Recency",
+        body_message="M0 scaffold. Recency table will land in M1.",
     )
-    return HTMLResponse(str(body))
+    return render(request, vm)

@@ -269,6 +269,35 @@ class ReviewVM(_VMBase):
     couldn't process (oversized, parse-failed, low-confidence)."""
 
 
+# ── DQ M0 stubs ────────────────────────────────────────────────────
+
+
+class DqStubVM(_VMBase):
+    """M0 placeholder for the seven /dq/* pages.
+
+    M1+ will replace each route with a fully-typed VM (e.g.
+    ``DqOverviewVM``, ``DqRecencyVM``, ...) backed by real queries.
+    Until then, every stub page renders this VM through the standard
+    ``render(request, vm)`` helper so the dashboard's render-only-path
+    contract stays uniform across the route table.
+
+    Fields:
+
+      ``title`` — human-readable page title (e.g. "Data Quality —
+      Overview"). Rendered into ``<h1>``.
+
+      ``body_message`` — the M0 placeholder body text. Includes the
+      milestone where the real surface lands.
+
+      ``stub_id`` — fixed ``"dq-stub"`` literal so the scaffold smoke
+      test can grep the response without depending on rendered chrome.
+    """
+
+    title: str
+    body_message: str
+    stub_id: Literal["dq-stub"] = "dq-stub"
+
+
 # ── Error pages ────────────────────────────────────────────────────
 
 

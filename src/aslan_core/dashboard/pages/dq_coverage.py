@@ -6,18 +6,20 @@ M1 will replace the body with the coverage tables backed by
 
 from __future__ import annotations
 
-from fasthtml.common import H1, Div, P
 from starlette.requests import Request
 from starlette.responses import HTMLResponse
 
+# Side-effect import: registers the shared DqStubVM template.
+import aslan_core.dashboard.pages.dq_overview  # noqa: F401
 from aslan_core.dashboard.app import app
+from aslan_core.dashboard.render import render
+from aslan_core.dashboard.view_models import DqStubVM
 
 
 @app.get("/dq/coverage")  # type: ignore[misc,untyped-decorator,unused-ignore]
 def dq_coverage(request: Request) -> HTMLResponse:
-    _ = request
-    body = Div(
-        H1("Data Quality — Coverage"),
-        P("M0 scaffold. Coverage tables will land in M1.", _id="dq-stub"),
+    vm = DqStubVM(
+        title="Data Quality — Coverage",
+        body_message="M0 scaffold. Coverage tables will land in M1.",
     )
-    return HTMLResponse(str(body))
+    return render(request, vm)

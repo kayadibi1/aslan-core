@@ -6,18 +6,20 @@ per spec §10.6.
 
 from __future__ import annotations
 
-from fasthtml.common import H1, Div, P
 from starlette.requests import Request
 from starlette.responses import HTMLResponse
 
+# Side-effect import: registers the shared DqStubVM template.
+import aslan_core.dashboard.pages.dq_overview  # noqa: F401
 from aslan_core.dashboard.app import app
+from aslan_core.dashboard.render import render
+from aslan_core.dashboard.view_models import DqStubVM
 
 
 @app.get("/dq/bloomberg")  # type: ignore[misc,untyped-decorator,unused-ignore]
 def dq_bloomberg(request: Request) -> HTMLResponse:
-    _ = request
-    body = Div(
-        H1("Data Quality — Bloomberg Comparison"),
-        P("M0 scaffold. Bloomberg comparison will land in M4.", _id="dq-stub"),
+    vm = DqStubVM(
+        title="Data Quality — Bloomberg Comparison",
+        body_message="M0 scaffold. Bloomberg comparison will land in M4.",
     )
-    return HTMLResponse(str(body))
+    return render(request, vm)
