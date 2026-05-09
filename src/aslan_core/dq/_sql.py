@@ -111,3 +111,59 @@ SELECT_SPOT_CHECK_SAMPLE_BY_ID = text(
     "  stratum, labelled, labelled_at, labeller, recorded_at "
     "FROM audit.spot_check_sample WHERE sample_id = :sample_id"
 )
+
+
+# ── dq M4: bloomberg-comparison framework ────────────────────────
+
+
+SELECT_BLOOMBERG_RUN_BY_QUARTER = text(
+    "SELECT run_id, quarter, opened_at, closed_at "
+    "FROM audit.bloomberg_comparison_run WHERE quarter = :quarter"
+)
+
+INSERT_BLOOMBERG_RUN = text(
+    "INSERT INTO audit.bloomberg_comparison_run(quarter) VALUES (:quarter) RETURNING run_id"
+)
+
+INSERT_BLOOMBERG_CELL = text(
+    "INSERT INTO audit.bloomberg_comparison_cell("
+    "  run_id, entity_ticker, field"
+    ") VALUES (:run_id, :entity_ticker, :field) "
+    "ON CONFLICT (run_id, entity_ticker, field) DO NOTHING "
+    "RETURNING cell_id"
+)
+
+SELECT_BLOOMBERG_CELL_BY_ID = text(
+    "SELECT cell_id, run_id, entity_ticker, field, bloomberg_value, "
+    "  bloomberg_entered_by, bloomberg_entered_at, aslan_value, "
+    "  aslan_sampled_at, variance_pct, aslan_advantage "
+    "FROM audit.bloomberg_comparison_cell WHERE cell_id = :cell_id"
+)
+
+UPDATE_BLOOMBERG_CELL_BLOOMBERG_VALUE = text(
+    "UPDATE audit.bloomberg_comparison_cell SET "
+    "  bloomberg_value = :bloomberg_value, "
+    "  bloomberg_entered_by = :entered_by, "
+    "  bloomberg_entered_at = now() "
+    "WHERE cell_id = :cell_id"
+)
+
+UPDATE_BLOOMBERG_CELL_ASLAN_VALUE = text(
+    "UPDATE audit.bloomberg_comparison_cell SET "
+    "  aslan_value = :aslan_value, "
+    "  aslan_sampled_at = now(), "
+    "  variance_pct = :variance_pct, "
+    "  aslan_advantage = :aslan_advantage "
+    "WHERE cell_id = :cell_id"
+)
+
+SELECT_BLOOMBERG_NULL_CELL_COUNT = text(
+    "SELECT count(*)::int AS n FROM audit.bloomberg_comparison_cell "
+    "WHERE run_id = :run_id AND bloomberg_value IS NULL"
+)
+
+UPDATE_BLOOMBERG_RUN_CLOSE = text(
+    "UPDATE audit.bloomberg_comparison_run SET "
+    "  closed_at = now(), closed_by = :closed_by "
+    "WHERE run_id = :run_id AND closed_at IS NULL"
+)
