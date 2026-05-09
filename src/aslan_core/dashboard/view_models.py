@@ -423,6 +423,60 @@ class DqSpotCheckSampleDetailVM(_VMBase):
     existing_results: list[DqSpotCheckResultRowVM]
 
 
+# ── DQ M4: Bloomberg comparison ───────────────────────────────────
+
+
+class DqBloombergCellRowVM(_VMBase):
+    """One cell row for the per-entity grid on /dq/bloomberg."""
+
+    cell_id: UUID
+    entity_ticker: str
+    field: str
+    bloomberg_value: str | None
+    aslan_value: str | None
+    variance_pct: float | None
+    aslan_advantage: Literal["wins", "ties", "loses"] | None
+
+
+class DqBloombergRunSummaryVM(_VMBase):
+    """Per-run summary block for the /dq/bloomberg overview page."""
+
+    run_id: UUID
+    quarter: str
+    opened_at: datetime
+    closed_at: datetime | None
+    wins: int
+    ties: int
+    loses: int
+    total_cells: int
+    null_bloomberg_cells: int
+    """How many cells still need a manual Bloomberg value. The cell-entry
+    form surfaces this count so the labeller knows the queue depth."""
+
+
+class DqBloombergOverviewVM(_VMBase):
+    """Top-of-page view: latest run summary + per-cell grid + history."""
+
+    latest_run: DqBloombergRunSummaryVM | None
+    """``None`` when no run has been opened yet — the page renders a
+    short prompt instead of the grid."""
+
+    cells: list[DqBloombergCellRowVM]
+    """All cells of the latest run, ordered by (entity_ticker, field).
+    Empty list when ``latest_run`` is None."""
+
+    closed_runs: list[DqBloombergRunSummaryVM]
+    """History block — past CLOSED runs, newest first. Click-through
+    to ``/dq/bloomberg/runs/<run_id>`` shows that run's grid."""
+
+
+class DqBloombergRunDetailVM(_VMBase):
+    """Per-run detail page for /dq/bloomberg/runs/<run_id>."""
+
+    run: DqBloombergRunSummaryVM
+    cells: list[DqBloombergCellRowVM]
+
+
 # ── DQ M0 stubs ────────────────────────────────────────────────────
 
 

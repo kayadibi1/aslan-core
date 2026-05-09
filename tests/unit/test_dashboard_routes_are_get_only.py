@@ -35,6 +35,11 @@ _MUTATION_ROUTES: frozenset[str] = frozenset(
         # aslan_core.dashboard.pages.dq_spot_check for the role +
         # privilege boundary contract.
         "/dq/spot-check/{sample_id}",
+        # dq M4: Bloomberg-comparison manual-entry form. See
+        # aslan_core.dashboard.pages.dq_bloomberg for the role +
+        # privilege boundary contract — column-level UPDATE on
+        # `bloomberg_value` is granted to audit_admin only.
+        "/dq/bloomberg/cells/{cell_id}",
     }
 )
 # POST is the only mutation method permitted on allowlisted routes.

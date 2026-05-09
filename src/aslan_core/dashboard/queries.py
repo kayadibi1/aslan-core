@@ -52,6 +52,10 @@ from aslan_core.dashboard.view_models import (
     AuditVM,
     DocumentRowVM,
     DocumentsVM,
+    DqBloombergCellRowVM,
+    DqBloombergOverviewVM,
+    DqBloombergRunDetailVM,
+    DqBloombergRunSummaryVM,
     DqCoverageRowVM,
     DqCoverageVM,
     DqHeatmapCellState,
@@ -956,10 +960,129 @@ async def dq_spot_check_sample_detail(
     )
 
 
+# ── DQ M4: Bloomberg-comparison ───────────────────────────────────
+
+
+_BLOOMBERG_LATEST_RUN_SQL = text(
+    "SELECT run_id, quarter, opened_at, closed_at "
+    "FROM audit.bloomberg_comparison_run "
+    "ORDER BY opened_at DESC LIMIT 1"
+)
+
+
+_BLOOMBERG_RUN_BY_ID_SQL = text(
+    "SELECT run_id, quarter, opened_at, closed_at "
+    "FROM audit.bloomberg_comparison_run WHERE run_id = :run_id"
+)
+
+
+_BLOOMBERG_CELLS_FOR_RUN_SQL = text(
+    "SELECT cell_id, entity_ticker, field, bloomberg_value, aslan_value, "
+    "  variance_pct, aslan_advantage "
+    "FROM audit.bloomberg_comparison_cell "
+    "WHERE run_id = :run_id "
+    "ORDER BY entity_ticker, field"
+)
+
+
+_BLOOMBERG_CLOSED_RUNS_SQL = text(
+    "SELECT run_id, quarter, opened_at, closed_at "
+    "FROM audit.bloomberg_comparison_run "
+    "WHERE closed_at IS NOT NULL "
+    "ORDER BY closed_at DESC LIMIT :limit"
+)
+
+
+_BLOOMBERG_RUN_AGGREGATES_SQL = text(
+    "SELECT "
+    "  count(*) FILTER (WHERE aslan_advantage = 'wins')::int AS wins, "
+    "  count(*) FILTER (WHERE aslan_advantage = 'ties')::int AS ties, "
+    "  count(*) FILTER (WHERE aslan_advantage = 'loses')::int AS loses, "
+    "  count(*)::int AS total_cells, "
+    "  count(*) FILTER (WHERE bloomberg_value IS NULL)::int AS null_bloomberg "
+    "FROM audit.bloomberg_comparison_cell WHERE run_id = :run_id"
+)
+
+
+async def _bloomberg_run_summary(session: AsyncSession, *, run_row: Any) -> DqBloombergRunSummaryVM:
+    aggs = (await session.execute(_BLOOMBERG_RUN_AGGREGATES_SQL, {"run_id": run_row.run_id})).one()
+    return DqBloombergRunSummaryVM(
+        run_id=run_row.run_id,
+        quarter=str(run_row.quarter),
+        opened_at=run_row.opened_at,
+        closed_at=run_row.closed_at,
+        wins=int(aggs.wins),
+        ties=int(aggs.ties),
+        loses=int(aggs.loses),
+        total_cells=int(aggs.total_cells),
+        null_bloomberg_cells=int(aggs.null_bloomberg),
+    )
+
+
+def _bloomberg_cell_row(row: Any) -> DqBloombergCellRowVM:
+    advantage = row.aslan_advantage if row.aslan_advantage in {"wins", "ties", "loses"} else None
+    return DqBloombergCellRowVM(
+        cell_id=row.cell_id,
+        entity_ticker=str(row.entity_ticker),
+        field=str(row.field),
+        bloomberg_value=row.bloomberg_value,
+        aslan_value=row.aslan_value,
+        variance_pct=float(row.variance_pct) if row.variance_pct is not None else None,
+        aslan_advantage=advantage,
+    )
+
+
+async def dq_bloomberg_overview(session: AsyncSession) -> DqBloombergOverviewVM:
+    """Latest run summary + cells + history block for /dq/bloomberg."""
+    latest = (await session.execute(_BLOOMBERG_LATEST_RUN_SQL)).one_or_none()
+    if latest is None:
+        return DqBloombergOverviewVM(
+            latest_run=None,
+            cells=[],
+            closed_runs=[],
+        )
+    summary = await _bloomberg_run_summary(session, run_row=latest)
+    cell_rows = (
+        await session.execute(_BLOOMBERG_CELLS_FOR_RUN_SQL, {"run_id": latest.run_id})
+    ).all()
+    cells = [_bloomberg_cell_row(r) for r in cell_rows]
+    closed_run_rows = (await session.execute(_BLOOMBERG_CLOSED_RUNS_SQL, {"limit": 12})).all()
+    closed_runs: list[DqBloombergRunSummaryVM] = []
+    for cr in closed_run_rows:
+        if cr.run_id == latest.run_id:
+            # The latest_run block already carries the latest run's
+            # aggregates; skip it here so the History list is strictly
+            # "older than latest".
+            continue
+        closed_runs.append(await _bloomberg_run_summary(session, run_row=cr))
+    return DqBloombergOverviewVM(
+        latest_run=summary,
+        cells=cells,
+        closed_runs=closed_runs,
+    )
+
+
+async def dq_bloomberg_run_detail(
+    session: AsyncSession, *, run_id: UUID
+) -> DqBloombergRunDetailVM | None:
+    """One-run grid view for /dq/bloomberg/runs/<run_id>."""
+    run_row = (await session.execute(_BLOOMBERG_RUN_BY_ID_SQL, {"run_id": run_id})).one_or_none()
+    if run_row is None:
+        return None
+    summary = await _bloomberg_run_summary(session, run_row=run_row)
+    cell_rows = (
+        await session.execute(_BLOOMBERG_CELLS_FOR_RUN_SQL, {"run_id": run_row.run_id})
+    ).all()
+    cells = [_bloomberg_cell_row(r) for r in cell_rows]
+    return DqBloombergRunDetailVM(run=summary, cells=cells)
+
+
 __all__ = [
     "audit_recent",
     "deadletter_recent",
     "documents_recent",
+    "dq_bloomberg_overview",
+    "dq_bloomberg_run_detail",
     "dq_coverage",
     "dq_overview",
     "dq_recency",

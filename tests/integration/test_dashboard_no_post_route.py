@@ -31,7 +31,12 @@ pytestmark = pytest.mark.integration
 
 # Routes permitted to expose POST. Mirrors the unit-test allowlist
 # in tests/unit/test_dashboard_routes_are_get_only.py.
-_MUTATION_ROUTES: frozenset[str] = frozenset({"/dq/spot-check/{sample_id}"})
+_MUTATION_ROUTES: frozenset[str] = frozenset(
+    {
+        "/dq/spot-check/{sample_id}",
+        "/dq/bloomberg/cells/{cell_id}",
+    }
+)
 
 
 def _gettable_paths() -> list[str]:
@@ -54,6 +59,8 @@ def _gettable_paths() -> list[str]:
         # the route resolves rather than 404-ing before the 405 check.
         if "{" in path:
             path = path.replace("{sample_id}", "00000000-0000-0000-0000-000000000000")
+            path = path.replace("{cell_id}", "00000000-0000-0000-0000-000000000000")
+            path = path.replace("{run_id}", "00000000-0000-0000-0000-000000000000")
         paths.append(path)
     return paths
 
