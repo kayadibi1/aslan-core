@@ -39,10 +39,9 @@ info:
       default_staging: true
       default_prod: true
       decision: D2
-    - name: BITEMPORAL_API_ALLOW_NULL_AS_OF
-      default_staging: true
-      default_prod: true
-      decision: D3
+    # BITEMPORAL_API_ALLOW_NULL_AS_OF retired round 8; migration
+    # 0051's kap.disclosures_version.as_of NOT NULL makes the
+    # behavior unreachable. See SCOPE.md "Retired flags" section.
     - name: BITEMPORAL_API_AUTH_ADDITIONAL_SCHEMES
       default_staging: empty
       default_prod: empty
@@ -117,9 +116,12 @@ tags:
     description: Cross-source entity resolution via `ref.identifier` (Moat 6).
   - name: disclosures
     description: |
-      KAP disclosures with pre-bitemporal handling (D3). 462k rows total,
-      ~89.7k carry sensible `as_of`; the remainder are NULL-as_of and
-      surface only with `include_pre_bitemporal=true`.
+      KAP disclosures via `kap.disclosures_at(:as_of)` (migration 0051,
+      SCD-4 bitemporal upgrade). All 462k existing rows are backfilled
+      into `kap.disclosures_version` with non-null `as_of` and an
+      `as_of_provenance` enum tag indicating how the timestamp was
+      sourced (`index_fetched_at`, `body_fetched_at`,
+      `pre_bitemporal_unknown`). Per D3 (round-8 revision).
   - name: filings
     description: |
       `doc.filing` PIT exposure. Empty until `aslan-event-extractor` M0
@@ -294,15 +296,25 @@ paths:
         - $ref: '#/components/parameters/EntityId'
         - name: filing_id
           in: query
+          description: |
+            `doc.filing.filing_id` UUID (NOT the KAP-string disclosure
+            ID — that's `kap_company_id` / `disclosure_id` on the
+            `/disclosures` surface). Per migration 0029.
           schema:
             type: string
-            example: KAP-2024-1234567
+            format: uuid
+            example: 0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d
         - name: statement_type
           in: query
+          description: |
+            Short statement-type code per `ts.financial_line_item`
+            schema (migration 0029):
+            `bs` (balance sheet), `is` (income statement),
+            `cf` (cash flow), `eq` (equity changes), `notes`.
           schema:
             type: string
-            enum: [balance_sheet, income_statement, cash_flow, equity_changes]
-            example: income_statement
+            enum: [bs, is, cf, eq, notes]
+            example: is
         - name: line_code
           in: query
           schema:
@@ -805,16 +817,24 @@ paths:
         Returns rows from `kap.disclosures` as known at `as_of`. Backed by
         `kap.disclosures_at(p_as_of)`.
 
-        **Pre-bitemporal handling (D3):** of 462,018 historical rows,
-        ~89,700 carry a sensible `as_of` (derived from `body_fetched_at`,
-        `index_fetched_at`, or `published_at` per provenance). The remaining
-        ~372k rows have `as_of=NULL` and `as_of_provenance='pre_bitemporal_unknown'`.
+        **Pre-bitemporal handling (D3, round-8 revision):** all 462,018
+        historical rows backfilled by migration 0051 carry a non-null `as_of`
+        (`kap.disclosures_version.as_of` is `NOT NULL` and is part of the
+        primary key). The `as_of_provenance` enum tags how `as_of` was
+        sourced — `body_fetched_at` for the ~89.7k rows with a real fetch
+        timestamp, `index_fetched_at` for the rest, with
+        `pre_bitemporal_unknown` reserved for future schemas where the
+        source's `index_fetched_at` could be NULL (not emitted by the
+        current production backfill).
 
-        - By default these NULL-as_of rows are **excluded** from the response
-          (honest about uncertainty).
-        - Pass `include_pre_bitemporal=true` to include them; the response
-          envelope flags `metadata.warnings` accordingly and each row carries
-          `pre_bitemporal=true`.
+        - PIT mode default (`as_of=T`, no flag): rows with `as_of <= T`.
+        - `include_pre_bitemporal=true` (PIT only) additionally surfaces
+          rows whose `as_of_provenance='pre_bitemporal_unknown'` (no
+          such rows in current prod data; reserved for forward-compat).
+        - Combining `include_pre_bitemporal=true` with `as_of_range` is
+          rejected with 400 `BITEMPORAL_INTERVAL_INVALID` (the
+          `*_version` history table already includes every row in
+          interval mode).
       parameters:
         - $ref: '#/components/parameters/AsOf'
         - $ref: '#/components/parameters/AsOfRange'
@@ -903,7 +923,7 @@ paths:
                       feature_flags_active:
                         - BITEMPORAL_API_ENABLED
                         - BITEMPORAL_API_KAP_APPEND_ONLY_TRIGGER
-                        - BITEMPORAL_API_ALLOW_NULL_AS_OF
+                        - BITEMPORAL_API_INTERVAL_QUERIES
                       warnings: []
                       request_id: 2a1b0c9d-8e7f-6a5b-4c3d-2e1f0a9b8c7d
                       served_by: bitemporal-api/abc1234
@@ -1467,7 +1487,6 @@ paths:
                     feature_flags_active:
                       - BITEMPORAL_API_ENABLED
                       - BITEMPORAL_API_INTERVAL_QUERIES
-                      - BITEMPORAL_API_ALLOW_NULL_AS_OF
                       - BITEMPORAL_API_RATE_LIMIT_ENFORCED
                       - BITEMPORAL_API_AUDIT_LOG_ENABLED
                       - BITEMPORAL_API_COST_LIMITS_ENFORCED
@@ -1995,11 +2014,11 @@ components:
         code:
           type: string
           description: Machine-readable warning code.
-          example: PRE_BITEMPORAL_ROWS_INCLUDED
+          example: PRE_BITEMPORAL_TABLE
         message:
           type: string
           description: Human-readable explanation.
-          example: 372,318 rows with as_of=NULL included due to include_pre_bitemporal=true.
+          example: This endpoint reads a Class F table (doc.filing) without a PIT function in v1; rows reflect current state regardless of as_of.
         rows_affected:
           type: integer
           minimum: 0
@@ -2163,14 +2182,25 @@ components:
       properties:
         entity_id:
           type: string
-          example: ASL-ENT-00000001
+          format: uuid
+          description: Per `ref.entity.entity_id`.
+          example: 9c2f3a1b-1d4e-4a5b-8e7f-3c2d1b0a9e8f
         filing_id:
           type: string
-          example: KAP-2024-1234567
+          format: uuid
+          description: |
+            `doc.filing.filing_id` UUID (NOT the KAP-string disclosure
+            ID — that lives on the `/disclosures` surface). Per
+            migration 0029.
+          example: 0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d
         statement_type:
           type: string
-          enum: [balance_sheet, income_statement, cash_flow, equity_changes]
-          example: income_statement
+          enum: [bs, is, cf, eq, notes]
+          description: |
+            `bs` balance sheet, `is` income statement, `cf` cash
+            flow, `eq` equity changes, `notes`. Per migration 0029
+            CHECK constraint.
+          example: is
         line_code:
           type: string
           example: revenue_total
@@ -2345,10 +2375,15 @@ components:
     Disclosure:
       type: object
       description: |
-        A `kap.disclosures` row (PIT projection). Per D3, pre-bitemporal
-        rows carry `pre_bitemporal=true` and `as_of_provenance` documents
-        which column the `as_of` was derived from (or
-        `pre_bitemporal_unknown` for NULL `as_of`).
+        A `kap.disclosures` row (PIT projection via
+        `kap.disclosures_at(:as_of)` or interval-mode scan of
+        `kap.disclosures_version`). Per D3 (round-8 revision), every
+        backfilled row carries a non-null `as_of`; the
+        `as_of_provenance` enum tags how the timestamp was sourced.
+        `pre_bitemporal` is true iff `as_of_provenance =
+        'pre_bitemporal_unknown'` — a value reserved for future
+        schemas where the source `index_fetched_at` is NULL (not
+        emitted by the current production backfill).
       properties:
         disclosure_id:
           type: string
@@ -2410,18 +2445,32 @@ components:
           enum: [indexed, body_fetched, republished, updated, deleted, null]
           example: body_fetched
         as_of:
-          type: [string, 'null']
+          type: string
           format: date-time
-          description: Platform-known time; null for pre-bitemporal rows (D3).
+          description: |
+            Platform-known time. Per D3 (round-8 revision), always
+            non-null — backfill rows receive a proxy timestamp from
+            `index_fetched_at` / `body_fetched_at` and the
+            `as_of_provenance` enum tags which column it was sourced
+            from.
           example: 2024-03-15T10:00:11Z
         as_of_provenance:
           type: string
-          description: Column the `as_of` was derived from (D3).
-          enum: [received_at, body_fetched_at, index_fetched_at, published_at, inserted_at, pre_bitemporal_unknown]
+          description: |
+            Column the `as_of` was sourced from (D3 round-8). `live`
+            for trigger-emitted versions; `index_fetched_at` /
+            `body_fetched_at` / `published_at` for migration-0051
+            backfill rows; `pre_bitemporal_unknown` reserved for
+            future schemas where the source timestamp can be NULL
+            (not emitted by current production data).
+          enum: [live, index_fetched_at, body_fetched_at, published_at, pre_bitemporal_unknown]
           example: body_fetched_at
         pre_bitemporal:
           type: boolean
-          description: True for the ~372k legacy rows with NULL `as_of`.
+          description: |
+            True iff `as_of_provenance == 'pre_bitemporal_unknown'`.
+            False for all current production backfill rows; reserved
+            for forward-compat with stricter schemas.
           example: false
         attributes:
           type: object

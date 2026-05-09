@@ -431,9 +431,14 @@ weakened by sentinel "as if known" timestamps.
 
 **Reversibility:** MEDIUM. Adopting a sentinel later would require
 a backfill.
-**Status:** PROVISIONAL (paired with D3).
-**Feature flag:** `BITEMPORAL_API_ALLOW_NULL_AS_OF` (same as D3).
-**Evidence:** `bitemporal-api-prompt.md` D14 prompt.
+**Status:** FINAL (round 8). Paired with D3 — the
+`kap.disclosures_version.as_of NOT NULL` schema makes "no NULL"
+structurally enforced for the only large pre-bitemporal table; no
+flag needed.
+**Feature flag:** none. (`BITEMPORAL_API_ALLOW_NULL_AS_OF` was
+retired in round 8 alongside D3's status flip; the behavior it
+gated is no longer reachable.)
+**Evidence:** `bitemporal-api-prompt.md` D14 prompt; D3 (revised).
 
 ### D15 — Response envelope
 
@@ -903,7 +908,6 @@ must be deliberately enabled per environment).
 |---|---|---|---|
 | `BITEMPORAL_API_ENABLED` (master) | `true` after Phase 5 gate | `false` until Phase 7e | D27 |
 | `BITEMPORAL_API_INTERVAL_QUERIES` | `true` | `true` after canary green ≥1h | D2 |
-| `BITEMPORAL_API_ALLOW_NULL_AS_OF` | `true` | `true` after canary green ≥1h | D3, D14 |
 | `BITEMPORAL_API_AUTH_ADDITIONAL_SCHEMES` | empty | empty | D5 |
 | `BITEMPORAL_API_RATE_LIMIT_ENFORCED` | `true` | `true` | D6 |
 | `BITEMPORAL_API_CURSOR_VERSION` | `1` | `1` | D7 |
@@ -923,6 +927,17 @@ Flags read from environment variables, with per-key overrides via
 `BITEMPORAL_API_ENABLED` overrides every other; if it is `false`,
 every endpoint returns `503 FEATURE_DISABLED` regardless of other
 flags' state.
+
+### Retired flags
+
+- `BITEMPORAL_API_ALLOW_NULL_AS_OF` — retired round 8 alongside the
+  D3 status flip (PROVISIONAL → FINAL). Its original purpose was to
+  gate the `as_of=NULL` surface on `kap.disclosures`; migration 0051's
+  `kap.disclosures_version.as_of NOT NULL` schema makes that path
+  structurally unreachable. The seed row inserted by migration 0048
+  remains for upgrade compatibility but is a no-op; a future
+  migration may DELETE it once consumers verify nothing reads the
+  flag's value.
 
 ---
 

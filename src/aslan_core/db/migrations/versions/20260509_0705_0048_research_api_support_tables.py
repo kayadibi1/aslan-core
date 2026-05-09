@@ -120,7 +120,16 @@ def upgrade() -> None:
              'Per D27/H7, enable per-environment after Phase 5 gate (staging) '
              'or Phase 7e (production).'),
             ('BITEMPORAL_API_INTERVAL_QUERIES', true, 'global', 'D2'),
-            ('BITEMPORAL_API_ALLOW_NULL_AS_OF', true, 'global', 'D3 + D14'),
+            -- BITEMPORAL_API_ALLOW_NULL_AS_OF retired in round 8;
+            -- migration 0051's kap.disclosures_version.as_of NOT NULL
+            -- makes the gated behavior unreachable. Row preserved
+            -- here for upgrade compatibility but marked retired in
+            -- the notes column so operators don't expect it to do
+            -- anything.
+            ('BITEMPORAL_API_ALLOW_NULL_AS_OF', true, 'global',
+             'RETIRED round 8 (D3 PROVISIONAL->FINAL). No-op flag; '
+             'the NULL-as_of behavior it gated is not reachable '
+             'because kap.disclosures_version.as_of is NOT NULL.'),
             ('BITEMPORAL_API_RATE_LIMIT_ENFORCED', true, 'global', 'D6'),
             ('BITEMPORAL_API_TAS29_RESTATEMENT_CHAIN', false, 'global', 'D8 — flip true after Phase 2j'),
             ('BITEMPORAL_API_ENTITY_MERGE_LINEAGE', false, 'global', 'D10 — flip true after Phase 2j'),
