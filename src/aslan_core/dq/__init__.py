@@ -23,19 +23,19 @@ Forward-deferred to later milestones:
 
 from __future__ import annotations
 
-from aslan_core.dq import sync_log
+from aslan_core.dq import coverage, event, sync_log, validation
 from aslan_core.dq.types import (
     Severity,
     SyncRunStatus,
     ValidationFailure,
 )
 
-# NOTE: validation, coverage, event modules land in subsequent M0 tasks
-# (Task 7/8/9). Re-exports added here when those modules exist.
-
 __all__ = [
     "Severity",
     "SyncRunStatus",
     "ValidationFailure",
+    "coverage",
+    "event",
     "sync_log",
+    "validation",
 ]
