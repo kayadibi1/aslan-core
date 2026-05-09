@@ -236,12 +236,17 @@ def _wipe_canonical_financial_seed(
             "WHERE entity_id = %s AND canonical_code = %s",
             (entity_id, canonical_code),
         )
+        # Migration 0046 installs an AFTER DELETE trigger on ref.entity
+        # that inserts a 'deleted' version row into ref.entity_version.
+        # Delete the parent first so the trigger emits its row, THEN
+        # wipe ref.entity_version (catches the trigger-emitted row plus
+        # any others). Pass-3 finding 6.
         cur.execute(
-            "DELETE FROM ref.entity_version WHERE entity_id = %s",
+            "DELETE FROM ref.entity WHERE entity_id = %s",
             (entity_id,),
         )
         cur.execute(
-            "DELETE FROM ref.entity WHERE entity_id = %s",
+            "DELETE FROM ref.entity_version WHERE entity_id = %s",
             (entity_id,),
         )
         cur.execute(
@@ -318,12 +323,17 @@ def _seed_entity_versions(
 
 def _wipe_entity_seed(dsn: str, *, entity_id: str, run_id: int) -> None:
     with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+        # Migration 0046 installs an AFTER DELETE trigger on ref.entity
+        # that inserts a 'deleted' version row into ref.entity_version.
+        # Delete the parent first so the trigger emits its row, THEN
+        # wipe ref.entity_version (catches the trigger-emitted row plus
+        # any others). Pass-3 finding 6.
         cur.execute(
-            "DELETE FROM ref.entity_version WHERE entity_id = %s",
+            "DELETE FROM ref.entity WHERE entity_id = %s",
             (entity_id,),
         )
         cur.execute(
-            "DELETE FROM ref.entity WHERE entity_id = %s",
+            "DELETE FROM ref.entity_version WHERE entity_id = %s",
             (entity_id,),
         )
         cur.execute(
@@ -412,12 +422,17 @@ def _wipe_disclosure_seed(
             "DELETE FROM kap.disclosures_version WHERE disclosure_id = %s",
             (disclosure_id,),
         )
+        # Migration 0046 installs an AFTER DELETE trigger on ref.entity
+        # that inserts a 'deleted' version row into ref.entity_version.
+        # Delete the parent first so the trigger emits its row, THEN
+        # wipe ref.entity_version (catches the trigger-emitted row plus
+        # any others). Pass-3 finding 6.
         cur.execute(
-            "DELETE FROM ref.entity_version WHERE entity_id = %s",
+            "DELETE FROM ref.entity WHERE entity_id = %s",
             (entity_id,),
         )
         cur.execute(
-            "DELETE FROM ref.entity WHERE entity_id = %s",
+            "DELETE FROM ref.entity_version WHERE entity_id = %s",
             (entity_id,),
         )
         cur.execute(

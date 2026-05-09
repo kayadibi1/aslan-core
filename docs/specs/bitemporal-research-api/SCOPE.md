@@ -134,37 +134,50 @@ on staging, `true` on production once Moat 2 canary green ≥1h
 (matches D27 master flag).
 **Evidence:** Phase 4f of `bitemporal-api-prompt.md`.
 
-### D3 — Pre-bitemporal `kap.disclosures` rows
+### D3 — Pre-bitemporal `kap.disclosures` rows (revised round 8)
 
-**Decision:** For the 462k existing `kap.disclosures` rows:
+**Decision:** For the 462k existing `kap.disclosures` rows backfilled
+into `kap.disclosures_version` by migration 0051:
 
-- For rows where `body_fetched=true` (89.7k rows), populate
-  `as_of` from `received_at` if column exists, else from
-  `body_fetched_at`, else from `inserted_at`. Use the earliest
-  available column with documented semantics
-  ("`as_of_provenance`" enum: `received_at`, `body_fetched_at`,
-  `inserted_at`, `pre_bitemporal_unknown`).
-- For the remaining ~372k rows, `as_of` is **NULL** with
-  `as_of_provenance='pre_bitemporal_unknown'`. Per ADR-002 we do
-  not fabricate timestamps.
-- API queries with explicit `?as_of=T` exclude
-  `as_of IS NULL` rows by default (honest about uncertainty).
-- API queries with `?include_pre_bitemporal=true` include them with
-  a per-row `metadata.pre_bitemporal=true` marker; the response
-  envelope flags `metadata.warnings` so clients know.
+- Every backfilled row carries a non-null `as_of` (the SCD-4 history
+  table defines `as_of TIMESTAMPTZ NOT NULL` and uses it as part of
+  the primary key). The originally-proposed "`as_of=NULL` for the
+  ~372k rows" path is structurally infeasible without a schema change.
+- The `as_of_provenance` enum tags how `as_of` was sourced:
+  `index_fetched_at` (default for the indexed pass), `body_fetched_at`
+  (added by the second-pass body fetch), `published_at`,
+  `pre_bitemporal_unknown` (reserved for future schemas where
+  `kap.disclosures.index_fetched_at` could be NULL — not emitted in
+  the current production data because that column is also NOT NULL).
+- API queries with `?as_of=T` exclude rows from
+  `kap.disclosures_at(T)` whose `as_of > T`; that's the standard
+  PIT contract.
+- API queries with `?include_pre_bitemporal=true` (PIT mode only)
+  also surface rows whose `as_of_provenance = 'pre_bitemporal_unknown'`
+  via a UNION-style branch in the disclosures route. Combining this
+  flag with `?as_of_range=...` returns 400
+  `BITEMPORAL_INTERVAL_INVALID` (per pass-3 finding 3 — interval mode
+  already scans `kap.disclosures_version` directly and would
+  double-count).
+- The per-row response carries `as_of_provenance` (enum) and
+  `pre_bitemporal: bool` (true iff
+  `as_of_provenance == 'pre_bitemporal_unknown'`).
 
-**Rationale (P1):** Better to surface NULL than invent. The Moat 2
-contract says "what did the platform know at T?"; for these rows
-we genuinely do not know — saying so is the correct answer.
+**Rationale (P1):** Better to record a proxy timestamp with the
+provenance tag than NULL. The Moat 2 contract is preserved: clients
+querying `as_of=T` for a row tagged `index_fetched_at` see what the
+platform knew at the index-fetch moment, which IS the platform's
+real first-knowledge of the disclosure. The original "NULL" framing
+predated the schema choice; the actual contract is more honest.
 
-**Reversibility:** LOW. Once the column is populated, undoing it
-loses the provenance trail.
-**Status:** PROVISIONAL.
-**Feature flag:** `BITEMPORAL_API_ALLOW_NULL_AS_OF` (default `true`
-on staging — needed for any data; required `true` on production
-once D27 master flag enabled).
-**Evidence:** STATE.md (462k disclosure rows); EXISTING_PATTERNS_AUDIT.md
-column inventory.
+**Reversibility:** LOW. The schema (`as_of NOT NULL`) is set; the
+provenance enum could be extended without breakage. Reverting to
+NULL `as_of` would require a backwards-incompatible migration.
+**Status:** FINAL (round 8 — implementation matches contract).
+**Feature flag:** `BITEMPORAL_API_ALLOW_NULL_AS_OF` (retired; the
+behavior it gated is no longer reachable).
+**Evidence:** STATE.md (462k disclosure rows); migration 0051's
+`kap.disclosures_version` schema + backfill CASE; pass-3 finding 2.
 
 ### D4 — API surface
 

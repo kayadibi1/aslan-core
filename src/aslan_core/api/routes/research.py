@@ -281,7 +281,11 @@ def _gate_interval_flag(
     """
     if as_of_range is None:
         return
-    if not flags.enabled.get("BITEMPORAL_API_INTERVAL_QUERIES", False):
+    # Default is True per SCOPE.md D2 / migration 0048 seeded value.
+    # On a partially-seeded environment where the flag row is absent,
+    # we must NOT fail-closed (would silently disable interval mode);
+    # only an explicit value_bool=false rejects.
+    if not flags.enabled.get("BITEMPORAL_API_INTERVAL_QUERIES", True):
         raise HTTPException(
             status_code=503,
             detail={
@@ -928,6 +932,14 @@ async def financials_line_items(
     as_of: str | None = Query(default=None),
     as_of_range: str | None = Query(default=None),
     entity_id: UUID | None = Query(default=None),
+    filing_id: UUID | None = Query(default=None),
+    statement_type: str | None = Query(
+        default=None,
+        pattern="^(bs|is|cf|eq|notes)$",
+    ),
+    line_code: str | None = Query(default=None),
+    consolidation: str | None = Query(default=None),
+    period_end: datetime | None = Query(default=None),
     period_end_from: datetime | None = Query(default=None),
     period_end_to: datetime | None = Query(default=None),
     restatement_basis: str | None = Query(
@@ -938,6 +950,13 @@ async def financials_line_items(
     limit: int = Query(default=50, ge=1),
 ) -> dict[str, Any]:
     """Per SCOPE.md D1, D8: ``ts.financial_line_item_at(p_as_of)``.
+
+    Documented filters per OPENAPI.yaml:
+    ``filing_id`` (UUID), ``statement_type`` (``bs|is|cf|eq|notes``),
+    ``line_code`` (text), ``consolidation`` (text), ``period_end``
+    (exact match), ``period_end_from`` / ``period_end_to`` (range),
+    ``restatement_basis``. The first five close the filter parity
+    gap pass-3 finding 5 caught.
 
     D2 interval, D6/D7/D17/D18/D25 wired via the cross-cutting
     observability module.
@@ -965,6 +984,21 @@ async def financials_line_items(
     if entity_id is not None:
         where_parts.append("entity_id = :entity_id")
         params["entity_id"] = str(entity_id)
+    if filing_id is not None:
+        where_parts.append("filing_id = :filing_id")
+        params["filing_id"] = str(filing_id)
+    if statement_type is not None:
+        where_parts.append("statement_type = :statement_type")
+        params["statement_type"] = statement_type
+    if line_code is not None:
+        where_parts.append("line_code = :line_code")
+        params["line_code"] = line_code
+    if consolidation is not None:
+        where_parts.append("consolidation = :consolidation")
+        params["consolidation"] = consolidation
+    if period_end is not None:
+        where_parts.append("period_end = :period_end")
+        params["period_end"] = period_end
     if period_end_from is not None:
         where_parts.append("period_end >= :period_end_from")
         params["period_end_from"] = period_end_from
@@ -983,6 +1017,11 @@ async def financials_line_items(
             else None
         ),
         "entity_id": str(entity_id) if entity_id else None,
+        "filing_id": str(filing_id) if filing_id else None,
+        "statement_type": statement_type,
+        "line_code": line_code,
+        "consolidation": consolidation,
+        "period_end": period_end.isoformat() if period_end else None,
         "period_end_from": (
             period_end_from.isoformat() if period_end_from else None
         ),
@@ -1415,12 +1454,34 @@ async def disclosures(
     historical row was timestamped (e.g. ``index_fetched_at``,
     ``body_fetched_at``, or ``pre_bitemporal_unknown`` for backfill).
     Interval mode (D2) queries ``kap.disclosures_version`` directly to
-    return the version chain. D6/D7/D17/D18/D25 wired.
+    return the version chain. ``include_pre_bitemporal=true`` is a
+    PIT-only modifier; combining it with ``as_of_range`` returns 400
+    ``BITEMPORAL_INTERVAL_INVALID`` (pass-3 finding 3).
+    D6/D7/D17/D18/D25 wired.
     """
     _reject_pit_with_interval(as_of=as_of, as_of_range=as_of_range)
     interval = _parse_as_of_range(as_of_range)
     _gate_interval_flag(as_of_range=interval, flags=flags)
     _enforce_query_cost(as_of_range=interval, limit=limit)
+    # Per SCOPE.md D3 / pass-3 finding 3: include_pre_bitemporal is a
+    # PIT-only modifier. Interval mode already scans the *_version
+    # history table; layering the OR-provenance branch on top would
+    # double-count rows. Reject the combination explicitly.
+    if include_pre_bitemporal and interval is not None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "type": (
+                    "https://docs.aslanterminal.com/errors/"
+                    "BITEMPORAL_INTERVAL_INVALID"
+                ),
+                "title": (
+                    "include_pre_bitemporal=true requires PIT mode "
+                    "(no as_of_range)"
+                ),
+                "code": "BITEMPORAL_INTERVAL_INVALID",
+            },
+        )
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
     ctx.api_key_id = principal.key_id if principal else None

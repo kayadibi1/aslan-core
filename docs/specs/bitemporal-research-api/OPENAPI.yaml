@@ -1243,6 +1243,7 @@ paths:
         entity's canonical financials at the queried `period_end`.
       parameters:
         - $ref: '#/components/parameters/AsOf'
+        - $ref: '#/components/parameters/AsOfRange'
         - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/DisplayTz'
@@ -1575,9 +1576,14 @@ components:
       in: query
       required: false
       description: |
-        Include `kap.disclosures` rows with `as_of=NULL` and
-        `as_of_provenance='pre_bitemporal_unknown'` (the ~372k legacy
-        rows). When true the response carries a warning. Per D3.
+        PIT-only modifier (rejected with 400 BITEMPORAL_INTERVAL_INVALID
+        when combined with `as_of_range`). When true, `/disclosures`
+        also surfaces rows whose `as_of_provenance` is
+        `pre_bitemporal_unknown` (a reserved enum value for backfill
+        rows where the source's `index_fetched_at` was unknown — not
+        emitted by the current production backfill but reserved for
+        forward-compat with stricter schemas). Per D3 (revised
+        round 8).
       schema:
         type: boolean
         default: false
