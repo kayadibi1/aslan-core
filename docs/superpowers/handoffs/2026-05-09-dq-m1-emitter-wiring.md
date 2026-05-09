@@ -461,3 +461,133 @@ auto-dismissed flags are NOT shown in the open-queue (they leave
   the inline TODO in `regression_detect._SELECT_TOP_BIST_ENTITIES`.
 
 
+## M6 weekly scorecard
+
+M6 ships the weekly DQ scorecard + email digest end-to-end. Sunday
+23:55 UTC the `audit-scorecard` cron computes ten metrics aggregating
+from the `audit.*` tables for the trailing 7 days, persists each as a
+row in `audit.scorecard_snapshot`, and emits
+`audit.event(event_type='scorecard_generated')` carrying the rendered
+HTML body. The `weekly_scorecard` severity rule (seeded in 0059) picks
+that event up on the next 60s alert-dispatch sweep and emails the
+recipient list.
+
+### Cron schedule
+
+```cron
+55 23  *   *   0   /usr/local/bin/aslan-core audit scorecard
+```
+
+Spec §13. Sunday 23:55 UTC. The cron summarises the just-ended week
+(Mon-Sun ending today). Re-run for a specific past week:
+
+```bash
+aslan-core audit scorecard --week-start 2026-04-27
+```
+
+`--week-start` must be a Monday (UTC). The UPSERT
+(`ON CONFLICT (week_start, metric_name) DO UPDATE`) keeps the
+recompute idempotent — `recorded_at` stays at the original insert
+time; `actual` / `status` / `notes` get overwritten in place.
+
+### Recipient list configuration
+
+The dispatcher's email sink reads the recipient list from
+`ASLAN_AUDIT_EMAIL_TO` (comma-separated). The SMTP relay URL comes
+from `ASLAN_AUDIT_SMTP_URL` (`smtp://user:pw@host:port` or
+`smtps://...`). Both are settings in `aslan_core.config.Settings`
+and the corresponding env vars are:
+
+```bash
+ASLAN_AUDIT_SMTP_URL="smtps://alerts:secret@smtp.relay:465"
+ASLAN_AUDIT_EMAIL_TO="sidar@aslan.example,ops@aslan.example"
+```
+
+### The ten metrics
+
+| metric_name | source | thresholds (pass / warn / fail) |
+| --- | --- | --- |
+| `kap_recency_p95` | `audit.recency_observation` p95 (kap, 7d) | ≤300s / ≤600s / >600s |
+| `kap_recency_p99` | `audit.recency_observation` p99 (kap, 7d) | ≤1800s / ≤3000s / >3000s |
+| `evds_freshness_pct` | `audit.evds_release_calendar` join `ts.observation` | ≥95% / ≥90% / <90% |
+| `kap_filings_today_coverage` | latest `audit.coverage_snapshot` (kap/filings_today) | ≥99% / ≥95% / <95% |
+| `bist_entity_coverage` | latest `audit.coverage_snapshot` (bist/entity) | =100% / ≥99% / <99% |
+| `validation_pass_rate_kap` | `audit.validation_failure` (kap, 7d) / recency-obs proxy | ≥99% / ≥97% / <97% |
+| `spot_check_completion_rate_4w` | `audit.spot_check_sample` labelled ratio (28d) | ≥90% / ≥80% / <80% |
+| `bloomberg_wins_count` | latest CLOSED `audit.bloomberg_comparison_run` cells | ≥30 / ≥20 / <20 |
+| `regression_flag_open_count` | `audit.regression_flag` status='open' | ≤5 / ≤10 / >10 |
+| `cross_source_rule_clean_count` | `audit.validation_failure` xs_* rules clean (7d) | ≥5 / ≥4 / <4 |
+
+Tables not deployed on a given branch (e.g. `audit.bloomberg_comparison_cell`
+on a v1 puller-only branch) return a row with `status='warn'` and a
+notes string explaining the gap rather than crashing the cron.
+
+### Email body — rich-body mode on the email sink
+
+The cron stuffs `subject` + `body_html` + `body_text` into the
+`scorecard_generated` event payload. The dispatcher's
+`weekly_scorecard` predicate query (in
+`aslan_core.dq.alert_dispatch`) projects the full payload onto the
+`audit.alert_dispatch.payload` column. `EmailSink.deliver` detects
+the `body_html` key and switches to a multipart/alternative message:
+
+* **Subject** — `payload['subject']` (overrides the generic
+  `[ASLAN AUDIT] [info] weekly_scorecard`).
+* **text/plain** — `payload['body_text']` (a monospace dump from
+  `dq.scorecard.render_text_fallback`) so terminal mail clients still
+  read the digest cleanly.
+* **text/html** — `payload['body_html']` (the colour-coded HTML
+  table from `dq.scorecard.render_email`).
+
+Existing M3-era rules (recency_sla_breach, coverage_below_target, …)
+have no `body_html` in their payload, so the legacy generic JSON-dump
+body kicks in unchanged.
+
+### Dashboard /dq/scorecard
+
+* **GET /dq/scorecard** — current-week metrics + history roll-up +
+  Email-preview / Export-HTML action links.
+* **GET /dq/scorecard/email** — renders the latest scorecard's email
+  body inline. Pulls from
+  `audit.event(event_type='scorecard_generated').payload.body_html`;
+  falls back to live-rendering when no event exists yet.
+* **GET /dq/scorecard/export** — downloads a standalone HTML file
+  named `aslan-scorecard-YYYY-MM-DD.html` for the current week.
+
+### PDF export — deferred to M6.1
+
+Real PDF rendering (WeasyPrint or reportlab) is deferred. The Export
+button serves HTML; the operator's browser does the print-to-PDF step.
+Documented inline in `dq.scorecard.render_html`'s docstring + the
+dashboard footer; ticket the M6.1 follow-up alongside the next `[obs]`
+extras refresh.
+
+### Migration 0062
+
+`audit.scorecard_snapshot` per spec §5.10. PK
+`(week_start, metric_name)` enables idempotent UPSERT. GRANTs:
+
+* `audit_writer` — INSERT + UPDATE (UPSERT requires both); the cron
+  runs as audit_writer.
+* `audit_reader` — SELECT.
+* `aslan_dashboard` — SELECT (page is read-only).
+
+### Sources of truth
+
+* Module: `src/aslan_core/dq/scorecard.py` — `compute` / `write` /
+  `render_email` / `render_html` / `render_text_fallback` /
+  `latest_week_start`.
+* CLI: `src/aslan_core/cli/dq.py` — `audit scorecard` subcommand.
+* Email sink: `src/aslan_core/dq/sinks/email.py` — rich-body mode.
+* Dashboard: `src/aslan_core/dashboard/pages/dq_scorecard.py` +
+  `dq_scorecard` / `dq_scorecard_latest_email_body` query helpers
+  in `src/aslan_core/dashboard/queries.py`.
+* Migration: `0062_dq_scorecard_snapshot.py`.
+* Tests:
+  * `tests/integration/test_migration_0062_scorecard_snapshot.py`
+  * `tests/integration/dq/test_scorecard_cli.py`
+  * `tests/integration/dashboard/test_dq_scorecard.py`
+  * `tests/unit/dq/test_scorecard_render.py`
+  * Email rich-body coverage in `tests/unit/dq/test_sinks.py`
+
+
