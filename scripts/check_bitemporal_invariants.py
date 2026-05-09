@@ -301,8 +301,11 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    log = _get_log()
+
     dsn = args.dsn or os.environ.get("ASLAN_PG_DSN")
     if not dsn:
+        log.error("invariants_check_no_dsn")
         print(
             json.dumps(
                 {
@@ -348,18 +351,42 @@ def main() -> int:
         if failures:
             report["status"] = "FAIL"
             report["violations"] = failures
+            log.error(
+                "invariants_check_fail",
+                invariants_total=len(INVARIANTS),
+                invariants_failed=len(failures),
+                violations=failures,
+            )
             print(json.dumps(report, indent=2 if not args.json else None))
             return 1
         report["status"] = "PASS"
+        log.info("invariants_check_pass", invariants_total=len(INVARIANTS))
         print(json.dumps(report, indent=2 if not args.json else None))
         return 0
     except psycopg.OperationalError as e:
+        log.exception("invariants_check_connect_failed", dsn_redacted=_redact_dsn(dsn))
         print(
             json.dumps(
                 {"status": "error", "reason": f"connect-failed: {e!r}"}
             )
         )
         return 2
+
+
+def _get_log() -> Any:  # noqa: F821 — Any imported below
+    """Return a structlog logger; fall back to stdlib if unavailable."""
+    try:
+        from aslan_core.api.research_logging import (
+            configure_research_logging,
+            get_research_logger,
+        )
+
+        configure_research_logging()
+        return get_research_logger("aslan_core.scripts.check_bitemporal_invariants")
+    except Exception:
+        import logging as _logging
+
+        return _logging.getLogger("aslan_core.scripts.check_bitemporal_invariants")
 
 
 def _redact_dsn(dsn: str) -> str:

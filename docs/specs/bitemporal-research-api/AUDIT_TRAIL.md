@@ -388,3 +388,95 @@ Same as before:
    ≡ prod per STATE.md).
 3. Place `PROMOTE_TO_PROD` file at workspace root.
 4. Phase 7 production deploy (gated on (2) and (3)).
+
+---
+
+## 2026-05-09T10:15:00Z — Round 5: structured error logging
+
+User: "lets do proper error logging too." Round 5 wires
+`structlog`-based event logging across the bitemporal API per
+SCOPE.md D25 (observability) and D16 (RFC 7807 error responses).
+
+### New module — `aslan_core/api/research_logging.py` (313 LOC)
+
+- `configure_research_logging` — idempotent structlog setup. JSON
+  output when `ASLAN_LOG_JSON=1`; key-value `ConsoleRenderer` in
+  dev. Stdlib root logger configured with `StreamHandler(stderr)`
+  at `ASLAN_LOG_LEVEL` (default INFO).
+- `get_research_logger(name)` — returns a `BoundLogger` pre-bound
+  to `component="bitemporal-research-api"`.
+- `bind_request_log_context(request_id, endpoint, api_key_id)` —
+  context manager binding fields on `structlog.contextvars`. Every
+  log line emitted within the request inherits them.
+- `update_request_log_context(**kwargs)` — additive bind for
+  fields not known at middleware-entry (e.g. `api_key_id` after
+  auth, `rate_tier`, `rows_returned`).
+- `register_research_exception_handlers(app)` — adds RFC 7807
+  `problem+json` handlers for `HTTPException` and `Exception`,
+  scoped to `/v1/research/*` paths. Non-research paths defer to
+  the existing `register_exception_handlers`. Client errors (4xx)
+  log at `WARNING`; server errors (5xx) log at `ERROR` with full
+  traceback via `logger.exception`.
+
+### Wired into `api/__init__.py`
+
+- Lifespan calls `configure_research_logging()` once at startup.
+- `register_research_exception_handlers` runs BEFORE
+  `register_exception_handlers` so the RFC 7807 branch matches
+  research paths first.
+
+### Per-event log catalog
+
+Implemented log events with their levels and bound fields:
+
+| Event | Level | Where | Fields beyond context |
+|---|---|---|---|
+| `research_request_received` | DEBUG | middleware entry | `client_ip` |
+| `research_request_completed` | INFO | middleware exit (4xx + 2xx) | `status_code, latency_ms, rows_returned` |
+| `research_http_exception` | WARNING (4xx) / ERROR (5xx) | RFC 7807 handler | `status_code, code, path, method` |
+| `research_unhandled_exception` | ERROR (with traceback) | unhandled exception handler | `path, method, exception_type` |
+| `research_audit_log_failed` | ERROR (with traceback) | audit-write best-effort | `status_code, latency_ms` |
+| `research_pii_access` | WARNING | middleware exit when bypass used | `api_key_id` |
+| `research_rate_limit_throttle` | WARNING | enforce_rate_limit on 429 | `rate_tier, window_kind, tokens_used, cap, retry_after_seconds` |
+| `research_auth_failure` | WARNING | research_auth `get_principal` | `reason ∈ {missing_header, malformed_header, key_id_not_uuid, unknown_key, bad_secret, revoked, expired}` |
+| `research_auth_success` | DEBUG | research_auth `get_principal` | `rate_tier, pii_unredacted` |
+
+Every line carries the request-bound `request_id`, `endpoint`,
+`api_key_id` (where known), and `component`.
+
+### Scripts
+
+- `scripts/canary_moat_2.py` — added structured events
+  `canary_moat_2_no_dsn` (ERROR), `canary_moat_2_connect_failed`
+  (ERROR + traceback), `canary_moat_2_unhandled_exception` (ERROR +
+  re-raise), `canary_moat_2_red` (ERROR with case detail),
+  `canary_moat_2_green` (INFO with timing). The JSON-on-stdout
+  contract for cron consumption is preserved.
+- `scripts/check_bitemporal_invariants.py` — added
+  `invariants_check_no_dsn` (ERROR), `invariants_check_pass`
+  (INFO), `invariants_check_fail` (ERROR with violations array),
+  `invariants_check_connect_failed` (ERROR + traceback). Stdout
+  JSON output preserved.
+
+Both scripts fall back to stdlib `logging` if `aslan_core` is not
+importable (e.g. running outside the venv), so the structured
+events emit even in minimal environments.
+
+### Verification
+
+- `ruff check` + `mypy --strict` clean on all 5 affected files.
+- Boot smoke-test: structlog output shows correct level, bound
+  context, and request-id propagation:
+  ```
+  2026-05-09T08:11:01Z [info     ] boot_smoke_event ...
+  2026-05-09T08:11:01Z [warning  ] test_event_with_context ... request_id=5105df25-d704-4d75-a67b-6b2f61188e4f
+  ```
+- App still constructs with 32 routes; pytest still collects 35
+  tests under `-m integration`.
+
+### What's truly remaining (unchanged from round 4)
+
+1. ADR-001/002/003 PROVISIONAL → FINAL (sidar review).
+2. Apply migrations to staging.
+3. Place `PROMOTE_TO_PROD` file at workspace root.
+4. Phase 7 production deploy (gated on the above).

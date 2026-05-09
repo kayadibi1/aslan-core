@@ -374,6 +374,26 @@ def persist_status(conn: psycopg.Connection, result: dict[str, Any]) -> None:
     conn.commit()
 
 
+def _get_log() -> Any:
+    """Return a structlog logger if available; fall back to stdlib.
+
+    Imported lazily so the script runs without aslan-core installed
+    (e.g. inside a one-shot Docker job that ships only the script).
+    """
+    try:
+        from aslan_core.api.research_logging import (  # type: ignore[import-not-found]
+            configure_research_logging,
+            get_research_logger,
+        )
+
+        configure_research_logging()
+        return get_research_logger("aslan_core.scripts.canary_moat_2")
+    except Exception:
+        import logging as _logging
+
+        return _logging.getLogger("aslan_core.scripts.canary_moat_2")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Moat 2 canary (H9).")
     parser.add_argument("--dsn", default=os.environ.get("ASLAN_PG_DSN"))
@@ -381,7 +401,10 @@ def main() -> int:
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
+    log = _get_log()
+
     if not args.dsn:
+        log.error("canary_moat_2_no_dsn")
         print(json.dumps({"status": "error", "reason": "no DSN"}))
         return 2
     try:
@@ -390,11 +413,36 @@ def main() -> int:
             if not args.no_persist:
                 persist_status(conn, result)
     except psycopg.OperationalError as e:
+        log.exception("canary_moat_2_connect_failed", dsn_redacted=_redact_dsn(args.dsn))
         print(json.dumps({"status": "error", "reason": f"connect: {e!r}"}))
         return 2
+    except Exception:
+        log.exception("canary_moat_2_unhandled_exception")
+        raise
+
+    if result["moat_2"] != "green":
+        log.error(
+            "canary_moat_2_red",
+            cases_total=result["cases_total"],
+            cases_passing=result["cases_passing"],
+            failing_cases=result["failing_cases"],
+        )
+    else:
+        log.info(
+            "canary_moat_2_green",
+            cases_total=result["cases_total"],
+            duration_seconds=result["duration_seconds"],
+        )
 
     print(json.dumps(result, indent=2 if not args.json else None))
     return 0 if result["moat_2"] == "green" else 1
+
+
+def _redact_dsn(dsn: str) -> str:
+    """Hide password segment from DSN before structured-logging it."""
+    import re
+
+    return re.sub(r"://([^:]+):([^@]+)@", r"://\1:***@", dsn)
 
 
 if __name__ == "__main__":

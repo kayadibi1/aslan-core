@@ -32,7 +32,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -46,8 +45,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from aslan_core.api.deps import get_session
 from aslan_core.api.research_auth import ApiKeyPrincipal, get_principal
+from aslan_core.api.research_logging import (
+    bind_request_log_context,
+    get_research_logger,
+    update_request_log_context,
+)
 
-logger = logging.getLogger(__name__)
+logger = get_research_logger("aslan_core.api.research.observability")
 
 
 # ---------------------------------------------------------------------
@@ -318,8 +322,19 @@ async def enforce_rate_limit(
         ).first()
         if bucket and bucket.tokens_used > cap:
             await session.commit()
-            _RATE_THROTTLES.labels(api_key_id=str(principal.key_id), window_kind=window_kind).inc()
+            _RATE_THROTTLES.labels(
+                api_key_id=str(principal.key_id), window_kind=window_kind
+            ).inc()
             retry_after = _retry_after_seconds(window_kind, now)
+            logger.warning(
+                "research_rate_limit_throttle",
+                api_key_id=str(principal.key_id),
+                rate_tier=principal.rate_tier,
+                window_kind=window_kind,
+                tokens_used=bucket.tokens_used,
+                cap=cap,
+                retry_after_seconds=retry_after,
+            )
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail={
@@ -337,6 +352,10 @@ async def enforce_rate_limit(
                 },
             )
     await session.commit()
+    update_request_log_context(
+        api_key_id=str(principal.key_id),
+        rate_tier=principal.rate_tier,
+    )
     return principal
 
 
@@ -370,62 +389,94 @@ async def research_audit_middleware(
     ctx = RequestContext(endpoint=f"{request.method} {request.url.path}")
     request.state.research_ctx = ctx
 
-    response = await call_next(request)
-    response.headers.setdefault("X-Request-Id", str(ctx.request_id))
+    with bind_request_log_context(
+        request_id=ctx.request_id,
+        endpoint=ctx.endpoint,
+        api_key_id=None,  # bound later by enforce_rate_limit if auth succeeds
+    ):
+        logger.debug(
+            "research_request_received",
+            client_ip=request.client.host if request.client else None,
+        )
 
-    duration = time.monotonic() - ctx.started_monotonic
-    _REQ_TOTAL.labels(
-        endpoint=request.url.path,
-        status=str(response.status_code),
-        rate_tier=ctx.rate_tier,
-    ).inc()
-    _REQ_DURATION.labels(endpoint=request.url.path).observe(duration)
+        response = await call_next(request)
+        response.headers.setdefault("X-Request-Id", str(ctx.request_id))
 
-    # Skip audit-log persistence for the public surfaces (per D18:
-    # api_key_id is nullable for /verify/moat-2 etc. — we still log
-    # those, just without api_key_id).
-    try:
-        engine = request.app.state.engine
-        async with engine.connect() as conn:
-            await conn.execute(
-                text(
-                    "INSERT INTO aslan_core.api_query_audit "
-                    "(audit_id, requested_at, api_key_id, request_ip, request_id, "
-                    " endpoint, query_params_sha256, as_of_requested, as_of_resolved, "
-                    " rows_returned, latency_ms, status_code, error_code, "
-                    " feature_flags_active) "
-                    "VALUES (gen_random_uuid(), now(), :api_key_id, :ip, :req_id, "
-                    " :ep, :qhash, :as_of_req, :as_of_res, :rows, :ms, :sc, "
-                    " :err, :flags)"
-                ),
-                {
-                    "api_key_id": str(ctx.api_key_id) if ctx.api_key_id else None,
-                    "ip": request.client.host if request.client else None,
-                    "req_id": str(ctx.request_id),
-                    "ep": ctx.endpoint,
-                    "qhash": _query_params_sha256(request),
-                    "as_of_req": ctx.as_of_requested,
-                    "as_of_res": ctx.as_of_resolved or datetime.now(tz=UTC),
-                    "rows": ctx.rows_returned,
-                    "ms": int(duration * 1000),
-                    "sc": response.status_code,
-                    "err": _error_code_from_status(response.status_code),
-                    "flags": ctx.feature_flags_active,
-                },
-            )
-            await conn.commit()
-        _AUDIT_TOTAL.labels(endpoint=request.url.path).inc()
-    except Exception as exc:
-        # Failing the audit-log write must not fail the user's request.
-        # We log the exception via structlog and emit a metric so
-        # operators see it in the dashboard.
-        logger.warning("research_audit_log_failed: %r", exc)
-    if ctx.pii_unredacted_used:
-        _PII_ACCESS.labels(
-            api_key_id=str(ctx.api_key_id) if ctx.api_key_id else "",
+        duration = time.monotonic() - ctx.started_monotonic
+        _REQ_TOTAL.labels(
             endpoint=request.url.path,
+            status=str(response.status_code),
+            rate_tier=ctx.rate_tier,
         ).inc()
-    return response
+        _REQ_DURATION.labels(endpoint=request.url.path).observe(duration)
+
+        # Successful-or-client-error completion at INFO; 5xx already
+        # logged by the unhandled-exception handler at ERROR.
+        update_request_log_context(
+            api_key_id=str(ctx.api_key_id) if ctx.api_key_id else None,
+            rate_tier=ctx.rate_tier,
+            rows_returned=ctx.rows_returned,
+        )
+        if response.status_code < 500:
+            logger.info(
+                "research_request_completed",
+                status_code=response.status_code,
+                latency_ms=int(duration * 1000),
+                rows_returned=ctx.rows_returned,
+            )
+
+        # Skip audit-log persistence on a transient failure but never
+        # fail the user's request because of it. Per D18.
+        try:
+            engine = request.app.state.engine
+            async with engine.connect() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO aslan_core.api_query_audit "
+                        "(audit_id, requested_at, api_key_id, request_ip, request_id, "
+                        " endpoint, query_params_sha256, as_of_requested, as_of_resolved, "
+                        " rows_returned, latency_ms, status_code, error_code, "
+                        " feature_flags_active) "
+                        "VALUES (gen_random_uuid(), now(), :api_key_id, :ip, :req_id, "
+                        " :ep, :qhash, :as_of_req, :as_of_res, :rows, :ms, :sc, "
+                        " :err, :flags)"
+                    ),
+                    {
+                        "api_key_id": str(ctx.api_key_id) if ctx.api_key_id else None,
+                        "ip": request.client.host if request.client else None,
+                        "req_id": str(ctx.request_id),
+                        "ep": ctx.endpoint,
+                        "qhash": _query_params_sha256(request),
+                        "as_of_req": ctx.as_of_requested,
+                        "as_of_res": ctx.as_of_resolved or datetime.now(tz=UTC),
+                        "rows": ctx.rows_returned,
+                        "ms": int(duration * 1000),
+                        "sc": response.status_code,
+                        "err": _error_code_from_status(response.status_code),
+                        "flags": ctx.feature_flags_active,
+                    },
+                )
+                await conn.commit()
+            _AUDIT_TOTAL.labels(endpoint=request.url.path).inc()
+        except Exception:
+            # Full traceback to logs (and Sentry, if configured); a
+            # missing audit row is a compliance signal worth chasing
+            # but must never propagate to the client.
+            logger.exception(
+                "research_audit_log_failed",
+                status_code=response.status_code,
+                latency_ms=int(duration * 1000),
+            )
+        if ctx.pii_unredacted_used:
+            _PII_ACCESS.labels(
+                api_key_id=str(ctx.api_key_id) if ctx.api_key_id else "",
+                endpoint=request.url.path,
+            ).inc()
+            logger.warning(
+                "research_pii_access",
+                api_key_id=str(ctx.api_key_id) if ctx.api_key_id else None,
+            )
+        return response
 
 
 def _query_params_sha256(request: Request) -> bytes:

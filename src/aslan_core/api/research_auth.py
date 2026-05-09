@@ -26,6 +26,9 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from aslan_core.api.deps import get_session
+from aslan_core.api.research_logging import get_research_logger
+
+_log = get_research_logger("aslan_core.api.research.auth")
 
 # Argon2id is the secret-hash KDF for API keys per SCOPE.md D5.
 # Defaults are reasonable for v1 (memory_cost=64MiB, time_cost=3,
@@ -159,6 +162,7 @@ async def get_principal(
         return None
 
     if not x_aslan_api_key:
+        _log.warning("research_auth_failure", reason="missing_header")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={
@@ -171,6 +175,7 @@ async def get_principal(
     # v1 placeholder: split the header on a colon → (key_id, secret).
     # In v1.1 we rotate to a single-token format with KDF lookup.
     if ":" not in x_aslan_api_key:
+        _log.warning("research_auth_failure", reason="malformed_header")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={
@@ -183,6 +188,7 @@ async def get_principal(
     try:
         key_id = UUID(raw_key_id)
     except ValueError as exc:
+        _log.warning("research_auth_failure", reason="key_id_not_uuid")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={
@@ -203,6 +209,11 @@ async def get_principal(
         )
     ).first()
     if row is None:
+        _log.warning(
+            "research_auth_failure",
+            reason="unknown_key",
+            api_key_id=str(key_id),
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"code": "AUTH_INVALID", "title": "Unknown API key"},
@@ -210,21 +221,43 @@ async def get_principal(
 
     # Argon2id verification (with backward-compat for seed/test keys).
     if not verify_secret(row.secret_hash, raw_secret):
+        _log.warning(
+            "research_auth_failure",
+            reason="bad_secret",
+            api_key_id=str(key_id),
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"code": "AUTH_INVALID", "title": "Invalid API key secret"},
         )
 
     if row.revoked_at is not None:
+        _log.warning(
+            "research_auth_failure",
+            reason="revoked",
+            api_key_id=str(key_id),
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"code": "AUTH_INVALID", "title": "API key revoked"},
         )
     if row.expires_at is not None and row.expires_at < datetime.now(tz=UTC):
+        _log.warning(
+            "research_auth_failure",
+            reason="expired",
+            api_key_id=str(key_id),
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"code": "AUTH_INVALID", "title": "API key expired"},
         )
+
+    _log.debug(
+        "research_auth_success",
+        api_key_id=str(key_id),
+        rate_tier=row.rate_tier,
+        pii_unredacted=bool(row.pii_unredacted),
+    )
 
     # last_used_at is intentionally NOT touched here. Doing so would
     # require committing the request session mid-flight (corrupting

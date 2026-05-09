@@ -24,6 +24,11 @@ _CANONICAL_LINES_MANIFEST = Path(__file__).resolve().parents[1] / "canonical_lin
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Create the DB engine once at startup; dispose on shutdown."""
+    # Configure structured logging once before any request fires.
+    from aslan_core.api.research_logging import configure_research_logging
+
+    configure_research_logging()
+
     engine = create_engine()
     app.state.engine = engine
 
@@ -55,6 +60,7 @@ def create_api_app() -> FastAPI:
     from starlette.middleware.base import BaseHTTPMiddleware
 
     from aslan_core.api.middleware import register_exception_handlers
+    from aslan_core.api.research_logging import register_research_exception_handlers
     from aslan_core.api.research_observability import research_audit_middleware
     from aslan_core.api.routes.auth import router as auth_router
     from aslan_core.api.routes.catalog import router as catalog_router
@@ -80,6 +86,14 @@ def create_api_app() -> FastAPI:
     # Filters by path inside the dispatcher, so it is safe to add globally.
     app.add_middleware(BaseHTTPMiddleware, dispatch=research_audit_middleware)
 
+    # Research-API exception handlers (RFC 7807 per D16, structured
+    # error logging per D25). Handlers no-op for non-/v1/research/*
+    # paths and delegate back to the existing app-wide handler.
+    # NOTE: register_research_exception_handlers must run BEFORE
+    # register_exception_handlers because FastAPI applies handlers
+    # in registration order — we want our research-path branch to
+    # match first.
+    register_research_exception_handlers(app)
     register_exception_handlers(app)
 
     return app
