@@ -49,10 +49,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from aslan_core.config import Settings
 from aslan_core.db.engine import create_engine
 from aslan_core.db.session import create_session_factory
-from aslan_core.dq import alert_dispatch, coverage, event, recency, spot_check
+from aslan_core.dq import alert_dispatch, bloomberg, coverage, event, recency, spot_check
 from aslan_core.dq._sql import SELECT_RECENCY_SLA
 from aslan_core.dq.probes import SOURCES, get_probe
-from aslan_core.dq.sinks import Sink, build_default_sinks
+from aslan_core.dq.sinks import Sink, SinkNotConfigured, build_default_sinks
 from aslan_core.dq.types import Severity
 
 
@@ -669,6 +669,327 @@ async def _run_test_alert(
             failed += 1
             click.echo(f"  {sink_name}: returned False", err=True)
     return {"delivered": delivered, "suppressed": suppressed, "failed": failed}
+
+
+# ── bloomberg-* commands ───────────────────────────────────────────
+
+
+@audit.command("bloomberg-open-quarter")
+@click.option(
+    "--quarter",
+    "quarter",
+    default=None,
+    help="YYYYQn label (e.g. 2026Q2). Defaults to the calendar quarter containing now().",
+)
+def bloomberg_open_quarter_cmd(quarter: str | None) -> None:
+    """Open a Bloomberg-comparison run for ``quarter``.
+
+    Idempotent: a second invocation for the same quarter prints the
+    existing run_id and exits cleanly. Creates 60 cells (5 entities x
+    12 fields) on first run; subsequent calls touch nothing.
+    """
+    target = quarter or bloomberg.current_quarter()
+    summary = asyncio.run(_run_bloomberg_open_quarter(target))
+    click.echo(
+        f"bloomberg-open-quarter: quarter={summary['quarter']} "
+        f"run_id={summary['run_id']} cells_per_run={bloomberg.CELLS_PER_RUN}"
+    )
+
+
+async def _run_bloomberg_open_quarter(quarter: str) -> dict[str, str]:
+    engine = create_engine()
+    factory = create_session_factory(engine)
+    try:
+        async with factory() as s:
+            run_id = await bloomberg.open_quarter(session=s, quarter=quarter)
+            await s.commit()
+        return {"quarter": quarter, "run_id": str(run_id)}
+    finally:
+        await engine.dispose()
+
+
+@audit.command("bloomberg-close-quarter")
+@click.option("--quarter", "quarter", required=True, help="YYYYQn label, e.g. 2026Q2.")
+@click.option(
+    "--closed-by",
+    "closed_by",
+    default=None,
+    help="Identity stamped on closed_by; defaults to the CLI actor.",
+)
+def bloomberg_close_quarter_cmd(quarter: str, closed_by: str | None) -> None:
+    """Close ``quarter``. Refuses if any cell has bloomberg_value=NULL."""
+    actor = closed_by or f"cli:{getpass_user()}"
+    try:
+        asyncio.run(_run_bloomberg_close_quarter(quarter=quarter, closed_by=actor))
+    except bloomberg.QuarterNotReadyError as exc:
+        raise click.ClickException(str(exc)) from exc
+    except LookupError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"bloomberg-close-quarter: quarter={quarter} closed_by={actor}")
+
+
+def getpass_user() -> str:
+    """Return the current CLI user (delegated import to keep the CLI's
+    top-level import block stable)."""
+    import getpass
+
+    return getpass.getuser()
+
+
+async def _run_bloomberg_close_quarter(*, quarter: str, closed_by: str) -> None:
+    engine = create_engine()
+    factory = create_session_factory(engine)
+    try:
+        async with factory() as s:
+            await bloomberg.close_quarter(session=s, quarter=quarter, closed_by=closed_by)
+            await s.commit()
+    finally:
+        await engine.dispose()
+
+
+@audit.command("bloomberg-sample")
+def bloomberg_sample_cmd() -> None:
+    """Drain NULL aslan_value cells across all open runs.
+
+    Iterates every cell in any non-closed run where ``aslan_value IS
+    NULL`` and runs the per-field auto-sampler. Cron schedule: nightly
+    (e.g. ``5 1 * * *``).
+    """
+    summary = asyncio.run(_run_bloomberg_sample())
+    click.echo(
+        f"bloomberg-sample: {summary['sampled']} cells sampled, "
+        f"{summary['placeholders']} placeholders"
+    )
+
+
+async def _run_bloomberg_sample() -> dict[str, int]:
+    engine = create_engine()
+    factory = create_session_factory(engine)
+    sampled = 0
+    placeholders = 0
+    try:
+        async with factory() as s:
+            cell_ids = await bloomberg.open_null_aslan_cells(session=s)
+        for cid in cell_ids:
+            async with factory() as s:
+                # Snapshot pre-event count so we can detect placeholder
+                # firings without reaching into the bloomberg module's
+                # internals.
+                pre = (
+                    await s.execute(
+                        text(
+                            "SELECT count(*)::int AS n FROM audit.event "
+                            "WHERE event_type = 'bloomberg_sampler_placeholder'"
+                        )
+                    )
+                ).scalar_one()
+                await bloomberg.record_aslan_value(session=s, cell_id=cid)
+                post = (
+                    await s.execute(
+                        text(
+                            "SELECT count(*)::int AS n FROM audit.event "
+                            "WHERE event_type = 'bloomberg_sampler_placeholder'"
+                        )
+                    )
+                ).scalar_one()
+                if int(post) > int(pre):
+                    placeholders += 1
+                sampled += 1
+                await s.commit()
+        return {"sampled": sampled, "placeholders": placeholders}
+    finally:
+        await engine.dispose()
+
+
+@audit.command("bloomberg-claim-check")
+@click.option(
+    "--field",
+    "field",
+    required=True,
+    type=click.Choice(list(bloomberg.COMPARISON_FIELDS)),
+    help="Field to summarise (e.g. revenue_q-1).",
+)
+def bloomberg_claim_check_cmd(field: str) -> None:
+    """Print a PR-ready summary of the latest closed run for ``field``.
+
+    Per workspace ``CLAUDE.md`` §2 — paste this into the PR description
+    when claiming Aslan beats Bloomberg on ``field``. The output is a
+    markdown block, safe to include verbatim.
+    """
+    text_block = asyncio.run(_run_bloomberg_claim_check(field))
+    click.echo(text_block)
+
+
+async def _run_bloomberg_claim_check(field: str) -> str:
+    engine = create_engine()
+    factory = create_session_factory(engine)
+    try:
+        async with factory() as s:
+            cc = await bloomberg.claim_check(session=s, field=field)
+        return cc.to_pr_text()
+    finally:
+        await engine.dispose()
+
+
+# Default render output path. Resolved relative to the workspace root
+# (``aslan-event-extractor`` is a sibling repo of ``aslan-core-dq-m0``).
+_DEFAULT_RENDER_PATH = "../aslan-event-extractor/docs/comparisons/bloomberg.md"
+
+
+@audit.command("bloomberg-render")
+@click.option(
+    "--output",
+    "output_path",
+    default=_DEFAULT_RENDER_PATH,
+    show_default=True,
+    help="Output markdown file. Parent directory is created if missing.",
+)
+def bloomberg_render_cmd(output_path: str) -> None:
+    """Render the latest closed run to ``aslan-event-extractor/docs/comparisons/bloomberg.md``.
+
+    The file is overwritten on each invocation. Do NOT edit by hand —
+    the next render will clobber any manual changes. The handoff doc
+    carries this contract under ``## M4 Bloomberg-comparison rotation``.
+    """
+    summary = asyncio.run(_run_bloomberg_render(output_path))
+    if summary["wrote"]:
+        click.echo(
+            f"bloomberg-render: wrote {summary['path']} "
+            f"({summary['cells']} cells, quarter={summary['quarter']})"
+        )
+    else:
+        click.echo(f"bloomberg-render: no closed run yet — nothing to render at {summary['path']}")
+
+
+def _write_render_output(output_path: str, body: str) -> str:
+    """Sync filesystem write for the bloomberg-render markdown.
+
+    Kept sync so the async render driver can call it without tripping
+    the ASYNC240 lint (the dashboard render is a one-shot human-driven
+    CLI write, not a hot-path I/O surface — synchronous filesystem
+    I/O is appropriate here).
+    """
+    from pathlib import Path
+
+    path = Path(output_path).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    return str(path)
+
+
+async def _run_bloomberg_render(output_path: str) -> dict[str, Any]:
+    engine = create_engine()
+    factory = create_session_factory(engine)
+    try:
+        async with factory() as s:
+            run = await bloomberg.latest_closed_run(session=s)
+        if run is None:
+            # Write a stub so the file always exists for downstream
+            # tooling, but log clearly that it carries no data yet.
+            stub = (
+                "# Bloomberg vs Aslan\n\n"
+                "_No closed Bloomberg-comparison run yet. Open one via "
+                "`aslan-core audit bloomberg-open-quarter` and close it "
+                "via `aslan-core audit bloomberg-close-quarter` once the "
+                "Bloomberg-side values are entered._\n"
+            )
+            written = _write_render_output(output_path, stub)
+            return {"wrote": False, "path": written, "cells": 0, "quarter": None}
+        markdown = bloomberg.render_markdown(run)
+        written = _write_render_output(output_path, markdown)
+        return {
+            "wrote": True,
+            "path": written,
+            "cells": len(run.cells),
+            "quarter": run.quarter,
+        }
+    finally:
+        await engine.dispose()
+
+
+@audit.command("bloomberg-reminder")
+def bloomberg_reminder_cmd() -> None:
+    """Slack-ping sidar for any open run with NULL bloomberg cells > 1 week old.
+
+    Cron schedule: weekly Mon 09:00 UTC. Sends one message per stale
+    run via the configured Slack sink. If no Slack sink is configured
+    the reminder is logged via ``audit.event`` but not delivered (same
+    suppression contract as the alert dispatcher).
+    """
+    summary = asyncio.run(_run_bloomberg_reminder())
+    click.echo(
+        f"bloomberg-reminder: {summary['stale_runs']} stale run(s), "
+        f"{summary['delivered']} reminder(s) delivered, "
+        f"{summary['suppressed']} suppressed"
+    )
+
+
+async def _run_bloomberg_reminder(
+    *,
+    settings: Settings | None = None,
+    sinks: dict[str, Sink] | None = None,
+) -> dict[str, int]:
+    if settings is None:
+        settings = Settings()
+    if sinks is None:
+        sinks = build_default_sinks(settings)
+    slack_sink = sinks.get("slack")
+    delivered = 0
+    suppressed = 0
+    engine = create_engine()
+    factory = create_session_factory(engine)
+    try:
+        async with factory() as s:
+            stale = await bloomberg.stale_open_runs(session=s)
+            for run_info in stale:
+                payload: dict[str, Any] = {
+                    "run_id": str(run_info.run_id),
+                    "quarter": run_info.quarter,
+                    "opened_at": run_info.opened_at.isoformat(),
+                    "null_cells": run_info.null_cells,
+                    "reminder": (
+                        f"Bloomberg-comparison run {run_info.quarter} has "
+                        f"{run_info.null_cells} NULL bloomberg_value cell(s) "
+                        f"> 1 week after open. Enter values via /dq/bloomberg."
+                    ),
+                }
+                # Always emit an audit.event so the gap is auditable
+                # even when Slack isn't configured.
+                await event.emit(
+                    session=s,
+                    event_type="bloomberg_reminder",
+                    emitter="cli:audit-bloomberg-reminder",
+                    severity=Severity.WARN,
+                    payload=payload,
+                )
+                if slack_sink is None:
+                    suppressed += 1
+                    continue
+                try:
+                    ok = await slack_sink.deliver(
+                        payload=payload,
+                        severity="warn",
+                        rule_name="bloomberg_reminder",
+                    )
+                except SinkNotConfigured:
+                    suppressed += 1
+                    continue
+                except Exception as exc:  # log + continue past per-run failures
+                    click.echo(
+                        f"  bloomberg-reminder slack failed for {run_info.quarter}: {exc}",
+                        err=True,
+                    )
+                    continue
+                if ok:
+                    delivered += 1
+            await s.commit()
+        return {
+            "stale_runs": len(stale),
+            "delivered": delivered,
+            "suppressed": suppressed,
+        }
+    finally:
+        await engine.dispose()
 
 
 __all__ = ["SOURCES", "audit"]
