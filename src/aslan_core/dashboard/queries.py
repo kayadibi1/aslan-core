@@ -63,11 +63,15 @@ from aslan_core.dashboard.view_models import (
     DqOverviewVM,
     DqRecencyRowVM,
     DqRecencyVM,
+    DqRegressionFlagRowVM,
     DqSpotCheckQueueVM,
     DqSpotCheckRecordPkPairVM,
     DqSpotCheckResultRowVM,
     DqSpotCheckSampleDetailVM,
     DqSpotCheckSampleRowVM,
+    DqValidationRuleRowVM,
+    DqValidationVM,
+    DqXsRuleSkipRowVM,
     IngestionRowVM,
     IngestionVM,
     OutboxRowVM,
@@ -1077,6 +1081,126 @@ async def dq_bloomberg_run_detail(
     return DqBloombergRunDetailVM(run=summary, cells=cells)
 
 
+# ── DQ M5: validation page ────────────────────────────────────────
+
+
+_VALIDATION_RULE_FAILURES_7D_SQL = text(
+    "SELECT rule_name, source, "
+    "  count(*)::int AS failures_7d, "
+    "  max(detected_at) AS last_failure_at "
+    "FROM audit.validation_failure "
+    "WHERE detected_at >= now() - INTERVAL '7 days' "
+    "GROUP BY rule_name, source "
+    "ORDER BY failures_7d DESC, rule_name "
+    "LIMIT :limit"
+)
+
+
+_VALIDATION_OPEN_FLAGS_SQL = text(
+    "SELECT flag_id, source, record_table, record_pk, metric, "
+    "  prior_value, current_value, shift_pct, threshold_pct, "
+    "  detected_at, status "
+    "FROM audit.regression_flag "
+    "WHERE status = 'open' "
+    "ORDER BY detected_at DESC "
+    "LIMIT :limit"
+)
+
+
+_VALIDATION_XS_SKIPS_SQL = text(
+    "SELECT payload, emitted_at "
+    "FROM audit.event "
+    "WHERE event_type = 'xs_rule_skipped' "
+    "  AND emitted_at >= now() - INTERVAL '7 days' "
+    "ORDER BY emitted_at DESC "
+    "LIMIT :limit"
+)
+
+
+def _format_decimal(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value)
+
+
+async def dq_validation(
+    session: AsyncSession,
+    *,
+    rule_limit: int = 50,
+    flag_limit: int = 25,
+    skip_limit: int = 25,
+) -> DqValidationVM:
+    """/dq/validation — 7d rule failure counts + open regression flags +
+    recent cross-source rule skips.
+
+    Spec §10.7. The page is read-only; the regression-flag review POST
+    handler in pages/dq_validation.py mutates ``audit.regression_flag``
+    via ``dq.regression.set_status`` and 303-redirects back here.
+    """
+    rule_rows_raw = (
+        await session.execute(_VALIDATION_RULE_FAILURES_7D_SQL, {"limit": rule_limit})
+    ).all()
+    rule_rows: list[DqValidationRuleRowVM] = [
+        DqValidationRuleRowVM(
+            rule_name=r.rule_name,
+            source=r.source,
+            failures_7d=int(r.failures_7d),
+            last_failure_at=r.last_failure_at,
+        )
+        for r in rule_rows_raw
+    ]
+
+    flag_rows_raw = (await session.execute(_VALIDATION_OPEN_FLAGS_SQL, {"limit": flag_limit})).all()
+    regression_rows: list[DqRegressionFlagRowVM] = [
+        DqRegressionFlagRowVM(
+            flag_id=int(r.flag_id),
+            source=r.source,
+            record_table=r.record_table,
+            record_pk_summary=_summarise_record_pk(r.record_pk),
+            metric=r.metric,
+            prior_value=_format_decimal(r.prior_value),
+            current_value=_format_decimal(r.current_value),
+            shift_pct=str(r.shift_pct),
+            threshold_pct=str(r.threshold_pct),
+            detected_at=r.detected_at,
+            status=r.status,
+        )
+        for r in flag_rows_raw
+    ]
+
+    skip_rows_raw = (await session.execute(_VALIDATION_XS_SKIPS_SQL, {"limit": skip_limit})).all()
+    xs_skip_rows: list[DqXsRuleSkipRowVM] = []
+    for r in skip_rows_raw:
+        payload = r.payload
+        if isinstance(payload, str):
+            payload_dict: dict[str, Any] = json.loads(payload)
+        elif isinstance(payload, dict):
+            payload_dict = payload
+        else:
+            payload_dict = {}
+        rule_name = str(payload_dict.get("rule_name") or "(unknown)")
+        reason = str(payload_dict.get("reason") or "(unspecified)")
+        missing_value = payload_dict.get("missing")
+        if isinstance(missing_value, list):
+            missing_summary = ", ".join(str(x) for x in missing_value) or "—"
+        else:
+            missing_summary = "—"
+        xs_skip_rows.append(
+            DqXsRuleSkipRowVM(
+                rule_name=rule_name,
+                reason=reason,
+                missing_summary=missing_summary,
+                emitted_at=r.emitted_at,
+            )
+        )
+
+    return DqValidationVM(
+        rule_rows=rule_rows,
+        regression_rows=regression_rows,
+        xs_skip_rows=xs_skip_rows,
+    )
+
+
 __all__ = [
     "audit_recent",
     "deadletter_recent",
@@ -1088,6 +1212,7 @@ __all__ = [
     "dq_recency",
     "dq_spot_check_queue",
     "dq_spot_check_sample_detail",
+    "dq_validation",
     "ingestion_recent",
     "outbox_recent",
     "overview",

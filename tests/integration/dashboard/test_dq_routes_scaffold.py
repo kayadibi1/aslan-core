@@ -34,23 +34,26 @@ pytestmark = pytest.mark.integration
 
 # Routes still backed by the M0 stub body (don't touch the DB).
 STUB_ROUTES = [
-    "/dq/validation",
     "/dq/scorecard",
 ]
 
-# M1 + M2 + M4 routes that hit audit.* tables. Tested via the configured app.
+# M1 + M2 + M4 + M5 routes that hit audit.* tables. Tested via the configured app.
 # /dq/spot-check moved off the stub list in M2 — see
 # tests/integration/dashboard/test_dq_spot_check.py for the
 # pending-queue + sample-form coverage.
 # /dq/bloomberg moved off the stub list in M4 — see
 # tests/integration/dashboard/test_dq_bloomberg.py for the per-cell
 # entry form + history coverage.
+# /dq/validation moved off the stub list in M5 — see
+# tests/integration/dashboard/test_dq_validation.py for the rule /
+# regression-flag / xs-skip surfaces and the regression review POST.
 M1_M2_ROUTES = [
     "/dq/overview",
     "/dq/recency",
     "/dq/coverage",
     "/dq/spot-check",
     "/dq/bloomberg",
+    "/dq/validation",
 ]
 
 

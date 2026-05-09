@@ -477,6 +477,67 @@ class DqBloombergRunDetailVM(_VMBase):
     cells: list[DqBloombergCellRowVM]
 
 
+# ── DQ M5: validation + regression-flag review ────────────────────
+
+
+class DqValidationRuleRowVM(_VMBase):
+    """One rule's 7-day failure rate on /dq/validation.
+
+    `failures` is the count of ``audit.validation_failure`` rows in
+    the trailing 7 days. `severity_breakdown` is a small dict keyed
+    by severity → count, frozen by Pydantic on construction.
+    """
+
+    rule_name: str
+    source: str
+    failures_7d: int
+    last_failure_at: datetime | None
+
+
+class DqRegressionFlagRowVM(_VMBase):
+    """One open regression flag on /dq/validation.
+
+    Numeric NUMERIC fields are surfaced as Decimal-text via the
+    ``Decimal`` typed field; the rendering helper formats them with a
+    fixed precision so the page is diff-stable.
+    """
+
+    flag_id: int
+    source: str
+    record_table: str
+    record_pk_summary: str
+    metric: str
+    prior_value: str | None
+    current_value: str | None
+    shift_pct: str
+    threshold_pct: str
+    detected_at: datetime
+    status: Literal["open", "reviewed", "dismissed", "confirmed_bug"]
+
+
+class DqXsRuleSkipRowVM(_VMBase):
+    """One recent ``xs_rule_skipped`` event from ``audit.event``.
+
+    Surfaces the cron-level gap (a cross-source rule whose dependent
+    source tables were absent on the last run) so operators can see
+    why no failures landed for a given rule.
+    """
+
+    rule_name: str
+    reason: str
+    missing_summary: str
+    emitted_at: datetime
+
+
+class DqValidationVM(_VMBase):
+    """/dq/validation page — 7d rule failure rate + open regression flags
+    + recent cross-source rule skips."""
+
+    rule_rows: list[DqValidationRuleRowVM]
+    regression_rows: list[DqRegressionFlagRowVM]
+    xs_skip_rows: list[DqXsRuleSkipRowVM]
+
+
 # ── DQ M0 stubs ────────────────────────────────────────────────────
 
 

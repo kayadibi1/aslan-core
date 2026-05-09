@@ -40,6 +40,12 @@ _MUTATION_ROUTES: frozenset[str] = frozenset(
         # privilege boundary contract — column-level UPDATE on
         # `bloomberg_value` is granted to audit_admin only.
         "/dq/bloomberg/cells/{cell_id}",
+        # dq M5: regression-flag review form. See
+        # aslan_core.dashboard.pages.dq_validation for the role +
+        # privilege boundary contract — column-level UPDATE on
+        # `status`/`reviewer`/`reviewed_at`/`review_note` is granted
+        # to audit_admin only.
+        "/dq/validation/regression/{flag_id}",
     }
 )
 # POST is the only mutation method permitted on allowlisted routes.
