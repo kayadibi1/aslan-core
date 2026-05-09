@@ -242,3 +242,25 @@ SELECT_SCORECARD_SNAPSHOT_WEEKS = text(
     "ORDER BY week_start DESC "
     "LIMIT :limit"
 )
+
+
+# ── dq NG6: external_corroborator_cache ──────────────────────────
+
+
+INSERT_CORROBORATOR_CACHE = text(
+    "INSERT INTO audit.external_corroborator_cache("
+    "  source, entity_ticker, fetched_at, cached_payload, "
+    "  fetch_url, fetch_latency_ms, fetch_status, error_summary"
+    ") VALUES ("
+    "  :source, :entity_ticker, :fetched_at, CAST(:cached_payload AS JSONB), "
+    "  :fetch_url, :fetch_latency_ms, :fetch_status, :error_summary"
+    ") RETURNING cache_id"
+)
+
+SELECT_CORROBORATOR_LATEST = text(
+    "SELECT cache_id, source, entity_ticker, fetched_at, cached_payload, "
+    "  fetch_url, fetch_latency_ms, fetch_status, error_summary, recorded_at "
+    "FROM audit.external_corroborator_cache "
+    "WHERE source = :source AND entity_ticker = :entity_ticker "
+    "ORDER BY fetched_at DESC LIMIT 1"
+)

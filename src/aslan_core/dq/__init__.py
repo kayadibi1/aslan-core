@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from aslan_core.dq import (
     alert_dispatch,
+    corroborator,
     coverage,
     event,
     recency,
@@ -47,6 +48,7 @@ __all__ = [
     "SyncRunStatus",
     "ValidationFailure",
     "alert_dispatch",
+    "corroborator",
     "coverage",
     "event",
     "recency",

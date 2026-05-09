@@ -114,6 +114,10 @@ ignore = [
 # dq probe module docstrings preserve Turkish source/agency names verbatim
 # per workspace CLAUDE.md "Turkish-language fidelity" (no auto-translation).
 "src/aslan_core/dq/probes/*.py" = ["RUF001", "RUF002", "RUF003"]
+# dq.corroborator extracts KAP IR page labels in Turkish (``Şirket Adı``,
+# ``Sektör``, ``BIST Kodu``) verbatim — per workspace CLAUDE.md
+# "Turkish-language fidelity", we never auto-translate the source labels.
+"src/aslan_core/dq/corroborator.py" = ["RUF001", "RUF002", "RUF003"]
 # NG1 public status page docstrings use the Unicode multiplication sign
 # (×) and en-dash glyphs verbatim — they appear in the rendered page
 # template and the docstring discussion of "2× SLA" thresholds.
