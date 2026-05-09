@@ -168,7 +168,11 @@ async def test_enqueue_dedup_within_minute(
 ) -> None:
     """Same (rule, sink, hash) inside the same minute: second enqueue
     returns the existing dispatch_id; row count remains 1."""
-    fired_at = datetime.now(UTC)
+    # Fixed timestamp midway through a minute so +5s stays inside the
+    # date_trunc('minute', fired_at) bucket. Mirrors the pattern used by
+    # test_enqueue_dedup_resets_next_minute below; using datetime.now(UTC)
+    # here flaked when the wall-clock second was >= 56.
+    fired_at = datetime(2026, 5, 9, 12, 0, 30, tzinfo=UTC)
     async with session_factory() as s:
         first = await alert_dispatch.enqueue(
             session=s,
