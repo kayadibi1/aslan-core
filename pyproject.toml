@@ -38,6 +38,14 @@ obs = [
     "opentelemetry-instrumentation-sqlalchemy>=0.48b0",
     "opentelemetry-instrumentation-asyncpg>=0.48b0",
     "prometheus-client>=0.21",
+    # M6.1 follow-up: WeasyPrint backs ``dq.scorecard.render_pdf`` and
+    # the ``/dq/scorecard/export?format=pdf`` dashboard endpoint. The
+    # native dep set (pango, cairo, gdk-pixbuf — Debian package names
+    # ``libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz-subset0``) is
+    # documented in the M6 handoff for the Hetzner image. Lazy-imported
+    # in ``render_pdf`` so a base ``aslan-core`` install runs without
+    # WeasyPrint and only operators wanting PDF export pay the cost.
+    "weasyprint>=60",
 ]
 # v0.6.0 dashboard extra. Consumers that want the read-only operator
 # web UI install ``aslan-core[dashboard]``. The base install runs
@@ -163,15 +171,17 @@ module = [
 ]
 ignore_missing_imports = true
 
-# v0.3.0 [obs] extra — sentry-sdk, opentelemetry, prometheus_client are
-# optional install deps. The observability modules use lazy imports so
-# the base install runs without them; mypy on a base venv must not
-# fail for the missing imports inside those lazy bodies.
+# v0.3.0 [obs] extra — sentry-sdk, opentelemetry, prometheus_client,
+# weasyprint are optional install deps. The observability modules
+# (and ``dq.scorecard.render_pdf``) use lazy imports so the base
+# install runs without them; mypy on a base venv must not fail for
+# the missing imports inside those lazy bodies.
 [[tool.mypy.overrides]]
 module = [
     "sentry_sdk.*",
     "opentelemetry.*",
     "prometheus_client.*",
+    "weasyprint.*",
 ]
 ignore_missing_imports = true
 

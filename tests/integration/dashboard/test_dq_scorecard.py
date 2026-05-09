@@ -11,10 +11,15 @@ Three scenarios:
     payload.body_html when it does.
   * /dq/scorecard/export downloads a standalone HTML file with the
     Content-Disposition attachment header.
+  * /dq/scorecard/export?format=pdf returns ``application/pdf`` bytes
+    when WeasyPrint is installed (skipped on environments without
+    the optional ``aslan-core[obs]`` extra), or 503 with the install
+    hint otherwise.
 """
 
 from __future__ import annotations
 
+import importlib.util
 from collections.abc import AsyncIterator
 from datetime import UTC, date, datetime
 
@@ -27,6 +32,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import aslan_core.dashboard.pages.dq_scorecard as _dq_scorecard  # noqa: F401
 from aslan_core.dashboard.app import app, configure_app
+
+_HAS_WEASYPRINT = importlib.util.find_spec("weasyprint") is not None
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="session")]
 
@@ -193,6 +200,73 @@ async def test_dq_scorecard_export_serves_attachment(
     body = resp.text
     assert body.startswith("<!doctype html>")
     assert "kap_recency_p95" in body
+    async with session_factory() as s:
+        await _wipe(s)
+        await s.commit()
+
+
+@pytest.mark.skipif(
+    not _HAS_WEASYPRINT,
+    reason="WeasyPrint not installed; install aslan-core[obs] to exercise PDF endpoint.",
+)
+async def test_dq_scorecard_export_pdf_serves_pdf_bytes(
+    _configured_dashboard: None,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """/dq/scorecard/export?format=pdf returns application/pdf bytes
+    starting with the PDF magic number."""
+    async with session_factory() as s:
+        await _wipe(s)
+        await s.execute(
+            text(
+                "INSERT INTO audit.scorecard_snapshot("
+                "  week_start, metric_name, target, actual, status, notes"
+                ") VALUES (:w, 'kap_recency_p95', '<= 300s', '120s', 'pass', NULL)"
+            ),
+            {"w": _TEST_WEEK},
+        )
+        await s.commit()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/dq/scorecard/export?format=pdf")
+    assert resp.status_code == 200
+    assert resp.headers.get("content-type") == "application/pdf"
+    cd = resp.headers.get("content-disposition", "")
+    assert "attachment" in cd
+    assert _TEST_WEEK.isoformat() in cd
+    assert ".pdf" in cd
+    body = resp.content
+    assert body.startswith(b"%PDF"), f"expected PDF magic, got: {body[:8]!r}"
+    async with session_factory() as s:
+        await _wipe(s)
+        await s.commit()
+
+
+@pytest.mark.skipif(
+    _HAS_WEASYPRINT,
+    reason="WeasyPrint installed in this env; the missing-dep 503 path is unreachable.",
+)
+async def test_dq_scorecard_export_pdf_returns_503_when_weasyprint_missing(
+    _configured_dashboard: None,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """/dq/scorecard/export?format=pdf returns 503 with the install
+    hint when WeasyPrint is not installed (operator gets a clear next
+    step rather than a generic 500)."""
+    async with session_factory() as s:
+        await _wipe(s)
+        await s.execute(
+            text(
+                "INSERT INTO audit.scorecard_snapshot("
+                "  week_start, metric_name, target, actual, status, notes"
+                ") VALUES (:w, 'kap_recency_p95', '<= 300s', '120s', 'pass', NULL)"
+            ),
+            {"w": _TEST_WEEK},
+        )
+        await s.commit()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/dq/scorecard/export?format=pdf")
+    assert resp.status_code == 503
+    assert "aslan-core[obs]" in resp.text
     async with session_factory() as s:
         await _wipe(s)
         await s.commit()

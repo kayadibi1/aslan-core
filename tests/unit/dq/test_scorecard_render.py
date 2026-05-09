@@ -13,15 +13,24 @@ no DB needed. Tests cover:
 
   * ``render_html`` returns a standalone document with doctype.
 
+  * ``render_pdf`` renders the standalone HTML through WeasyPrint to
+    PDF bytes (skipped on environments without the optional
+    ``aslan-core[obs]`` extra).
+
   * ``render_text_fallback`` returns a plaintext body with the
     metric / target / actual / status / notes columns aligned.
 """
 
 from __future__ import annotations
 
+import importlib.util
 from datetime import UTC, date, datetime
 
+import pytest
+
 from aslan_core.dq import scorecard
+
+_HAS_WEASYPRINT = importlib.util.find_spec("weasyprint") is not None
 
 
 def _row(metric: str, status: scorecard.ScorecardStatus = "pass") -> scorecard.ScorecardRow:
@@ -105,8 +114,10 @@ def test_render_html_is_standalone_document() -> None:
     body = scorecard.render_html(week_start=date(2026, 4, 27), rows=rows)
     assert body.startswith("<!doctype html>")
     assert "<title>" in body
-    # PDF deferred TODO must be visible to operators.
-    assert "TODO" in body or "M6.1" in body
+    # The deferred-TODO note has been resolved by render_pdf — make
+    # sure no stale "M6.1 TODO" copy survives in the operator-facing
+    # body.
+    assert "TODO(M6.1)" not in body
 
 
 def test_render_text_fallback_has_columns() -> None:
@@ -161,3 +172,35 @@ def test_compute_rejects_non_monday_week_start() -> None:
         raise AssertionError("expected ValueError for non-Monday week_start")
     except ValueError as exc:
         assert "Monday" in str(exc)
+
+
+@pytest.mark.skipif(
+    not _HAS_WEASYPRINT,
+    reason="WeasyPrint not installed; install aslan-core[obs] to exercise PDF render.",
+)
+def test_render_pdf_returns_pdf_bytes() -> None:
+    """When WeasyPrint is installed, render_pdf returns non-empty bytes
+    starting with ``%PDF`` (the PDF magic number)."""
+    rows = [
+        _row("kap_recency_p95", "pass"),
+        _row("regression_flag_open_count", "fail"),
+    ]
+    pdf_bytes = scorecard.render_pdf(week_start=date(2026, 4, 27), rows=rows)
+    assert isinstance(pdf_bytes, bytes)
+    assert len(pdf_bytes) > 0
+    assert pdf_bytes.startswith(b"%PDF"), (
+        f"expected PDF magic number, got first 8 bytes: {pdf_bytes[:8]!r}"
+    )
+
+
+@pytest.mark.skipif(
+    _HAS_WEASYPRINT,
+    reason="WeasyPrint is installed in this env; the missing-dep branch is unreachable.",
+)
+def test_render_pdf_raises_runtime_error_when_weasyprint_missing() -> None:
+    """When WeasyPrint isn't installed, render_pdf raises RuntimeError
+    pointing at the install hint (not ImportError, so callers get a
+    user-actionable message)."""
+    rows = [_row("kap_recency_p95", "pass")]
+    with pytest.raises(RuntimeError, match=r"aslan-core\[obs\]"):
+        scorecard.render_pdf(week_start=date(2026, 4, 27), rows=rows)

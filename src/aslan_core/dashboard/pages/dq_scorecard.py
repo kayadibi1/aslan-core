@@ -16,10 +16,12 @@ Spec §10.8 + §5.10. Three sections:
     * ``Export HTML`` — serves the rendered HTML body for download at
       ``/dq/scorecard/export``.
 
-PDF export is deferred to M6.1 (see ``dq.scorecard.render_html``
-TODO). The "Export HTML" download is the supported v1 surface; the
-spec's "PDF export" requirement is documented as deferred in the
-handoff doc.
+PDF export ships via WeasyPrint behind the optional
+``aslan-core[obs]`` extra. The "Export PDF" link calls
+``/dq/scorecard/export?format=pdf`` which renders the same HTML
+through WeasyPrint and returns ``application/pdf``. If the extra is
+not installed, the endpoint returns 503 with the install hint and
+the "Export HTML" link keeps working.
 
 Privilege boundary: dashboard role has SELECT-only on
 ``audit.scorecard_snapshot`` (migration 0062). The page is read-only;
@@ -162,10 +164,17 @@ def _build_dq_scorecard_body(vm: DqScorecardVM) -> object:
                 href="/dq/scorecard/export",
                 _id="dq-scorecard-export-link",
             ),
+            " · ",
+            A(
+                "Export PDF",
+                href="/dq/scorecard/export?format=pdf",
+                _id="dq-scorecard-export-pdf-link",
+            ),
         ),
         P(
-            "PDF export is deferred to M6.1 — v1 serves HTML and the "
-            "browser's print-to-PDF takes it from there.",
+            "PDF export uses WeasyPrint (aslan-core[obs] extra). "
+            "If the optional dep is not installed, the PDF link returns "
+            "503 with the install hint and the HTML export keeps working.",
             cls="aslan-scorecard-actions-note",
         ),
         _id="dq-scorecard-actions",
@@ -236,13 +245,15 @@ async def dq_scorecard_email_preview(request: Request) -> Response:
 
 @app.get("/dq/scorecard/export")  # type: ignore[misc,untyped-decorator,unused-ignore]
 async def dq_scorecard_export(request: Request) -> Response:
-    """Download the current week's scorecard as a standalone HTML file.
+    """Download the current week's scorecard.
 
-    Filename: ``aslan-scorecard-YYYY-MM-DD.html`` where the date is the
-    week_start. Real PDF export is M6.1 deferred (needs WeasyPrint /
-    reportlab); v1 ships HTML and the browser's print-to-PDF.
+    Default filename: ``aslan-scorecard-YYYY-MM-DD.html`` (HTML body).
+    Pass ``?format=pdf`` to download as
+    ``aslan-scorecard-YYYY-MM-DD.pdf`` instead — the PDF is rendered
+    via WeasyPrint, which lives behind the optional ``aslan-core[obs]``
+    extra. If WeasyPrint is not installed, the endpoint returns 503
+    with a clear message pointing at the install path.
     """
-    _ = request
     factory = get_session_factory()
     async with factory() as session:
         vm = await queries.dq_scorecard(session)
@@ -264,6 +275,24 @@ async def dq_scorecard_export(request: Request) -> Response:
         for r in vm.rows
     ]
     week_start = vm.current_week_start.date()
+    fmt = request.query_params.get("format", "html").lower()
+    if fmt == "pdf":
+        try:
+            pdf_bytes = scorecard_module.render_pdf(week_start=week_start, rows=rows)
+        except RuntimeError as exc:
+            # WeasyPrint not installed — surface the install hint.
+            return HTMLResponse(
+                f"<h1>PDF export unavailable</h1><p>{exc}</p>",
+                status_code=503,
+            )
+        filename = f"aslan-scorecard-{week_start.isoformat()}.pdf"
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+            },
+        )
     body = scorecard_module.render_html(week_start=week_start, rows=rows)
     filename = f"aslan-scorecard-{week_start.isoformat()}.html"
     return Response(
