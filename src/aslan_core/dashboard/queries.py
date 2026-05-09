@@ -836,7 +836,7 @@ def _summarise_record_pk(record_pk: Any) -> str:
         try:
             record_pk = json.loads(record_pk)
         except (ValueError, TypeError):
-            return record_pk
+            return str(record_pk)
     if not isinstance(record_pk, dict):
         return str(record_pk)
     return ", ".join(f"{k}={v}" for k, v in sorted(record_pk.items()))
@@ -851,14 +851,11 @@ def _record_pk_pairs(record_pk: Any) -> list[DqSpotCheckRecordPkPairVM]:
     if not isinstance(record_pk, dict):
         return []
     return [
-        DqSpotCheckRecordPkPairVM(key=str(k), value=str(v))
-        for k, v in sorted(record_pk.items())
+        DqSpotCheckRecordPkPairVM(key=str(k), value=str(v)) for k, v in sorted(record_pk.items())
     ]
 
 
-async def dq_spot_check_queue(
-    session: AsyncSession, *, limit: int = 50
-) -> DqSpotCheckQueueVM:
+async def dq_spot_check_queue(session: AsyncSession, *, limit: int = 50) -> DqSpotCheckQueueVM:
     """Pending samples + 7-day completion count for /dq/spot-check."""
     pending = (
         await session.execute(
@@ -943,9 +940,7 @@ async def dq_spot_check_sample_detail(
         )
         for r in result_rows
     ]
-    raw_bytes_status = (
-        "kap-replay-pending" if sample_row.source == "kap" else "api-replay-pending"
-    )
+    raw_bytes_status = "kap-replay-pending" if sample_row.source == "kap" else "api-replay-pending"
     return DqSpotCheckSampleDetailVM(
         sample_id=sample_row.sample_id,
         source=sample_row.source,

@@ -54,9 +54,7 @@ async def _kap_disclosures_seeded_for_cli(
         await s.execute(text("DELETE FROM kap.disclosures"))
         for _ in range(30):
             await s.execute(
-                text(
-                    "INSERT INTO kap.disclosures(event_type) VALUES ('material_event')"
-                )
+                text("INSERT INTO kap.disclosures(event_type) VALUES ('material_event')")
             )
         for _ in range(30):
             await s.execute(
@@ -88,8 +86,7 @@ async def test_cli_draws_for_kap_only_when_filtered(
         rows = (
             await s.execute(
                 text(
-                    "SELECT source, count(*)::int AS n "
-                    "FROM audit.spot_check_sample GROUP BY source"
+                    "SELECT source, count(*)::int AS n FROM audit.spot_check_sample GROUP BY source"
                 )
             )
         ).all()
@@ -109,9 +106,7 @@ async def test_cli_default_all_sources_skips_absent_tables(
     The skipped sources fire spot_check_draw_skipped events."""
     async with session_factory() as s:
         await s.execute(text("DELETE FROM audit.spot_check_sample"))
-        await s.execute(
-            text("DELETE FROM audit.event WHERE event_type LIKE 'spot_check_%'")
-        )
+        await s.execute(text("DELETE FROM audit.event WHERE event_type LIKE 'spot_check_%'"))
         await s.commit()
     summary = await _run_spot_check_draw(source_filter=None, n_per_source=3)
     assert summary["drawn"] == 3  # Only kap landed; 4 sources skipped silently.

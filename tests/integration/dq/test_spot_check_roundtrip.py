@@ -52,9 +52,7 @@ async def _kap_disclosures_seeded(
         # should noticeably exceed 20%.
         for _ in range(20):
             await s.execute(
-                text(
-                    "INSERT INTO kap.disclosures(event_type) VALUES ('material_event')"
-                )
+                text("INSERT INTO kap.disclosures(event_type) VALUES ('material_event')")
             )
         for _ in range(80):
             await s.execute(
@@ -103,7 +101,9 @@ async def test_draw_sample_skips_when_table_absent(
 ) -> None:
     """source with no primary table → empty list + event."""
     async with session_factory() as s:
-        await s.execute(text("DELETE FROM audit.event WHERE event_type = 'spot_check_draw_skipped'"))
+        await s.execute(
+            text("DELETE FROM audit.event WHERE event_type = 'spot_check_draw_skipped'")
+        )
         ids = await spot_check.draw_sample(session=s, source="tefas", n=5)
         await s.commit()
     assert ids == []
@@ -304,8 +304,7 @@ async def test_label_field_flips_labelled_flag(
         before = (
             await s.execute(
                 text(
-                    "SELECT labelled, labeller FROM audit.spot_check_sample "
-                    "WHERE sample_id = :sid"
+                    "SELECT labelled, labeller FROM audit.spot_check_sample WHERE sample_id = :sid"
                 ),
                 {"sid": sample_id},
             )
@@ -376,9 +375,7 @@ async def test_mark_sample_complete_idempotent(
         await s.commit()
     sample_id = ids[0]
     async with session_factory() as s:
-        await spot_check.mark_sample_complete(
-            session=s, sample_id=sample_id, labeller="auto"
-        )
+        await spot_check.mark_sample_complete(session=s, sample_id=sample_id, labeller="auto")
         await s.commit()
     async with session_factory() as s:
         first = (
@@ -394,9 +391,7 @@ async def test_mark_sample_complete_idempotent(
     assert first.labeller == "auto"
     # Second call: WHERE labelled = false guard makes this a no-op.
     async with session_factory() as s:
-        await spot_check.mark_sample_complete(
-            session=s, sample_id=sample_id, labeller="other"
-        )
+        await spot_check.mark_sample_complete(session=s, sample_id=sample_id, labeller="other")
         await s.commit()
     async with session_factory() as s:
         second = (
@@ -443,9 +438,7 @@ async def test_draw_sample_unsupported_stratum_raises(
 ) -> None:
     async with session_factory() as s:
         with pytest.raises(ValueError, match="unsupported stratum"):
-            await spot_check.draw_sample(
-                session=s, source="kap", n=5, stratum="bogus"
-            )
+            await spot_check.draw_sample(session=s, source="kap", n=5, stratum="bogus")
 
 
 async def test_draw_sample_kap_stratum_only_for_kap(

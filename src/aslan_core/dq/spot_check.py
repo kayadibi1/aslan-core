@@ -6,7 +6,7 @@ Three public surfaces:
     table, insert ``audit.spot_check_sample`` rows. KAP supports
     ``stratum='high_priority_event_type'`` which over-samples
     material_event / dividend / share_buyback / capital_action filings
-    at 2× weight (spec §7.2 step 1).
+    at 2x weight (spec §7.2 step 1).
 
   * ``pending_samples(...)`` — list rows where ``labelled = false``
     (the labeller's queue).
@@ -83,7 +83,7 @@ _SOURCE_TABLES: dict[str, _SourceTable] = {
     "mkk": _SourceTable("mkk", "mkk", "capital_action", ("entity_id", "event_at")),
 }
 
-# KAP "high-priority" event types — over-sampled at 2× when the
+# KAP "high-priority" event types — over-sampled at 2x when the
 # stratum kwarg is set. Spec §7.2 step 1.
 _HIGH_PRIORITY_KAP_TYPES: tuple[str, ...] = (
     "material_event",
@@ -135,30 +135,20 @@ async def _column_present(
 # carries through. Each query selects N rows uniformly at random; the
 # KAP variant doubles the per-row hit probability for high-priority types.
 _RANDOM_SQL: dict[str, Any] = {
-    "kap": text(
-        "SELECT disclosure_id FROM kap.disclosures "
-        "ORDER BY random() LIMIT :n"
-    ),
-    "bist": text(
-        "SELECT security_id, trade_date FROM bist.daily_ohlcv "
-        "ORDER BY random() LIMIT :n"
-    ),
+    "kap": text("SELECT disclosure_id FROM kap.disclosures ORDER BY random() LIMIT :n"),
+    "bist": text("SELECT security_id, trade_date FROM bist.daily_ohlcv ORDER BY random() LIMIT :n"),
     "evds": text(
-        "SELECT series_code, observation_date FROM evds.observation "
-        "ORDER BY random() LIMIT :n"
+        "SELECT series_code, observation_date FROM evds.observation ORDER BY random() LIMIT :n"
     ),
     "tefas": text(
         "SELECT fund_id, entity_id, snapshot_date FROM tefas.fund_holding "
         "ORDER BY random() LIMIT :n"
     ),
-    "mkk": text(
-        "SELECT entity_id, event_at FROM mkk.capital_action "
-        "ORDER BY random() LIMIT :n"
-    ),
+    "mkk": text("SELECT entity_id, event_at FROM mkk.capital_action ORDER BY random() LIMIT :n"),
 }
 
 # KAP stratified variant: rows where event_type IN high-priority list
-# get a 2× weight via UNION ALL — the 2nd copy effectively doubles the
+# get a 2x weight via UNION ALL — the 2nd copy effectively doubles the
 # random-pick probability per row.
 _RANDOM_KAP_HIGH_PRIORITY_SQL = text(
     "SELECT disclosure_id FROM ("
@@ -190,27 +180,22 @@ async def draw_sample(
     `stratum`:
       * ``None`` — uniform random.
       * ``"high_priority_event_type"`` — KAP-only over-sample of
-        material_event/dividend/share_buyback/capital_action at 2×.
+        material_event/dividend/share_buyback/capital_action at 2x.
         Falls back to uniform random when ``event_type`` is absent
         from ``kap.disclosures`` on this branch.
 
     Raises ``ValueError`` for unknown source or unsupported stratum.
     """
     if source not in _SOURCE_TABLES:
-        raise ValueError(
-            f"unknown source {source!r}; expected one of {sorted(_SOURCE_TABLES)}"
-        )
+        raise ValueError(f"unknown source {source!r}; expected one of {sorted(_SOURCE_TABLES)}")
     if n <= 0:
         raise ValueError(f"n must be positive; got {n}")
     if stratum is not None and stratum != "high_priority_event_type":
         raise ValueError(
-            f"unsupported stratum {stratum!r}; only "
-            f"'high_priority_event_type' is recognised"
+            f"unsupported stratum {stratum!r}; only 'high_priority_event_type' is recognised"
         )
     if stratum == "high_priority_event_type" and source != "kap":
-        raise ValueError(
-            f"stratum='high_priority_event_type' is KAP-only; got source={source!r}"
-        )
+        raise ValueError(f"stratum='high_priority_event_type' is KAP-only; got source={source!r}")
 
     src_meta = _SOURCE_TABLES[source]
     if not await _table_present(session, src_meta.schema, src_meta.table):
@@ -347,9 +332,7 @@ async def pending_samples(
     return [_row_to_sample(r) for r in result.all()]
 
 
-async def get_sample(
-    *, session: AsyncSession, sample_id: UUID
-) -> SpotCheckSample | None:
+async def get_sample(*, session: AsyncSession, sample_id: UUID) -> SpotCheckSample | None:
     """Fetch one sample by id (for the dashboard's per-sample form)."""
     result = await session.execute(
         SELECT_SPOT_CHECK_SAMPLE_BY_ID,
@@ -509,7 +492,7 @@ async def _maybe_mirror_to_agg_label(
                 },
             )
         ).one_or_none()
-    except Exception as exc:  # noqa: BLE001 — best-effort mirror, log and continue
+    except Exception as exc:  # best-effort mirror, log and continue
         _log.warning(
             "spot_check.mirror_failed",
             sample_id=str(sample.sample_id),

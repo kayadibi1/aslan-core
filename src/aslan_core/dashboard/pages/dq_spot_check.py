@@ -1,7 +1,6 @@
-"""/dq/spot-check — pending queue + per-sample labelling form (GET).
+"""/dq/spot-check — pending queue + per-sample labelling form.
 
-M2 deliverable per spec §5.5 + §7.2 + §10.5. The POST handler that
-accepts label submissions lands in a follow-up commit.
+M2 deliverable per spec §5.5 + §7.2 + §10.5.
 
 Two GET routes:
 
@@ -12,14 +11,20 @@ Two GET routes:
       right = raw bytes pane (v1 placeholder; live MinIO replay in M2.1);
       bottom = per-field text inputs + truth-value submission form.
 
+One POST route:
+
+  * ``POST /dq/spot-check/{sample_id}`` — accept the labelling form
+    submission. The handler dispatches one ``label_field()`` call per
+    request, then 303-redirects back to the pending queue.
+
 Spec §5.5 contract: ``audit.spot_check_sample`` rows are append-only;
 the labelling flow flips ``labelled = false → true`` once via the
 narrow column-level UPDATE GRANT. ``audit.spot_check_result`` rows
 are append-only outright. The dashboard role itself has SELECT only
-on both tables (migration 0058) — the POST handler (next commit)
-runs the ``dq.spot_check`` write helpers under a write-capable
-session, which on production is the labeller's authenticated session
-against the ``audit_writer`` role.
+on both tables (migration 0058) — the POST handler runs the
+``dq.spot_check`` write helpers under a write-capable session, which
+on production is the labeller's authenticated session against the
+``audit_writer`` role.
 """
 
 from __future__ import annotations
@@ -46,7 +51,7 @@ from fasthtml.common import (
     Tr,
 )
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, Response
+from starlette.responses import HTMLResponse, RedirectResponse, Response
 
 # Side-effect import: shared DqStubVM template lives in dq_overview.
 import aslan_core.dashboard.pages.dq_overview  # noqa: F401
@@ -57,9 +62,9 @@ from aslan_core.dashboard.view_models import (
     DqSpotCheckQueueVM,
     DqSpotCheckSampleDetailVM,
 )
+from aslan_core.dq import spot_check
 
-# ── Form-input bounds (used by the GET form action target; the
-# POST validator that consumes them lands in the follow-up commit) ──
+# ── Input validation ─────────────────────────────────────────────
 
 
 # Field names: short alphanumeric + underscore + dot. Matches the
@@ -67,10 +72,29 @@ from aslan_core.dashboard.view_models import (
 # `entity.name`). Length-bounded so a malicious form post can't DoS
 # the persisted column.
 _FIELD_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.]{0,63}$")
+# Truth values are textual — the column is TEXT. We bound at 4 KiB
+# so a labeller-side paste error doesn't blow out the row width.
 _MAX_TRUTH_VALUE_LEN = 4096
 _MAX_LABEL_NOTE_LEN = 2048
 _MAX_LABELLER_LEN = 64
-_ = _FIELD_NAME_RE, _MAX_LABELLER_LEN  # POST handler reuses these.
+
+
+def _validate_field(field: str) -> str | None:
+    if not field:
+        return "field name required"
+    if len(field) > 64:
+        return "field name too long (>64)"
+    if not _FIELD_NAME_RE.match(field):
+        return "field name has invalid characters (alphanumeric + . _ only)"
+    return None
+
+
+def _validate_value(value: str | None, *, max_len: int, label: str) -> str | None:
+    if value is None:
+        return None
+    if len(value) > max_len:
+        return f"{label} too long (>{max_len})"
+    return None
 
 
 # ── Body builders ────────────────────────────────────────────────
@@ -251,3 +275,85 @@ async def dq_spot_check_detail(request: Request, sample_id: str) -> Response:
             status_code=404,
         )
     return render(request, vm)
+
+
+@app.post("/dq/spot-check/{sample_id}")  # type: ignore[misc,untyped-decorator,unused-ignore]
+async def dq_spot_check_submit(request: Request, sample_id: str) -> Response:
+    """Accept one label submission and 303-redirect back to the queue.
+
+    Validates inputs against the bounded character classes / lengths
+    declared at the top of this module — a bad field name or an
+    over-length truth value returns 400 with a short error string.
+    On success calls ``dq.spot_check.label_field()`` once and redirects
+    back to ``/dq/spot-check`` so the labeller sees the updated queue.
+
+    Privilege boundary: the dashboard role itself has SELECT-only on
+    audit.spot_check_sample / audit.spot_check_result. Production
+    deployment expects the labeller's session to authenticate as a
+    write-capable role (``audit_writer`` holds the narrow column-level
+    UPDATE plus INSERT). ``configure_app(...)`` is the dependency
+    injection seam the deployment uses to bind the right factory.
+    """
+    try:
+        sid = UUID(sample_id)
+    except ValueError:
+        return HTMLResponse("<h1>Bad sample id</h1>", status_code=400)
+
+    form = await request.form()
+
+    def _form_str(name: str) -> str | None:
+        value = form.get(name)
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            # Starlette's form() also returns UploadFile for multipart
+            # file fields. We never accept files on this form.
+            return None
+        return value
+
+    field = (_form_str("field") or "").strip()
+    db_value_raw = _form_str("db_value")
+    truth_value_raw = _form_str("truth_value")
+    label_note_raw = _form_str("label_note")
+    labeller = (_form_str("labeller") or "").strip()
+
+    # Empty-string → None on the optional values so the audit row
+    # carries SQL NULL rather than the empty string.
+    db_value = db_value_raw.strip() if db_value_raw and db_value_raw.strip() else None
+    truth_value = truth_value_raw.strip() if truth_value_raw and truth_value_raw.strip() else None
+    label_note = label_note_raw.strip() if label_note_raw and label_note_raw.strip() else None
+
+    err = _validate_field(field)
+    if err is not None:
+        return HTMLResponse(f"<h1>Bad input</h1><p>{err}</p>", status_code=400)
+    if not labeller or len(labeller) > _MAX_LABELLER_LEN:
+        return HTMLResponse(
+            "<h1>Bad input</h1><p>labeller required, max 64 chars</p>",
+            status_code=400,
+        )
+    err = _validate_value(db_value, max_len=_MAX_TRUTH_VALUE_LEN, label="db_value")
+    if err is not None:
+        return HTMLResponse(f"<h1>Bad input</h1><p>{err}</p>", status_code=400)
+    err = _validate_value(truth_value, max_len=_MAX_TRUTH_VALUE_LEN, label="truth_value")
+    if err is not None:
+        return HTMLResponse(f"<h1>Bad input</h1><p>{err}</p>", status_code=400)
+    err = _validate_value(label_note, max_len=_MAX_LABEL_NOTE_LEN, label="label_note")
+    if err is not None:
+        return HTMLResponse(f"<h1>Bad input</h1><p>{err}</p>", status_code=400)
+
+    factory = get_session_factory()
+    async with factory() as session:
+        try:
+            await spot_check.label_field(
+                session=session,
+                sample_id=sid,
+                field=field,
+                db_value=db_value,
+                truth_value=truth_value,
+                labeller=labeller,
+                label_note=label_note,
+            )
+        except LookupError:
+            return HTMLResponse("<h1>Sample not found</h1>", status_code=404)
+        await session.commit()
+    return RedirectResponse(url="/dq/spot-check", status_code=303)

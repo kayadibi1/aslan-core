@@ -78,22 +78,16 @@ def upgrade() -> None:
         )
     """)
     op.execute("CREATE INDEX scr_sample ON audit.spot_check_result(sample_id)")
-    op.execute(
-        "CREATE INDEX scr_match "
-        "ON audit.spot_check_result(matches, recorded_at DESC)"
-    )
+    op.execute("CREATE INDEX scr_match ON audit.spot_check_result(matches, recorded_at DESC)")
 
     # Writer role: full INSERT on sample + result; UPDATE only on the
     # three columns the labelling flow flips on first label.
     op.execute("GRANT INSERT ON audit.spot_check_sample TO audit_writer")
     op.execute(
-        "GRANT UPDATE (labelled, labelled_at, labeller) "
-        "ON audit.spot_check_sample TO audit_writer"
+        "GRANT UPDATE (labelled, labelled_at, labeller) ON audit.spot_check_sample TO audit_writer"
     )
     op.execute("GRANT INSERT ON audit.spot_check_result TO audit_writer")
-    op.execute(
-        "GRANT USAGE ON SEQUENCE audit.spot_check_result_result_id_seq TO audit_writer"
-    )
+    op.execute("GRANT USAGE ON SEQUENCE audit.spot_check_result_result_id_seq TO audit_writer")
 
     # Reader role: SELECT on both.
     op.execute("GRANT SELECT ON audit.spot_check_sample TO audit_reader")

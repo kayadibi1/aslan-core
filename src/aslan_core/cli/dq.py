@@ -411,10 +411,7 @@ _SPOT_CHECK_SOURCES: tuple[str, ...] = ("kap", "bist", "evds", "tefas", "mkk")
     "--source",
     "source_filter",
     default=None,
-    help=(
-        "Limit the draw to one source (kap|bist|evds|tefas|mkk). "
-        "Default: draw across all five."
-    ),
+    help=("Limit the draw to one source (kap|bist|evds|tefas|mkk). Default: draw across all five."),
 )
 @click.option(
     "--n",
@@ -438,18 +435,14 @@ def spot_check_draw_cmd(source_filter: str | None, n_per_source: int) -> None:
     )
 
 
-async def _run_spot_check_draw(
-    source_filter: str | None, n_per_source: int
-) -> dict[str, int]:
+async def _run_spot_check_draw(source_filter: str | None, n_per_source: int) -> dict[str, int]:
     engine = create_engine()
     factory = create_session_factory(engine)
     try:
         async with factory() as s:
             drawn = 0
             sources_touched = 0
-            sources = (
-                (source_filter,) if source_filter is not None else _SPOT_CHECK_SOURCES
-            )
+            sources = (source_filter,) if source_filter is not None else _SPOT_CHECK_SOURCES
             for source in sources:
                 stratum = "high_priority_event_type" if source == "kap" else None
                 try:

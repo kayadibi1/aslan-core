@@ -46,9 +46,7 @@ async def _kap_seeded(
         await s.execute(text("DELETE FROM kap.disclosures"))
         for _ in range(5):
             await s.execute(
-                text(
-                    "INSERT INTO kap.disclosures(event_type) VALUES ('material_event')"
-                )
+                text("INSERT INTO kap.disclosures(event_type) VALUES ('material_event')")
             )
         await s.execute(text("DELETE FROM audit.spot_check_result"))
         await s.execute(text("DELETE FROM audit.spot_check_sample"))
@@ -136,3 +134,150 @@ async def test_sample_detail_400_for_bad_uuid(
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.get("/dq/spot-check/not-a-uuid")
     assert resp.status_code == 400
+
+
+# ── POST tests ────────────────────────────────────────────────────
+
+
+async def test_post_writes_result_and_redirects(
+    _configured_dashboard: None,
+    _kap_seeded: None,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Happy path: POST → 303 redirect to /dq/spot-check + result row
+    persisted + sample.labelled flipped."""
+    async with session_factory() as s:
+        ids = await spot_check.draw_sample(session=s, source="kap", n=1)
+        await s.commit()
+    sid = ids[0]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            f"/dq/spot-check/{sid}",
+            data={
+                "field": "revenue_try",
+                "db_value": "1000",
+                "truth_value": "1010",
+                "labeller": "sidar",
+                "label_note": "ratio under 1pp",
+            },
+        )
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/dq/spot-check"
+    async with session_factory() as s:
+        result_count = (
+            await s.execute(
+                text(
+                    "SELECT count(*)::int AS n FROM audit.spot_check_result WHERE sample_id = :sid"
+                ),
+                {"sid": sid},
+            )
+        ).scalar_one()
+        sample_row = (
+            await s.execute(
+                text(
+                    "SELECT labelled, labeller FROM audit.spot_check_sample WHERE sample_id = :sid"
+                ),
+                {"sid": sid},
+            )
+        ).one()
+    assert result_count == 1
+    assert sample_row.labelled is True
+    assert sample_row.labeller == "sidar"
+
+
+async def test_post_400_for_bad_field_name(
+    _configured_dashboard: None,
+    _kap_seeded: None,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as s:
+        ids = await spot_check.draw_sample(session=s, source="kap", n=1)
+        await s.commit()
+    sid = ids[0]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            f"/dq/spot-check/{sid}",
+            data={
+                "field": "drop table users;--",
+                "db_value": "1",
+                "truth_value": "1",
+                "labeller": "sidar",
+            },
+        )
+    assert resp.status_code == 400
+
+
+async def test_post_400_for_missing_labeller(
+    _configured_dashboard: None,
+    _kap_seeded: None,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as s:
+        ids = await spot_check.draw_sample(session=s, source="kap", n=1)
+        await s.commit()
+    sid = ids[0]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            f"/dq/spot-check/{sid}",
+            data={
+                "field": "revenue_try",
+                "db_value": "1",
+                "truth_value": "1",
+                "labeller": "",
+            },
+        )
+    assert resp.status_code == 400
+
+
+async def test_post_400_for_overlong_truth_value(
+    _configured_dashboard: None,
+    _kap_seeded: None,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as s:
+        ids = await spot_check.draw_sample(session=s, source="kap", n=1)
+        await s.commit()
+    sid = ids[0]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            f"/dq/spot-check/{sid}",
+            data={
+                "field": "x",
+                "db_value": "1",
+                "truth_value": "y" * (4097),
+                "labeller": "sidar",
+            },
+        )
+    assert resp.status_code == 400
+
+
+async def test_post_400_for_bad_uuid(
+    _configured_dashboard: None,
+) -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/dq/spot-check/not-a-uuid",
+            data={
+                "field": "x",
+                "db_value": "1",
+                "truth_value": "1",
+                "labeller": "sidar",
+            },
+        )
+    assert resp.status_code == 400
+
+
+async def test_post_404_for_unknown_sample(
+    _configured_dashboard: None,
+) -> None:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/dq/spot-check/00000000-0000-0000-0000-000000000000",
+            data={
+                "field": "x",
+                "db_value": "1",
+                "truth_value": "1",
+                "labeller": "sidar",
+            },
+        )
+    assert resp.status_code == 404

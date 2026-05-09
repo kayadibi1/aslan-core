@@ -1,11 +1,17 @@
-"""POST to every registered route returns 405.
+"""POST to every registered route returns 405, except the small
+allowlist of mutation routes carrying explicit audit-write workflows.
 
-Spec §3 + §8.2: the v0.6.0 dashboard is read-only. The unit test
-``test_dashboard_routes_are_get_only.py`` enforces this at the
-route-table layer; this integration test goes through the full
-ASGI stack so a regression that registered a non-routing POST
-shim (e.g. a middleware that dispatches POSTs) would still be
-caught.
+Spec §3 + §8.2: the v0.6.0 dashboard is read-only by default. The
+unit test ``test_dashboard_routes_are_get_only.py`` enforces the
+route-table layer; this integration test goes through the full ASGI
+stack so a regression that registered a non-routing POST shim (e.g.
+a middleware that dispatches POSTs) would still be caught.
+
+The dq M2 spot-check labelling form (``/dq/spot-check/{sample_id}``)
+is the lone mutation route. See
+``aslan_core.dashboard.pages.dq_spot_check`` for the role + privilege
+boundary contract — the dashboard role itself remains SELECT-only on
+the underlying audit tables.
 """
 
 from __future__ import annotations
@@ -23,17 +29,32 @@ from aslan_core.dashboard.app import app, configure_app
 
 pytestmark = pytest.mark.integration
 
+# Routes permitted to expose POST. Mirrors the unit-test allowlist
+# in tests/unit/test_dashboard_routes_are_get_only.py.
+_MUTATION_ROUTES: frozenset[str] = frozenset({"/dq/spot-check/{sample_id}"})
 
-def _post_paths() -> list[str]:
+
+def _gettable_paths() -> list[str]:
     """Walk the route table and pick a representative request path
-    for each route. Static-asset routes are kept (their POST is
-    just as forbidden as any page's)."""
+    for each non-mutation route. Mutation-allowlisted routes are
+    excluded (they validate via the page-specific tests instead).
+
+    For routes with path parameters we substitute a representative
+    literal that the route's converter will accept — the PUT/POST
+    405 check doesn't depend on the path-param value being meaningful.
+    """
     paths: list[str] = []
     for route in app.routes:
-        if isinstance(route, Route) and route.path:
-            # Route paths in this app are literal (no path
-            # parameters), so the path itself is a valid request URL.
-            paths.append(route.path)
+        if not isinstance(route, Route) or not route.path:
+            continue
+        if route.path in _MUTATION_ROUTES:
+            continue
+        path = route.path
+        # Substitute path-param placeholders with a benign literal so
+        # the route resolves rather than 404-ing before the 405 check.
+        if "{" in path:
+            path = path.replace("{sample_id}", "00000000-0000-0000-0000-000000000000")
+        paths.append(path)
     return paths
 
 
@@ -46,7 +67,7 @@ async def _configured_dashboard(
     yield
 
 
-@pytest.mark.parametrize("path", _post_paths())
+@pytest.mark.parametrize("path", _gettable_paths())
 @pytest.mark.asyncio(loop_scope="session")
 async def test_post_to_registered_route_returns_405(
     _configured_dashboard: None,
@@ -59,5 +80,6 @@ async def test_post_to_registered_route_returns_405(
         response = await client.post(path)
     assert response.status_code == 405, (
         f"POST {path!r} returned {response.status_code}; expected 405 — "
-        "the v0.6.0 dashboard is read-only at the route-table layer"
+        "the v0.6.0 dashboard is read-only at the route-table layer "
+        "(except the named spot-check mutation route)"
     )

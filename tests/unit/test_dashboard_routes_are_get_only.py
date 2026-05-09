@@ -54,8 +54,7 @@ def test_every_route_is_get_only() -> None:
         if route.path in _MUTATION_ROUTES:
             unsafe = methods - _ALLOWED_MUTATION_METHODS
             assert not unsafe, (
-                f"mutation-allowlisted route {route.path!r} exposes "
-                f"unexpected methods {unsafe!r}"
+                f"mutation-allowlisted route {route.path!r} exposes unexpected methods {unsafe!r}"
             )
         else:
             unsafe = methods - _ALLOWED_METHODS
