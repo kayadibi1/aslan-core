@@ -57,6 +57,7 @@ def create_api_app() -> FastAPI:
     from aslan_core.api.routes.catalog import router as catalog_router
     from aslan_core.api.routes.entities import router as entities_router
     from aslan_core.api.routes.financials import router as financials_router
+    from aslan_core.api.routes.research import router as research_router
 
     app = FastAPI(
         title="Aslan Financial API",
@@ -68,6 +69,9 @@ def create_api_app() -> FastAPI:
     app.include_router(entities_router, prefix="/entities", tags=["entities"])
     app.include_router(financials_router, prefix="/financials", tags=["financials"])
     app.include_router(catalog_router, tags=["catalog"])
+    # Bitemporal Research API — gated by BITEMPORAL_API_ENABLED feature flag.
+    # Mounts at /v1/research; the router defines its own prefix internally.
+    app.include_router(research_router)
 
     register_exception_handlers(app)
 
