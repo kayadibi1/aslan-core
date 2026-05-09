@@ -82,3 +82,7 @@ async def test_recency_observation_is_hypertable(engine: AsyncEngine) -> None:
 
 async def test_coverage_snapshot_table_exists(engine: AsyncEngine) -> None:
     assert await _table_exists(engine, "audit", "coverage_snapshot")
+
+
+async def test_validation_failure_table_exists(engine: AsyncEngine) -> None:
+    assert await _table_exists(engine, "audit", "validation_failure")
