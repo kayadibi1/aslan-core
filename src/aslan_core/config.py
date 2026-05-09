@@ -85,6 +85,32 @@ class Settings(BaseSettings):
         validation_alias="ASLAN_METRICS_ENABLED",
     )
 
+    # ── DQ alert sinks (M3) ──────────────────────────────────────────
+    # Optional fanout targets for `aslan_core.dq.alert_dispatch`. Each
+    # is independently nullable: when a sink is unconfigured the
+    # dispatcher marks affected `audit.alert_dispatch` rows as
+    # ``status='suppressed'`` with a ``not_configured`` reason rather
+    # than raising. Production must set at least one (typically all
+    # three) — see docs/superpowers/handoffs/2026-05-09-dq-m1-emitter-wiring.md
+    # `## M3 alert deployment` for env-var wiring.
+    audit_glitchtip_dsn: SecretStr | None = Field(
+        default=None,
+        validation_alias="ASLAN_AUDIT_GLITCHTIP_DSN",
+    )
+    audit_smtp_url: SecretStr | None = Field(
+        default=None,
+        validation_alias="ASLAN_AUDIT_SMTP_URL",
+    )
+    # Comma-separated; the email sink splits on `,` and trims whitespace.
+    audit_email_to: str = Field(
+        default="",
+        validation_alias="ASLAN_AUDIT_EMAIL_TO",
+    )
+    audit_slack_webhook_url: SecretStr | None = Field(
+        default=None,
+        validation_alias="ASLAN_AUDIT_SLACK_WEBHOOK_URL",
+    )
+
     def __init__(self, **kw: Any) -> None:
         try:
             super().__init__(**kw)
