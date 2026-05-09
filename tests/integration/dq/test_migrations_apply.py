@@ -110,3 +110,11 @@ async def test_spot_check_pending_index_exists(engine: AsyncEngine) -> None:
             )
         ).scalar_one_or_none()
     assert row == "scs_pending"
+
+
+async def test_bloomberg_comparison_run_table_exists(engine: AsyncEngine) -> None:
+    assert await _table_exists(engine, "audit", "bloomberg_comparison_run")
+
+
+async def test_bloomberg_comparison_cell_table_exists(engine: AsyncEngine) -> None:
+    assert await _table_exists(engine, "audit", "bloomberg_comparison_cell")
