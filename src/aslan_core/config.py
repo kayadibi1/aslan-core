@@ -111,6 +111,34 @@ class Settings(BaseSettings):
         validation_alias="ASLAN_AUDIT_SLACK_WEBHOOK_URL",
     )
 
+    # ── DQ probe upstream HTTP (Batch 2 follow-up) ───────────────────
+    # Opt-in URLs used by the per-source recency probes (KAP / MKK)
+    # to compute ``upstream_latest_at`` against a real upstream rather
+    # than the conservative DB-only fallback. When unset, the probes
+    # use DB-only mode (assumes upstream publishes continuously, lag
+    # = "time since our last ingest"). When set, the probes issue an
+    # HTTP GET via the proxy-aware httpx client (KAP_PROXY_URL when
+    # present, else direct) and parse for the latest event timestamp.
+    #
+    # CRITICAL (per workspace CLAUDE.md + crawl commit eb78619): KAP
+    # HTTP from any aslan service MUST honor the rotating-proxy pool
+    # via ``KAP_PROXY_URL``. The probe's httpx client reads
+    # ``KAP_PROXY_URL`` directly so a forgotten env var does not
+    # silently bypass the proxy. ``DQ_KAP_LISTING_URL=`` (empty) keeps
+    # the probe in DB-only mode regardless of ``KAP_PROXY_URL``.
+    dq_kap_listing_url: str | None = Field(
+        default=None,
+        validation_alias="DQ_KAP_LISTING_URL",
+    )
+    dq_mkk_api_url: str | None = Field(
+        default=None,
+        validation_alias="DQ_MKK_API_URL",
+    )
+    dq_mkk_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias="DQ_MKK_API_KEY",
+    )
+
     def __init__(self, **kw: Any) -> None:
         try:
             super().__init__(**kw)
