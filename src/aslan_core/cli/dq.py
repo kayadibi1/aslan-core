@@ -49,7 +49,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from aslan_core.config import Settings
 from aslan_core.db.engine import create_engine
 from aslan_core.db.session import create_session_factory
-from aslan_core.dq import alert_dispatch, bloomberg, coverage, event, recency, spot_check
+from aslan_core.dq import (
+    alert_dispatch,
+    bloomberg,
+    coverage,
+    cross_source,
+    event,
+    recency,
+    regression_detect,
+    spot_check,
+)
 from aslan_core.dq._sql import SELECT_RECENCY_SLA
 from aslan_core.dq.probes import SOURCES, get_probe
 from aslan_core.dq.sinks import Sink, SinkNotConfigured, build_default_sinks
@@ -987,6 +996,90 @@ async def _run_bloomberg_reminder(
             "stale_runs": len(stale),
             "delivered": delivered,
             "suppressed": suppressed,
+        }
+    finally:
+        await engine.dispose()
+
+
+# ── cross-source-consistency ──────────────────────────────────────
+
+
+@audit.command("cross-source-consistency")
+def cross_source_consistency_cmd() -> None:
+    """Run all 6 cross-source consistency rules nightly.
+
+    Spec §7.3. Each rule joins across two source schemas to detect
+    inconsistencies single-source validation can't catch (dangling
+    entity references, KAP/MKK capital-action correlation, NAV
+    reconciliation, EVDS calendar misses, etc.). Per-rule failures
+    persist to ``audit.validation_failure`` so they show up in the
+    /dq/validation feed alongside in-line validation failures.
+
+    Rules whose required source tables aren't present on this branch
+    skip gracefully and emit a single ``xs_rule_skipped`` event; the
+    cron loop continues.
+
+    Cron schedule: ``0 2 * * * audit cross-source-consistency``.
+    """
+    summary = asyncio.run(_run_cross_source_consistency())
+    rules_section = ", ".join(f"{k}={v}" for k, v in summary.items())
+    click.echo(f"cross-source-consistency complete: {rules_section}")
+
+
+async def _run_cross_source_consistency() -> dict[str, int]:
+    engine = create_engine()
+    factory = create_session_factory(engine)
+    try:
+        async with factory() as s:
+            summary = await cross_source.run_all(session=s)
+            await s.commit()
+            return summary
+    finally:
+        await engine.dispose()
+
+
+# ── regression-detect (v1 + v2) ────────────────────────────────────
+
+
+@audit.command("regression-detect")
+def regression_detect_cmd() -> None:
+    """Detect period-over-period regressions + auto-dismiss justified flags.
+
+    v1: for each (entity, metric) in the curated list, compute the
+    period-over-period shift on ``ts.canonical_financial`` and emit an
+    ``audit.regression_flag`` with ``status='open'`` whenever
+    ``|shift_pct| > threshold_pct``.
+
+    v2 (NG5, in-scope per autonomy directive): for each newly-flagged
+    row, query ``kap.disclosures`` for material filings on the entity
+    in the window ``[detected_at - 7d, detected_at + 1d]``. If a
+    filing of category in ``{material_event, capital_action, dividend}``
+    exists, auto-dismiss the flag with
+    ``review_note='auto-dismissed: justified by KAP filing <id>'`` and
+    emit ``regression_auto_dismissed`` for the audit trail.
+
+    Cron schedule: ``0 3 * * * audit regression-detect``.
+    """
+    summary = asyncio.run(_run_regression_detect())
+    click.echo(
+        f"regression-detect complete: "
+        f"{summary['v1_flagged']} flagged, "
+        f"{summary['v2_dismissed']} auto-dismissed (v2), "
+        f"{summary['v2_kept_open']} kept open"
+    )
+
+
+async def _run_regression_detect() -> dict[str, int]:
+    engine = create_engine()
+    factory = create_session_factory(engine)
+    try:
+        async with factory() as s:
+            result = await regression_detect.detect_and_correlate(session=s)
+            await s.commit()
+        return {
+            "v1_flagged": result.v1_flagged,
+            "v2_dismissed": result.v2_dismissed,
+            "v2_kept_open": result.v2_kept_open,
         }
     finally:
         await engine.dispose()
