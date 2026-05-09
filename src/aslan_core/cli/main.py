@@ -12,6 +12,7 @@ from aslan_core.cli.dashboard import dashboard
 from aslan_core.cli.doc import doc
 from aslan_core.cli.dq import audit
 from aslan_core.cli.migrate import migrate
+from aslan_core.cli.public_status import public_status
 from aslan_core.cli.registry import registry
 from aslan_core.cli.seed import seed
 from aslan_core.cli.streams import streams
@@ -51,6 +52,7 @@ cli.add_command(dashboard)
 cli.add_command(agg)
 cli.add_command(api)
 cli.add_command(audit)
+cli.add_command(public_status)
 
 
 if __name__ == "__main__":
