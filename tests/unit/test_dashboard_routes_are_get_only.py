@@ -46,6 +46,12 @@ _MUTATION_ROUTES: frozenset[str] = frozenset(
         # `status`/`reviewer`/`reviewed_at`/`review_note` is granted
         # to audit_admin only.
         "/dq/validation/regression/{flag_id}",
+        # NG6: external-corroborator refresh button. See
+        # aslan_core.dashboard.pages.dq_spot_check + the NG6 handoff
+        # for the role + privilege boundary contract — INSERT on
+        # `audit.external_corroborator_cache` is granted to
+        # audit_writer only; UPDATE is never granted.
+        "/dq/spot-check/{sample_id}/corroborator/{source}/refresh",
     }
 )
 # POST is the only mutation method permitted on allowlisted routes.

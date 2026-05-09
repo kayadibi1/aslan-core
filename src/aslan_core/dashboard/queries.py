@@ -41,9 +41,9 @@ output and constructs the final frozen VM at render time.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from datetime import date as date_cls
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from sqlalchemy import text
@@ -69,6 +69,8 @@ from aslan_core.dashboard.view_models import (
     DqScorecardRowVM,
     DqScorecardVM,
     DqScorecardWeekSummaryVM,
+    DqSpotCheckCorroboratorPanelVM,
+    DqSpotCheckCorroboratorPayloadPairVM,
     DqSpotCheckQueueVM,
     DqSpotCheckRecordPkPairVM,
     DqSpotCheckResultRowVM,
@@ -910,6 +912,203 @@ async def dq_spot_check_queue(session: AsyncSession, *, limit: int = 50) -> DqSp
     )
 
 
+_CORROBORATOR_LATEST_SQL = text(
+    "SELECT source, entity_ticker, fetched_at, cached_payload, "
+    "  fetch_url, fetch_latency_ms, fetch_status, error_summary "
+    "FROM audit.external_corroborator_cache "
+    "WHERE source = :source AND entity_ticker = :entity_ticker "
+    "ORDER BY fetched_at DESC LIMIT 1"
+)
+
+_CORROBORATOR_TTL_HOURS = 24
+
+
+def _humanize_corroborator_age(fetched_at: datetime | None) -> str:
+    if fetched_at is None:
+        return "never"
+    if fetched_at.tzinfo is None:
+        fetched_at = fetched_at.replace(tzinfo=UTC)
+    delta = datetime.now(UTC) - fetched_at
+    seconds = max(int(delta.total_seconds()), 0)
+    if seconds < 60:
+        return f"{seconds} sec ago"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} min ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours} hr ago"
+    days = hours // 24
+    return f"{days} day ago" if days == 1 else f"{days} days ago"
+
+
+def _corroborator_payload_pairs(
+    payload: Any,
+) -> list[DqSpotCheckCorroboratorPayloadPairVM]:
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (ValueError, TypeError):
+            return []
+    if not isinstance(payload, dict):
+        return []
+    return [
+        DqSpotCheckCorroboratorPayloadPairVM(key=str(k), value=str(v))
+        for k, v in sorted(payload.items())
+    ]
+
+
+async def _entity_ticker_for_sample(
+    session: AsyncSession, *, source: str, record_pk: Any
+) -> str:
+    """Resolve a BIST ticker from the sample's source + record_pk.
+
+    KAP samples carry ``disclosure_id``; we project to the canonical
+    entity through ``doc.filing.entity_id``, then through
+    ``ref.identifier`` if available. On any branch where the join
+    chain isn't present we fall back to '' so the corroborator panel
+    renders the "ticker unresolved" placeholder rather than crashing.
+    """
+    if isinstance(record_pk, str):
+        try:
+            record_pk_dict: dict[str, Any] = json.loads(record_pk)
+        except (ValueError, TypeError):
+            return ""
+    elif isinstance(record_pk, dict):
+        record_pk_dict = record_pk
+    else:
+        return ""
+
+    if source == "bist":
+        sec_id = record_pk_dict.get("security_id")
+        if sec_id is None:
+            return ""
+        row = (
+            await session.execute(
+                text(
+                    "SELECT identifier_value FROM ref.identifier "
+                    "WHERE identifier_type = 'bist_ticker' "
+                    "  AND entity_id = ("
+                    "    SELECT entity_id FROM ref.identifier "
+                    "    WHERE identifier_type = 'bist_security_id' "
+                    "      AND identifier_value = :v "
+                    "    LIMIT 1"
+                    "  ) "
+                    "LIMIT 1"
+                ),
+                {"v": str(sec_id)},
+            )
+        ).one_or_none()
+        return str(row.identifier_value) if row is not None else ""
+
+    if source == "kap":
+        disclosure_id = record_pk_dict.get("disclosure_id")
+        if disclosure_id is None:
+            return ""
+        row = (
+            await session.execute(
+                text(
+                    "SELECT identifier_value FROM ref.identifier "
+                    "WHERE identifier_type = 'bist_ticker' "
+                    "  AND entity_id = ("
+                    "    SELECT entity_id FROM doc.filing "
+                    "    WHERE source_id = 'kap' "
+                    "      AND source_filing_ref = :v "
+                    "    LIMIT 1"
+                    "  ) "
+                    "LIMIT 1"
+                ),
+                {"v": str(disclosure_id)},
+            )
+        ).one_or_none()
+        return str(row.identifier_value) if row is not None else ""
+
+    return ""
+
+
+async def _build_corroborator_panels(
+    session: AsyncSession, *, entity_ticker: str
+) -> list[DqSpotCheckCorroboratorPanelVM]:
+    # Lazy import to keep dashboard.queries -> dq.corroborator coupling
+    # asymmetric: corroborator does not import queries.
+    from aslan_core.dq import corroborator as _corroborator
+
+    if not entity_ticker:
+        return []
+    panels: list[DqSpotCheckCorroboratorPanelVM] = []
+    cutoff = datetime.now(UTC) - timedelta(hours=_CORROBORATOR_TTL_HOURS)
+    for source in _corroborator.registered_sources():
+        implemented = _corroborator.is_implemented(source)
+        row = None
+        if implemented:
+            row = (
+                await session.execute(
+                    _CORROBORATOR_LATEST_SQL,
+                    {"source": source, "entity_ticker": entity_ticker},
+                )
+            ).one_or_none()
+        if not implemented:
+            cache_state: Literal[
+                "fresh", "stale", "miss", "error", "unimplemented"
+            ] = "unimplemented"
+            panels.append(
+                DqSpotCheckCorroboratorPanelVM(
+                    source=source,
+                    entity_ticker=entity_ticker,
+                    implemented=False,
+                    cache_state=cache_state,
+                    fetched_at=None,
+                    cached_age_label="never",
+                    fetch_url="",
+                    fetch_latency_ms=None,
+                    fetch_status=None,
+                    error_summary=None,
+                    payload_pairs=[],
+                )
+            )
+            continue
+        if row is None:
+            cache_state = "miss"
+            panels.append(
+                DqSpotCheckCorroboratorPanelVM(
+                    source=source,
+                    entity_ticker=entity_ticker,
+                    implemented=True,
+                    cache_state=cache_state,
+                    fetched_at=None,
+                    cached_age_label="never",
+                    fetch_url="",
+                    fetch_latency_ms=None,
+                    fetch_status=None,
+                    error_summary=None,
+                    payload_pairs=[],
+                )
+            )
+            continue
+        if row.fetch_status != "ok":
+            cache_state = "error"
+        elif row.fetched_at < cutoff:
+            cache_state = "stale"
+        else:
+            cache_state = "fresh"
+        panels.append(
+            DqSpotCheckCorroboratorPanelVM(
+                source=source,
+                entity_ticker=entity_ticker,
+                implemented=True,
+                cache_state=cache_state,
+                fetched_at=row.fetched_at,
+                cached_age_label=_humanize_corroborator_age(row.fetched_at),
+                fetch_url=row.fetch_url,
+                fetch_latency_ms=int(row.fetch_latency_ms),
+                fetch_status=row.fetch_status,
+                error_summary=row.error_summary,
+                payload_pairs=_corroborator_payload_pairs(row.cached_payload),
+            )
+        )
+    return panels
+
+
 async def dq_spot_check_sample_detail(
     session: AsyncSession, *, sample_id: UUID
 ) -> DqSpotCheckSampleDetailVM | None:
@@ -954,6 +1153,19 @@ async def dq_spot_check_sample_detail(
         for r in result_rows
     ]
     raw_bytes_status = "kap-replay-pending" if sample_row.source == "kap" else "api-replay-pending"
+    entity_ticker = ""
+    try:
+        entity_ticker = await _entity_ticker_for_sample(
+            session, source=sample_row.source, record_pk=sample_row.record_pk
+        )
+    except Exception:
+        # ref.identifier / doc.filing may not be present on every
+        # branch — fall back to empty ticker so the corroborator panel
+        # renders the "ticker unresolved" placeholder.
+        entity_ticker = ""
+    corroborator_panels = await _build_corroborator_panels(
+        session, entity_ticker=entity_ticker
+    )
     return DqSpotCheckSampleDetailVM(
         sample_id=sample_row.sample_id,
         source=sample_row.source,
@@ -966,6 +1178,8 @@ async def dq_spot_check_sample_detail(
         labeller=sample_row.labeller,
         raw_bytes_status=raw_bytes_status,
         existing_results=results,
+        entity_ticker=entity_ticker,
+        corroborator_panels=corroborator_panels,
     )
 
 

@@ -400,6 +400,81 @@ class DqSpotCheckRecordPkPairVM(_VMBase):
     value: str
 
 
+class DqSpotCheckCorroboratorPayloadPairVM(_VMBase):
+    """One (key, value) entry from a corroborator-source payload,
+    rendered as text on the spot-check page.
+
+    The corroborator panel surfaces these alongside the canonical DB
+    row so the labeller can compare a "second opinion" reference value.
+    Per NG6: this is reference material — the labeller's truth value
+    remains the binding label.
+    """
+
+    key: str
+    value: str
+
+
+class DqSpotCheckCorroboratorPanelVM(_VMBase):
+    """One corroborator source's panel on the spot-check detail page.
+
+    The panel is read from ``audit.external_corroborator_cache``. When
+    no cache row exists for ``(source, entity_ticker)`` the panel
+    renders ``cache_state='miss'`` with a Refresh button; on a stale
+    row the panel renders ``cache_state='stale'``; on a fresh row the
+    panel renders ``cache_state='fresh'``.
+
+    ``implemented=False`` panels render a "not yet implemented"
+    placeholder. They appear so the labeller sees the roadmap of
+    registered sources without each one needing its own UI work.
+    """
+
+    source: str
+    """Registered source key (e.g. 'investing_com', 'kap_ir',
+    'tradingview', 'earningshub')."""
+
+    entity_ticker: str
+    """The BIST ticker the panel keys on. Empty string when no entity
+    could be derived from the sample (e.g. a non-KAP sample with no
+    ticker projection)."""
+
+    implemented: bool
+    """Whether the source has a real fetch handler. Registered-but-
+    unimplemented sources render the placeholder."""
+
+    cache_state: Literal["fresh", "stale", "miss", "error", "unimplemented"]
+    """`fresh` — within 24-hour TTL.
+    `stale` — cache hit but past TTL (still rendered for reference;
+    Refresh forces a re-fetch).
+    `miss`  — no cache row at all.
+    `error` — last cache row carried fetch_status != 'ok'.
+    `unimplemented` — source registered but no handler yet."""
+
+    fetched_at: datetime | None
+    """Timestamp on the latest cache row, or ``None`` for cache miss /
+    unimplemented."""
+
+    cached_age_label: str
+    """Human-readable age string (e.g. ``"4 hours ago"``, ``"never"``)."""
+
+    fetch_url: str
+    """The URL the corroborator built for this entity, surfaced so the
+    labeller can open it in a new tab to cross-check."""
+
+    fetch_latency_ms: int | None
+    """Latency of the cached fetch, or ``None`` for cache miss /
+    unimplemented."""
+
+    fetch_status: str | None
+    """Cached fetch status (``ok``, ``error``, ``rate_limited``,
+    ``blocked``), or ``None`` for cache miss / unimplemented."""
+
+    error_summary: str | None
+    """First ~200 chars of the error if the cached fetch failed."""
+
+    payload_pairs: list[DqSpotCheckCorroboratorPayloadPairVM]
+    """Extracted payload as a deterministic ordered list of pairs."""
+
+
 class DqSpotCheckSampleDetailVM(_VMBase):
     """Per-sample form view for /dq/spot-check/<sample_id>."""
 
@@ -421,6 +496,15 @@ class DqSpotCheckSampleDetailVM(_VMBase):
     once the per-source filing-id resolution is wired in.
     """
     existing_results: list[DqSpotCheckResultRowVM]
+    entity_ticker: str
+    """Resolved BIST ticker for the sample, or '' when none could be
+    derived. Drives the corroborator panel — empty ticker collapses
+    each panel to a "ticker unresolved" message."""
+
+    corroborator_panels: list[DqSpotCheckCorroboratorPanelVM]
+    """One panel per registered corroborator source. Empty list when
+    ``entity_ticker`` is empty (no fetch is meaningful without a
+    ticker)."""
 
 
 # ── DQ M4: Bloomberg comparison ───────────────────────────────────
