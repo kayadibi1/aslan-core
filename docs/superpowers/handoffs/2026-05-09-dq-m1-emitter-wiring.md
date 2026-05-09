@@ -289,3 +289,175 @@ expect to beat Bloomberg once the first comparison closes."
   GRANT layout.
 
 
+## M5 cross-source + regression detection
+
+Spec §7.3 (cross-source consistency) + §7.4 (regression detection
+v1) + autonomy directive on this branch (regression v2 / NG5
+promoted to in-scope, post-processing of v1 inside the same cron).
+
+### Cron schedule
+
+Two new entries in the production crontab:
+
+```
+0 2 * * * aslan-core audit cross-source-consistency
+0 3 * * * aslan-core audit regression-detect
+```
+
+Both run nightly. The two crons are independent — cross-source
+writes to `audit.validation_failure`; regression-detect writes to
+`audit.regression_flag`. They share no table-level state and can run
+in either order.
+
+### Cross-source rules (§7.3)
+
+Six rules under `src/aslan_core/dq/cross_source.py`. Each is a
+coroutine returning `list[ValidationFailure]`; each persists every
+firing to `audit.validation_failure` for durable audit.
+
+| Rule | Severity | Source tables |
+|---|---|---|
+| `xs_tefas_holding_dangling_entity` | warn | `tefas.fund_holding`, `ref.entity` |
+| `xs_bist_ticker_kap_issuer` | warn | `bist.security`, `ref.identifier` |
+| `xs_mkk_kap_capital_action_corr` | warn | `mkk.capital_action`, `kap.disclosures` |
+| `xs_tefas_nav_holdings_recon` | error | `tefas.fund_nav`, `tefas.fund_holding`, `bist.daily_ohlcv` |
+| `xs_evds_observation_calendar` | error | `audit.evds_release_calendar`, `evds.observation` |
+| `xs_kap_filing_count_recon` | info | `kap.disclosures` (placeholder; see §M5.1 below) |
+
+When a rule's required source tables are absent on this branch /
+environment the rule emits a single `xs_rule_skipped` audit event and
+returns `[]` instead of raising. The cron loop continues with the
+next rule. The `/dq/validation` page surfaces these skips at the
+bottom so operators see when a rule lapsed for table-availability
+reasons.
+
+### Regression detection v1 (§7.4)
+
+`src/aslan_core/dq/regression_detect.py` runs the curated metric
+list against every BIST roster entity (resolved via
+`ref.identifier(namespace='bist_ticker')`):
+
+| Metric | canonical_code | Period | Threshold |
+|---|---|---|---|
+| revenue | `is.revenue` | QoQ | 25% |
+| net_income | `is.net_income` | QoQ | 40% |
+| total_assets | `bs.total_assets` | QoQ | 15% |
+| debt_to_equity | `ratio.debt_to_equity` | QoQ | 30% |
+| pe | `ratio.pe` | DoD | 20% |
+| roe | `ratio.roe` | QoQ | 30% |
+
+The three ratio metrics (`debt_to_equity`, `pe`, `roe`) are flagged
+`wired=False` until the financial canonicaliser ships a ratio-
+projection step (M2.1 patch). The detector emits a single
+`regression_metric_unwired` audit event per unwired metric per run
+and skips it.
+
+### Regression detection v2 — KAP filing correlation (NG5 promoted)
+
+After v1 inserts new flags, the same cron runs `correlate_v2`. For
+each new flag, it queries `kap.disclosures` for filings on the
+flag's entity in the window **`[detected_at - 7 days, detected_at + 1 day]`**.
+A filing of category in `{material_event, capital_action, dividend}`
+auto-dismisses the flag with:
+
+* `status='dismissed'`
+* `reviewer='cli:audit-regression-detect'`
+* `review_note='auto-dismissed: justified by KAP filing <disclosure_id>'`
+* an additional `audit.event(event_type='regression_auto_dismissed')`
+  carrying the matched disclosure_id, category, and window bounds
+
+The 7d back / 1d forward window is justified by KAP filing data: a
+material event published up to a week before the period close that
+moves the metric is the canonical justification for the move; an
+event up to 1 day after the detection covers same-day disclosures
+that land on the cron's morning run. Tighter windows produced too
+many false-positive open flags during shadow runs; wider windows
+auto-dismissed legitimate data-issue regressions.
+
+### Once `aslan-event-extractor` M3 lands
+
+The v2 correlation can become more selective. Today's heuristic
+fires on any filing in `{material_event, capital_action, dividend}`;
+once M3's extracted `material_change` boolean is on
+`agg.filing_event`, v2 should additionally filter to filings with
+`material_change=true`. That tightens the auto-dismiss to
+**actually-material** filings, making the open queue more useful
+for sidar's review pass.
+
+### Curated entity roster — placeholder
+
+The detector currently uses **every** entity with a current
+`ref.identifier(namespace='bist_ticker')` row, capped at 50. The
+spec calls for a curated top-50 by liquidity; **sidar curation of
+the actual list is deferred**. When the curated list lands, replace
+`_SELECT_TOP_BIST_ENTITIES` in
+`src/aslan_core/dq/regression_detect.py` with a JOIN against the
+new `audit.regression_top50` (or equivalent) table. The placeholder
+is documented inline.
+
+### Migration 0061
+
+`audit.regression_flag` per spec §5.7 — append-only, with `status`
+the lone mutable column. GRANTs:
+
+* `audit_writer` — INSERT only (the detector cron runs as audit_writer)
+* `audit_admin` — UPDATE on `status` / `reviewer` / `reviewed_at` /
+  `review_note` (the dashboard review POST + the v2 auto-dismiss path
+  both run under audit_admin since both are review actions)
+* `audit_reader` — SELECT
+* `aslan_dashboard` — SELECT (the dashboard process is read-only;
+  the review POST goes through a write-capable role per the
+  spot-check / Bloomberg pattern)
+
+### Dashboard `/dq/validation`
+
+Replaces the M0 stub. Three sections:
+
+1. Top — per-rule failure rate over 7d (groups in-line validators
+   and `xs_*` cross-source rules into one table).
+2. Middle — open `audit.regression_flag` rows with click-through
+   review form (status: dismiss / confirm bug / mark reviewed).
+3. Bottom — recent `xs_rule_skipped` events.
+
+POST handler: `/dq/validation/regression/{flag_id}` accepts the
+review form and 303-redirects back. Bound character classes /
+lengths on reviewer + review_note, status enum-checked. v2
+auto-dismissed flags are NOT shown in the open-queue (they leave
+`status='dismissed'` and live in `audit.event(event_type='regression_auto_dismissed')`).
+
+### Sources of truth
+
+* Modules:
+  * `src/aslan_core/dq/regression.py` — `flag` / `set_status` /
+    `pending_flags` / `get_flag`.
+  * `src/aslan_core/dq/cross_source.py` — 6 rules + `run_all` driver.
+  * `src/aslan_core/dq/regression_detect.py` — `detect_v1`,
+    `correlate_v2`, `detect_and_correlate`.
+* CLI: `src/aslan_core/cli/dq.py` — `cross-source-consistency` and
+  `regression-detect` subcommands.
+* Dashboard: `src/aslan_core/dashboard/pages/dq_validation.py` +
+  `dq_validation` query helper in
+  `src/aslan_core/dashboard/queries.py`.
+* Migration: `0061_dq_regression_flag.py`.
+* Tests:
+  * `tests/integration/test_migration_0061_regression_flag.py`
+  * `tests/integration/dq/test_regression_roundtrip.py`
+  * `tests/integration/dq/test_cross_source_rules.py`
+  * `tests/integration/dq/test_cross_source_cli.py`
+  * `tests/integration/dq/test_regression_detect.py`
+  * `tests/integration/dashboard/test_dq_validation.py`
+
+### M5.1 follow-ups (deferred, but not blocking M5)
+
+* **`xs_kap_filing_count_recon`** — wire the upstream KAP listing
+  HTTP query and replace the trailing-7d-mean self-compare with a
+  real upstream-vs-DB diff. The placeholder emits a
+  `kap_api_count_unimplemented` event per run so the gap is visible.
+* **Trading-day calendar for `xs_mkk_kap_capital_action_corr`** —
+  v1 uses ±5 calendar days as a Mon-Fri ±3-trading-day approximation.
+  Once `ref.calendar_tr` is populated, swap the SQL window to a real
+  trading-day calculation.
+* **Curated top-50 entity roster** — sidar curation pending. See
+  the inline TODO in `regression_detect._SELECT_TOP_BIST_ENTITIES`.
+
+
