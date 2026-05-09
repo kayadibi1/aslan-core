@@ -1,0 +1,448 @@
+{
+  "$schema_version": "1.0.0",
+  "spec": "bitemporal-research-api",
+  "drafted": "2026-05-09",
+  "owner": "sidar",
+  "decisions": [
+    {
+      "decision_id": "D1",
+      "topic": "tables/views exposed by the API",
+      "options_considered": [
+        "expose every aslan-core table",
+        "expose only Class-A bitemporal tables (per EXISTING_PATTERNS_AUDIT.md)",
+        "expose only ts.* and agg.*",
+        "expose ts.*, ref.*, doc.*, kap.*, agg.* with one PIT function per resource"
+      ],
+      "chosen": "ts.*, ref.entity, ref.identifier, doc.filing, kap.disclosures, agg.filing_event — each via a PIT SQL function and a thin REST layer",
+      "rationale": "Bitemporal logic concentrates in SQL functions (testable in SQL, reusable by SDK and tools); only fact tables and identifier-bearing tables are exposed.",
+      "reversibility": "HIGH",
+      "status": "FINAL",
+      "feature_flag": null,
+      "default_state": null,
+      "consumer_visibility": "OpenAPI 3.1 surface; documented in /v1/research/docs",
+      "evidence": [
+        "STATE.md §2 row counts",
+        "EXISTING_PATTERNS_AUDIT.md class-A tables",
+        "bitemporal-api-prompt.md D1"
+      ]
+    },
+    {
+      "decision_id": "D2",
+      "topic": "query semantics (point-in-time, interval, current)",
+      "options_considered": [
+        "PIT only",
+        "PIT + interval",
+        "PIT + interval + current as default",
+        "expose temporal SQL:2011 'FOR SYSTEM_TIME AS OF' surface"
+      ],
+      "chosen": "PIT (?as_of=T), interval (?as_of_range=[T1,T2)), current (?as_of=NOW(); default if omitted)",
+      "rationale": "PIT and current cover 95% of research workloads; interval supports change-detection and amendment analysis (the Moat 2 canary itself uses interval queries).",
+      "reversibility": "MEDIUM",
+      "status": "PROVISIONAL",
+      "feature_flag": "BITEMPORAL_API_INTERVAL_QUERIES",
+      "default_state": "true (staging); true (prod after canary green >=1h)",
+      "consumer_visibility": "documented in OpenAPI per-endpoint params",
+      "evidence": [
+        "bitemporal-api-prompt.md D2 + Phase 4f",
+        "ADR-003 §Verification endpoint"
+      ]
+    },
+    {
+      "decision_id": "D3",
+      "topic": "handling of pre-bitemporal kap.disclosures rows",
+      "options_considered": [
+        "use received_at where available",
+        "NULL with documented semantics",
+        "sentinel 1970-01-01",
+        "exclude from API"
+      ],
+      "chosen": "as_of derived from COALESCE(body_fetched_at, index_fetched_at, published_at) with as_of_provenance enum; NULL when none available; default API queries exclude NULL rows; ?include_pre_bitemporal=true surfaces them with metadata.pre_bitemporal=true",
+      "rationale": "Surfacing NULL is honest about uncertainty; sentinels propagate silently through aggregations and break Moat 2's contract.",
+      "reversibility": "LOW",
+      "status": "PROVISIONAL",
+      "feature_flag": "BITEMPORAL_API_ALLOW_NULL_AS_OF",
+      "default_state": "true (staging); true (prod after canary green >=1h)",
+      "consumer_visibility": "documented as 'pre-bitemporal era; query separately'",
+      "evidence": [
+        "STATE.md (462k disclosure rows; 89.7k body_fetched=true)",
+        "EXISTING_PATTERNS_AUDIT.md §kap.disclosures",
+        "bitemporal-api-prompt.md D3"
+      ]
+    },
+    {
+      "decision_id": "D4",
+      "topic": "API surface (REST/GraphQL/PostgREST/gRPC)",
+      "options_considered": ["REST + OpenAPI 3.1", "GraphQL", "PostgREST", "gRPC"],
+      "chosen": "REST + OpenAPI 3.1",
+      "rationale": "Auto-generated docs (Swagger/ReDoc), straightforward SDK generation, matches existing aslan-core API patterns. PostgREST rejected because the API has non-trivial business logic (rate limits, audit log, FF gating, pre-bitemporal handling).",
+      "reversibility": "HIGH",
+      "status": "FINAL",
+      "feature_flag": null,
+      "default_state": null,
+      "consumer_visibility": "OpenAPI 3.1 at /v1/research/openapi.json; Swagger UI at /v1/research/docs; ReDoc at /v1/research/redoc",
+      "evidence": ["existing aslan-core/src/aslan_core/api/routes/* layout"]
+    },
+    {
+      "decision_id": "D5",
+      "topic": "authentication scheme",
+      "options_considered": ["API keys", "JWT", "OAuth2", "mTLS"],
+      "chosen": "Long-lived API keys (UUID + 32-byte secret) hashed argon2id; per-key rate tier; per-key pii_unredacted scope; expires_at default +1y",
+      "rationale": "API keys are simplest to audit; match aslan-event-extractor compliance posture; defer JWT/OAuth/mTLS until enterprise demands it.",
+      "reversibility": "MEDIUM",
+      "status": "PROVISIONAL",
+      "feature_flag": "BITEMPORAL_API_AUTH_ADDITIONAL_SCHEMES",
+      "default_state": "empty",
+      "consumer_visibility": "documented in OpenAPI security scheme",
+      "evidence": ["aslan-event-extractor/SCOPE.md §6"]
+    },
+    {
+      "decision_id": "D6",
+      "topic": "rate-limit tiers and quotas",
+      "options_considered": [
+        "single global tier",
+        "three tiers (internal/partner/public)",
+        "fully per-key custom"
+      ],
+      "chosen": "Three tiers (internal/partner/public); per-key overrides via aslan_core.api_key.rate_overrides JSONB; Postgres-backed token bucket",
+      "rationale": "Simple defaults that fit common access patterns; per-key overrides handle edge cases without a tier explosion.",
+      "reversibility": "MEDIUM",
+      "status": "PROVISIONAL",
+      "feature_flag": "BITEMPORAL_API_RATE_LIMIT_ENFORCED",
+      "default_state": "true",
+      "consumer_visibility": "X-RateLimit-Tier, X-RateLimit-Remaining, X-RateLimit-Reset response headers",
+      "evidence": ["aslan-event-extractor/SCOPE.md §6 audit log shape"]
+    },
+    {
+      "decision_id": "D7",
+      "topic": "pagination strategy",
+      "options_considered": ["offset/limit", "cursor-based (opaque)", "page tokens"],
+      "chosen": "Cursor-based: opaque base64 JSON of {v, as_of, anchor, direction, filters_hash}; default limit 50, max 500",
+      "rationale": "Monotonic under bitemporal append; uses the underlying (entity, as_of) index efficiently; filters_hash prevents cursor reuse across filter sets.",
+      "reversibility": "MEDIUM",
+      "status": "PROVISIONAL",
+      "feature_flag": "BITEMPORAL_API_CURSOR_VERSION",
+      "default_state": "1",
+      "consumer_visibility": "next_cursor / prev_cursor in response envelope; cursor opaque to clients",
+      "evidence": ["Postgres keyset-pagination patterns; ref.identifier PIT pattern"]
+    },
+    {
+      "decision_id": "D8",
+      "topic": "TAS 29 restated financials handling under as_of",
+      "options_considered": [
+        "in-place restatement",
+        "new as_of row (additive)",
+        "separate restated_canonical table"
+      ],
+      "chosen": "New as_of row in ts.canonical_financial with restatement_kind='tas29' tag; restatement_chain materialized view walks the chain",
+      "rationale": "TAS 29 is workspace Moat 5; in-place restatement would break Moat 2.",
+      "reversibility": "LOW",
+      "status": "PROVISIONAL",
+      "feature_flag": "BITEMPORAL_API_TAS29_RESTATEMENT_CHAIN",
+      "default_state": "false until Phase 2; true after Phase 2j gate; true on prod after Phase 7",
+      "consumer_visibility": "restatement_kind field in CanonicalFinancial schema",
+      "evidence": ["workspace CLAUDE.md §4 Moat 5", "ts.canonical_financial existing schema"]
+    },
+    {
+      "decision_id": "D9",
+      "topic": "identifier change handling",
+      "options_considered": [
+        "version table separate from ref.identifier",
+        "use existing ref.identifier daterange + GiST EXCLUDE"
+      ],
+      "chosen": "Use existing ref.identifier; API endpoint resolves (namespace, value, as_of) via daterange @> as_of",
+      "rationale": "Existing schema is bitemporal-correct; no new discipline needed.",
+      "reversibility": "LOW",
+      "status": "FINAL",
+      "feature_flag": null,
+      "default_state": null,
+      "consumer_visibility": "/v1/research/identifiers/resolve endpoint",
+      "evidence": ["aslan-core/src/aslan_core/db/migrations/versions/20260427_1612_0002_ref_schema_and_tables.py"]
+    },
+    {
+      "decision_id": "D10",
+      "topic": "entity merge / split handling",
+      "options_considered": [
+        "physical merge with audit row",
+        "new ref.entity row with merged_from_entity_ids",
+        "separate ref.entity_lineage table only",
+        "both"
+      ],
+      "chosen": "New ref.entity row with later as_of and merged_from_entity_ids JSONB; ref.entity_lineage row recording the merge event",
+      "rationale": "Allows PIT before-merge queries to see pre-merge structure; lineage table enables audit/replay.",
+      "reversibility": "LOW",
+      "status": "PROVISIONAL",
+      "feature_flag": "BITEMPORAL_API_ENTITY_MERGE_LINEAGE",
+      "default_state": "false until Phase 2; true after Phase 2 gate",
+      "consumer_visibility": "merged_from_entity_ids field on Entity schema; ref.entity_lineage exposed via /entities/{id}/lineage in v2",
+      "evidence": ["bitemporal-api-prompt.md D10"]
+    },
+    {
+      "decision_id": "D11",
+      "topic": "idempotency on republish (KAP amendment)",
+      "options_considered": ["UPDATE in place", "new as_of row + append-only trigger", "version table separate"],
+      "chosen": "New (disclosure_id, as_of) row on republish; append-only trigger blocks UPDATE",
+      "rationale": "Amendment chains are the load-bearing case for Moat 2 — exactly what the canary tests.",
+      "reversibility": "LOW",
+      "status": "PROVISIONAL",
+      "feature_flag": "BITEMPORAL_API_KAP_APPEND_ONLY_TRIGGER",
+      "default_state": "false until Phase 2c; true after Phase 2j gate; true on prod after Phase 7",
+      "consumer_visibility": "Disclosure schema reflects multi-version chain",
+      "evidence": ["existing kap.disclosures.republished_as migration", "bitemporal-api-prompt.md D11"]
+    },
+    {
+      "decision_id": "D12",
+      "topic": "as_of granularity",
+      "options_considered": ["second", "millisecond", "microsecond", "nanosecond"],
+      "chosen": "microsecond (Postgres timestamptz native)",
+      "rationale": "Native precision; finer would require a separate as_of_seq column with no benefit at our write rate.",
+      "reversibility": "HIGH",
+      "status": "FINAL",
+      "feature_flag": null,
+      "default_state": null,
+      "consumer_visibility": "ISO8601 with microseconds in API responses",
+      "evidence": ["Postgres timestamptz documentation"]
+    },
+    {
+      "decision_id": "D13",
+      "topic": "timezone handling",
+      "options_considered": ["UTC at storage + UTC in API", "UTC at storage + Europe/Istanbul in API", "UTC + optional display_tz"],
+      "chosen": "UTC at storage; API responses always UTC ISO8601 with Z; optional ?display_tz=IANA adds local_time companion field",
+      "rationale": "UTC discipline upstream; naive datetimes raise; display_tz is convenience without changing semantics.",
+      "reversibility": "HIGH",
+      "status": "FINAL",
+      "feature_flag": null,
+      "default_state": null,
+      "consumer_visibility": "ISO8601 with Z; optional local_time field per row",
+      "evidence": ["aslan-core/CLAUDE.md datetime rule"]
+    },
+    {
+      "decision_id": "D14",
+      "topic": "NULL vs sentinel for unknown as_of",
+      "options_considered": ["NULL", "sentinel 1970-01-01", "sentinel infinity", "synthetic now()"],
+      "chosen": "NULL; no sentinel",
+      "rationale": "Per ADR-002 the platform does not fabricate data; sentinels propagate silently through aggregations; NULL is loud.",
+      "reversibility": "MEDIUM",
+      "status": "PROVISIONAL",
+      "feature_flag": "BITEMPORAL_API_ALLOW_NULL_AS_OF",
+      "default_state": "true (staging); true (prod after canary)",
+      "consumer_visibility": "documented in /v1/research/disclosures and elsewhere where pre-bitemporal rows exist",
+      "evidence": ["ADR-002", "bitemporal-api-prompt.md D14"]
+    },
+    {
+      "decision_id": "D15",
+      "topic": "response envelope shape",
+      "options_considered": ["bare data array", "data + metadata envelope", "JSON:API"],
+      "chosen": "data + metadata envelope with as_of_requested, as_of_resolved, lineage, pagination, feature_flags_active, warnings, request_id, served_by",
+      "rationale": "Lineage and as_of metadata in every response is the audit-trail contract from ADR-003 replayability.",
+      "reversibility": "MEDIUM",
+      "status": "PROVISIONAL",
+      "feature_flag": "BITEMPORAL_API_ENVELOPE_VERSION",
+      "default_state": "1",
+      "consumer_visibility": "Envelope schema in OpenAPI",
+      "evidence": ["aslan-event-extractor/SCOPE.md §6", "ADR-003 replayability target"]
+    },
+    {
+      "decision_id": "D16",
+      "topic": "error codes and envelope",
+      "options_considered": ["ad-hoc error JSON", "RFC 7807 problem+json", "custom shape"],
+      "chosen": "RFC 7807 application/problem+json; machine-readable code field added; extensions for error-specific structure",
+      "rationale": "Standard, stable, widely supported by client tooling.",
+      "reversibility": "MEDIUM",
+      "status": "PROVISIONAL",
+      "feature_flag": "BITEMPORAL_API_ERROR_FORMAT_VERSION",
+      "default_state": "1",
+      "consumer_visibility": "Problem schema in OpenAPI",
+      "evidence": ["RFC 7807", "FastAPI conventions"]
+    },
+    {
+      "decision_id": "D17",
+      "topic": "caching strategy",
+      "options_considered": ["no caching", "ETag-only", "immutable for past + ETag for current"],
+      "chosen": "Immutable Cache-Control for as_of <= NOW()-5min (ETag = sha256 body); no-cache + ETag for current/recent",
+      "rationale": "Past as_of responses are immutable by Moat 2; immutable cache is a major perf lever and CDN-friendly. 5-minute window absorbs late-arriving extraction events.",
+      "reversibility": "HIGH",
+      "status": "FINAL",
+      "feature_flag": null,
+      "default_state": null,
+      "consumer_visibility": "Cache-Control, ETag headers documented in OpenAPI",
+      "evidence": ["RFC 7234", "aslan-event-extractor/SCOPE.md §7 latency"]
+    },
+    {
+      "decision_id": "D18",
+      "topic": "per-query audit log",
+      "options_considered": ["log to file", "log to Postgres table", "log to Redis stream + Postgres", "no audit log"],
+      "chosen": "aslan_core.api_query_audit table; 13-month retention; query params hashed (raw params PII-risky); request_id for correlation",
+      "rationale": "Required for SOC II + GDPR; 'who-asked-what-at-when' answerable; hashing keeps log free of incidental PII.",
+      "reversibility": "LOW",
+      "status": "PROVISIONAL",
+      "feature_flag": "BITEMPORAL_API_AUDIT_LOG_ENABLED",
+      "default_state": "true",
+      "consumer_visibility": "internal table; not exposed via API in v1",
+      "evidence": ["aslan-event-extractor/SCOPE.md §6 GDPR"]
+    },
+    {
+      "decision_id": "D19",
+      "topic": "query cost limits",
+      "options_considered": ["no limits", "single global cap", "multi-dimensional caps with per-key overrides"],
+      "chosen": "Multi-dimensional: as_of_range <=5y, page<=500, distinct entity_ids<=100, OR-clauses<=10, statement_timeout 30s, response<=10MiB; per-key overrides",
+      "rationale": "p99 <=100ms target is single-entity PIT only; bulk queries pay via lower-priority queues in v2.",
+      "reversibility": "MEDIUM",
+      "status": "PROVISIONAL",
+      "feature_flag": "BITEMPORAL_API_COST_LIMITS_ENFORCED",
+      "default_state": "true",
+      "consumer_visibility": "QUERY_TOO_LARGE error code documented in OpenAPI",
+      "evidence": ["bitemporal-api-prompt.md Phase 4e load target"]
+    },
+    {
+      "decision_id": "D20",
+      "topic": "Moat 2 regression as public verification endpoint",
+      "options_considered": ["internal-only canary", "internal + Slack alerts", "public /verify/moat-2 endpoint"],
+      "chosen": "/v1/verify/moat-2 unauthenticated; 200 green or 503 red; cached 60s server-side",
+      "rationale": "Moat is verifiable by anyone (customers, journalists, regulators) — not just internal monitoring.",
+      "reversibility": "HIGH",
+      "status": "FINAL",
+      "feature_flag": null,
+      "default_state": null,
+      "consumer_visibility": "/v1/verify/moat-2 documented as public endpoint",
+      "evidence": ["ADR-003 §Verification endpoint"]
+    },
+    {
+      "decision_id": "D21",
+      "topic": "documentation surface",
+      "options_considered": ["Swagger only", "ReDoc only", "Swagger + ReDoc", "external static docs site"],
+      "chosen": "Swagger UI at /v1/research/docs; ReDoc at /v1/research/redoc; raw OpenAPI at /v1/research/openapi.json; customer-facing prose at docs/specs/.../README.md",
+      "rationale": "Swagger for exploration; ReDoc for static; raw JSON for SDK generation.",
+      "reversibility": "HIGH",
+      "status": "FINAL",
+      "feature_flag": null,
+      "default_state": null,
+      "consumer_visibility": "documented at the URLs themselves",
+      "evidence": ["FastAPI documentation surfaces"]
+    },
+    {
+      "decision_id": "D22",
+      "topic": "SDK strategy",
+      "options_considered": ["Python only", "Python + TypeScript", "Python + auto-generated others", "no SDK"],
+      "chosen": "Python SDK first-class (aslan_research_sdk); other languages on demand per ADR-002",
+      "rationale": "Python is the platform language; internal services consume via SDK first; non-Python SDKs need maintenance plans before merging.",
+      "reversibility": "HIGH",
+      "status": "FINAL",
+      "feature_flag": null,
+      "default_state": null,
+      "consumer_visibility": "SDK package on internal PyPI / aslan-core/sdk/python",
+      "evidence": ["ADR-002"]
+    },
+    {
+      "decision_id": "D23",
+      "topic": "URL versioning scheme",
+      "options_considered": ["path-based major (/v1/)", "header-based version", "query-string version"],
+      "chosen": "Path-based major (/v1/research/); minor versions backward-compatible additions",
+      "rationale": "Simplest mental model; matches existing aslan-dashboard-api routes.",
+      "reversibility": "LOW",
+      "status": "PROVISIONAL",
+      "feature_flag": "BITEMPORAL_API_V2_PREVIEW",
+      "default_state": "false",
+      "consumer_visibility": "documented in URL paths",
+      "evidence": ["existing aslan-core API path layout"]
+    },
+    {
+      "decision_id": "D24",
+      "topic": "deprecation policy",
+      "options_considered": ["ad-hoc CHANGELOG only", "Deprecation header + Sunset", "OpenAPI deprecated flag only"],
+      "chosen": "Deprecation header + Sunset header + OpenAPI deprecated=true + CHANGELOG entry; minimum 6 months between announcement and removal",
+      "rationale": "Industry-standard headers + project CHANGELOG; 6 months gives clients quarterly cadence.",
+      "reversibility": "HIGH",
+      "status": "FINAL",
+      "feature_flag": null,
+      "default_state": null,
+      "consumer_visibility": "Deprecation, Sunset response headers when applicable",
+      "evidence": ["IETF Deprecation header draft", "RFC 8594 Sunset"]
+    },
+    {
+      "decision_id": "D25",
+      "topic": "observability (metrics, traces, logs)",
+      "options_considered": ["logs only", "Prometheus metrics + structlog", "Prometheus + OTel + structlog"],
+      "chosen": "Prometheus on :9001/metrics; OTel traces to existing collector; structlog with request_id correlation",
+      "rationale": "Match existing aslan-core observability; do not invent.",
+      "reversibility": "HIGH",
+      "status": "FINAL",
+      "feature_flag": null,
+      "default_state": null,
+      "consumer_visibility": "internal dashboards; no API surface change",
+      "evidence": ["aslan_core.observability package"]
+    },
+    {
+      "decision_id": "D26",
+      "topic": "relationship to existing FastAPI surfaces",
+      "options_considered": ["modify existing routes for PIT", "new router additive", "new service entirely"],
+      "chosen": "New router aslan_core.api.routes.research mounted at /v1/research/; existing routes unchanged",
+      "rationale": "Existing routes have other consumers (dashboard, etc.); changing semantics under feet is out of scope.",
+      "reversibility": "HIGH",
+      "status": "FINAL",
+      "feature_flag": null,
+      "default_state": null,
+      "consumer_visibility": "URL prefix /v1/research/",
+      "evidence": ["aslan-core/src/aslan_core/api/routes/ inventory"]
+    },
+    {
+      "decision_id": "D27",
+      "topic": "deployment shape (separate service vs router)",
+      "options_considered": ["separate aslan-research-api service", "router in aslan-dashboard-api"],
+      "chosen": "Router in aslan-dashboard-api FastAPI process behind master flag BITEMPORAL_API_ENABLED",
+      "rationale": "Single-process simplest at v1 RPS; Postgres is the bottleneck not FastAPI; v2 can split without API surface change.",
+      "reversibility": "MEDIUM",
+      "status": "PROVISIONAL",
+      "feature_flag": "BITEMPORAL_API_ENABLED",
+      "default_state": "false (prod) / true (staging after Phase 5)",
+      "consumer_visibility": "503 FEATURE_DISABLED if master flag off",
+      "evidence": ["STATE.md aslan-dashboard-api-1 on 127.0.0.1:8600"]
+    },
+    {
+      "decision_id": "D28",
+      "topic": "lockstep with future as_of-bearing tables",
+      "options_considered": ["manual coordination", "registry table + CI check"],
+      "chosen": "aslan_core.bitemporal_table_registry table + CI check scripts/check_bitemporal_table_registry.py enforcing every as_of-bearing table has a registry row",
+      "rationale": "Without enforcement, bitemporal discipline drifts silently as new tables ship.",
+      "reversibility": "LOW",
+      "status": "PROVISIONAL",
+      "feature_flag": "BITEMPORAL_TABLE_REGISTRY_CI_ENFORCED",
+      "default_state": "true",
+      "consumer_visibility": "internal CI; not exposed via API",
+      "evidence": ["bitemporal-api-prompt.md D28"]
+    },
+    {
+      "decision_id": "D29",
+      "topic": "testing strategy",
+      "options_considered": [
+        "unit only",
+        "unit + integration",
+        "unit + integration + regression + fuzz + load + canary + replay"
+      ],
+      "chosen": "Unit (pytest, testcontainers Postgres) + integration + regression (Moat 2 canary >=10 cases) + fuzz (Hypothesis on as_of parsing/cursor/auth) + load (locust 100 RPS, p99 <=100ms target) + replay (>=10 random agg.filing_event rows reconstructed from raw bytes)",
+      "rationale": "Defense-in-depth; schema-level append-only contract tested both via positive trigger and via negative bypass attempts.",
+      "reversibility": "HIGH",
+      "status": "FINAL",
+      "feature_flag": null,
+      "default_state": null,
+      "consumer_visibility": "test suite in aslan-core/tests/research/",
+      "evidence": ["bitemporal-api-prompt.md Phase 4 sections"]
+    },
+    {
+      "decision_id": "D30",
+      "topic": "GDPR/KVKK posture",
+      "options_considered": [
+        "no PII exposure ever",
+        "PII fully exposed",
+        "default redacted with per-key pii_unredacted scope"
+      ],
+      "chosen": "Default redacted (<REDACTED:reason>); per-key pii_unredacted scope; redaction events themselves bitemporal (PIT before redaction returns unredacted; after returns redacted); audit log captures every PII access; 13-month retention; EU-only routing (Hetzner DE)",
+      "rationale": "Compliance is schema-level not retrofit; matches aslan-event-extractor/SCOPE.md §6 posture; PIT before redaction must return original to honor Moat 2.",
+      "reversibility": "LOW",
+      "status": "PROVISIONAL",
+      "feature_flag": "BITEMPORAL_API_PII_EXPOSURE",
+      "default_state": "false (must be deliberately enabled per environment)",
+      "consumer_visibility": "<REDACTED:reason> tokens in PII fields when not authorized",
+      "evidence": ["aslan-event-extractor/SCOPE.md §6 GDPR + D21 redaction registry"]
+    }
+  ]
+}
