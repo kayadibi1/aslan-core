@@ -62,3 +62,18 @@ INSERT_EVENT = text(
     "  :event_type, :emitted_at, :emitter, :severity, CAST(:payload AS JSONB)"
     ") RETURNING event_id"
 )
+
+INSERT_RECENCY_OBSERVATION = text(
+    "INSERT INTO audit.recency_observation("
+    "  source, observed_at, upstream_latest_at, db_latest_at, "
+    "  sla_target_seconds, probe_detail"
+    ") VALUES ("
+    "  :source, :observed_at, :upstream_latest_at, :db_latest_at, "
+    "  :sla_target_seconds, CAST(:probe_detail AS JSONB)"
+    ") RETURNING observation_id, sla_breached, lag_seconds"
+)
+
+SELECT_RECENCY_SLA = text(
+    "SELECT source, dimension, sla_seconds FROM audit.recency_sla "
+    "ORDER BY source, dimension"
+)

@@ -23,7 +23,7 @@ Forward-deferred to later milestones:
 
 from __future__ import annotations
 
-from aslan_core.dq import coverage, event, sync_log, validation
+from aslan_core.dq import coverage, event, recency, sync_log, validation
 from aslan_core.dq.types import (
     Severity,
     SyncRunStatus,
@@ -36,6 +36,7 @@ __all__ = [
     "ValidationFailure",
     "coverage",
     "event",
+    "recency",
     "sync_log",
     "validation",
 ]
