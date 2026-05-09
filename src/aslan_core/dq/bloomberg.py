@@ -778,9 +778,7 @@ def render_markdown(run: RenderRun) -> str:
         )
         # Render in the canonical field order, not whatever the DB
         # returned — keeps adjacent runs diffable.
-        per_field: dict[str, RenderCell] = {
-            c.field: c for c in cells_by_entity.get(entity, [])
-        }
+        per_field: dict[str, RenderCell] = {c.field: c for c in cells_by_entity.get(entity, [])}
         for field in COMPARISON_FIELDS:
             cell = per_field.get(field)
             if cell is None:

@@ -159,3 +159,133 @@ is observable on /dq.
   `severity_rule_change_audit` trigger, so the change shows up in
   `audit.event(event_type='severity_rule_changed')`).
 
+## M4 Bloomberg-comparison rotation
+
+M4 ships the Bloomberg-vs-Aslan quarterly comparison framework. Alembic
+head moves to `0060` (`20260509_1507_0060_dq_bloomberg_comparison.py`),
+adding `audit.bloomberg_comparison_run` + `audit.bloomberg_comparison_cell`.
+The framework lives in `aslan_core.dq.bloomberg`; the dashboard surface
+is `/dq/bloomberg` (overview + per-cell entry form + history) plus
+`/dq/bloomberg/runs/{run_id}` (per-run drill-down). Five new CLIs land
+under `aslan-core audit bloomberg-*`.
+
+### Cell catalogue (60 cells per quarter)
+
+5 anchor BIST entities × 12 fields each:
+
+* Anchor entities: `AKBNK`, `ASELS`, `GARAN`, `KCHOL`, `TUPRS` —
+  large issuers with quarterly disclosures, dividend histories, and
+  capital actions in the KAP corpus, so each cell has a meaningful
+  Bloomberg counterpart.
+* Fields:
+  * `revenue_q-1` … `revenue_q-4` (4 latest quarterly revenues from
+    `ts.canonical_financial`, code `is.revenue`)
+  * `net_income_q-1` … `net_income_q-4` (4 latest, code `is.net_income`)
+  * `latest_dividend_amount` (placeholder; v1 wiring deferred to M4.1)
+  * `latest_capital_action` (placeholder)
+  * `filing_lag_p95_30d` (audit-derived: p95 of
+    `audit.recency_observation.lag_seconds` for KAP over 30d)
+  * `material_event_field_count` (Aslan-only signal; placeholder)
+
+Placeholder samplers emit one
+`audit.event(event_type='bloomberg_sampler_placeholder')` per call so
+the gap is observable on /dq.
+
+### Quarterly schedule
+
+The aslan-team operates a quarterly rotation:
+
+* **First Mon of each quarter** — `aslan-core audit bloomberg-open-quarter`.
+  Idempotent: a second invocation for the same quarter is a no-op.
+* **Every Mon thereafter** — sidar enters Bloomberg values via
+  `/dq/bloomberg`. The page renders one row per cell with NULL
+  `bloomberg_value` and an inline POST form.
+* **Nightly** — `aslan-core audit bloomberg-sample` runs the auto-sampler.
+  Sample cron line:
+  ```
+  5 1 * * * aslan-core audit bloomberg-sample
+  ```
+  Drains every cell with `aslan_value IS NULL` across all open runs,
+  populating `aslan_value` + `variance_pct` + `aslan_advantage`.
+* **Last Fri of each quarter** — `aslan-core audit bloomberg-close-quarter
+  --quarter <YYYYQn>`. Refuses with `QuarterNotReadyError` if any
+  `bloomberg_value` is still NULL (spec §17 R2). Once all 60 cells are
+  filled, the close stamps `closed_at` on the run, and the run flows
+  into the `claim_check` aggregate.
+
+### Reminder ping mechanism
+
+Once a Bloomberg-comparison run has been open for more than a week
+with NULL `bloomberg_value` cells remaining, the operator gets a
+weekly Slack ping via:
+
+```
+0 9 * * MON aslan-core audit bloomberg-reminder
+```
+
+The reminder always lands a row in `audit.event(event_type='bloomberg_reminder')`
+even when no Slack sink is configured — so the gap is auditable on
+/audit even before Slack is wired. Reminder Slack messages reuse the
+M3 `SlackSink` machinery; if `ASLAN_AUDIT_SLACK_WEBHOOK_URL` is unset
+the reminder counts as suppressed (same contract as the alert
+dispatcher).
+
+### `aslan-event-extractor/docs/comparisons/bloomberg.md`
+
+The markdown comparison report at the workspace path
+`aslan-event-extractor/docs/comparisons/bloomberg.md` is **generated**,
+not hand-written. It is overwritten on each invocation of:
+
+```
+aslan-core audit bloomberg-render
+```
+
+The render CLI auto-creates the parent directory if missing, so a
+fresh checkout of `aslan-event-extractor` does not need to pre-create
+`docs/comparisons/`. **Do not edit the file by hand** — the next
+render run will clobber any manual changes. The intended cadence is
+"after every closed quarter" (a one-shot CLI invocation, not a cron).
+
+### Per-PR claim defence
+
+Per workspace `CLAUDE.md` §2 ("Does this meet or exceed Bloomberg's TR
+coverage on the relevant dimension?"), every PR that claims an Aslan
+advantage on a comparison field must paste the output of:
+
+```
+aslan-core audit bloomberg-claim-check --field <FIELD>
+```
+
+into the PR description. The output is a markdown block listing the
+most-recent CLOSED run's per-entity verdict for that field. If no
+closed run exists yet, the CLI prints a short prompt explaining that
+the claim cannot yet be defended; in that case the PR author must
+either open + close a quarter first, or downgrade the claim to "we
+expect to beat Bloomberg once the first comparison closes."
+
+### Dashboard surface (M4)
+
+* `GET /dq/bloomberg` — latest run summary (wins/ties/loses headline
+  counts, NULL-cell count), the 60-cell grid grouped by entity with
+  inline entry forms on NULL bloomberg cells, and a History block
+  listing past closed runs with click-through.
+* `GET /dq/bloomberg/runs/{run_id}` — per-run drill-down. Always
+  read-only (closed runs cannot be re-edited).
+* `POST /dq/bloomberg/cells/{cell_id}` — manual-entry submit. Mirrors
+  the `/dq/spot-check/{sample_id}` pattern: column-level UPDATE on
+  `bloomberg_value` is granted to `audit_admin` only (migration 0060);
+  the dashboard role itself remains SELECT-only. Production wires
+  sidar's authenticated session against the `audit_admin` role.
+
+### Sources of truth
+
+* Module: `src/aslan_core/dq/bloomberg.py` — public API
+  (`open_quarter`, `record_bloomberg_value`, `record_aslan_value`,
+  `close_quarter`, `claim_check`, `render_markdown`).
+* CLI: `src/aslan_core/cli/dq.py` — five new commands listed above.
+* Dashboard: `src/aslan_core/dashboard/pages/dq_bloomberg.py` +
+  `_bloomberg_*` query helpers in `src/aslan_core/dashboard/queries.py`.
+* Migration: `0060_dq_bloomberg_comparison.py` — table + index +
+  GRANT layout.
+
+

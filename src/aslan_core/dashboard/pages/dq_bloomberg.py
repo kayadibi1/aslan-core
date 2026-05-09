@@ -103,9 +103,7 @@ def _verdict_badge(advantage: str | None) -> str:
     return {"wins": "Aslan", "ties": "tie", "loses": "Bloomberg"}.get(advantage, advantage)
 
 
-def _cells_grid(
-    cells: list[DqBloombergCellRowVM], *, run_id: UUID, run_open: bool
-) -> object:
+def _cells_grid(cells: list[DqBloombergCellRowVM], *, run_id: UUID, run_open: bool) -> object:
     """Render the 60-cell grid grouped by entity. ``run_open`` controls
     whether the per-NULL-cell entry form is rendered (closed runs are
     read-only)."""
