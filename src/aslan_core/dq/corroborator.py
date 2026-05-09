@@ -306,9 +306,7 @@ def _firecrawl_via_cli(url: str) -> _FirecrawlOutcome:
             markdown=None,
             error_summary=(proc.stderr or "")[:200] or f"exit {proc.returncode}",
         )
-    return _FirecrawlOutcome(
-        status="ok", markdown=proc.stdout or None, error_summary=None
-    )
+    return _FirecrawlOutcome(status="ok", markdown=proc.stdout or None, error_summary=None)
 
 
 def _firecrawl_fetch(url: str) -> _FirecrawlOutcome:
@@ -454,9 +452,7 @@ async def _select_latest_row(
     ).one_or_none()
 
 
-async def _insert_cache_row(
-    session: AsyncSession, *, result: CorroboratorResult
-) -> int:
+async def _insert_cache_row(session: AsyncSession, *, result: CorroboratorResult) -> int:
     insert = await session.execute(
         INSERT_CORROBORATOR_CACHE,
         {
@@ -499,9 +495,7 @@ async def lookup(
         )
     if max_age_hours <= 0:
         raise ValueError(f"max_age_hours must be positive; got {max_age_hours}")
-    row = await _select_latest_row(
-        session, source=source, entity_ticker=entity_ticker
-    )
+    row = await _select_latest_row(session, source=source, entity_ticker=entity_ticker)
     if row is None:
         return None
     cutoff = datetime.now(UTC) - timedelta(hours=max_age_hours)
@@ -574,11 +568,7 @@ async def refresh(
     outcome = _firecrawl_fetch(fetch_url)
     latency_ms = int((time.monotonic() - started) * 1000)
     fetched_at = datetime.now(UTC)
-    payload = (
-        _extract_payload(source, outcome.markdown)
-        if outcome.status == "ok"
-        else {}
-    )
+    payload = _extract_payload(source, outcome.markdown) if outcome.status == "ok" else {}
     result = CorroboratorResult(
         source=source,
         entity_ticker=entity_ticker,

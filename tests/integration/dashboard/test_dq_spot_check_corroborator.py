@@ -59,11 +59,7 @@ async def _kap_seeded_with_ticker(
         # ``entity_id`` in ref.entity that we can reuse; if not we
         # insert one. We use a stable disclosure_id by reading back.
         ent_row = (
-            await s.execute(
-                text(
-                    "SELECT entity_id FROM ref.entity ORDER BY entity_id LIMIT 1"
-                )
-            )
+            await s.execute(text("SELECT entity_id FROM ref.entity ORDER BY entity_id LIMIT 1"))
         ).one_or_none()
         if ent_row is None:
             entity_id = (
@@ -254,9 +250,7 @@ async def test_panel_renders_no_ticker_placeholder(
         await s.commit()
     sid = ids[0]
     try:
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.get(f"/dq/spot-check/{sid}")
         assert resp.status_code == 200
         assert "Could not resolve a BIST ticker" in resp.text
@@ -291,12 +285,8 @@ async def test_refresh_writes_cache_row_and_redirects(
         ids = await spot_check.draw_sample(session=s, source="kap", n=1)
         await s.commit()
     sid = ids[0]
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as client:
-        resp = await client.post(
-            f"/dq/spot-check/{sid}/corroborator/investing_com/refresh"
-        )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(f"/dq/spot-check/{sid}/corroborator/investing_com/refresh")
     assert resp.status_code == 303
     assert resp.headers["location"] == f"/dq/spot-check/{sid}"
     async with session_factory() as s:
@@ -312,12 +302,8 @@ async def test_refresh_writes_cache_row_and_redirects(
 
 
 async def test_refresh_400_for_bad_uuid(_configured_dashboard: None) -> None:
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as client:
-        resp = await client.post(
-            "/dq/spot-check/not-a-uuid/corroborator/investing_com/refresh"
-        )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post("/dq/spot-check/not-a-uuid/corroborator/investing_com/refresh")
     assert resp.status_code == 400
 
 
@@ -330,12 +316,8 @@ async def test_refresh_404_for_unknown_source(
         ids = await spot_check.draw_sample(session=s, source="kap", n=1)
         await s.commit()
     sid = ids[0]
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as client:
-        resp = await client.post(
-            f"/dq/spot-check/{sid}/corroborator/totally_made_up/refresh"
-        )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(f"/dq/spot-check/{sid}/corroborator/totally_made_up/refresh")
     assert resp.status_code == 404
 
 
@@ -348,24 +330,17 @@ async def test_refresh_400_for_unimplemented_source(
         ids = await spot_check.draw_sample(session=s, source="kap", n=1)
         await s.commit()
     sid = ids[0]
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as client:
-        resp = await client.post(
-            f"/dq/spot-check/{sid}/corroborator/tradingview/refresh"
-        )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(f"/dq/spot-check/{sid}/corroborator/tradingview/refresh")
     assert resp.status_code == 400
 
 
 async def test_refresh_404_for_unknown_sample(
     _configured_dashboard: None,
 ) -> None:
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as client:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
-            "/dq/spot-check/00000000-0000-0000-0000-000000000000"
-            "/corroborator/investing_com/refresh"
+            "/dq/spot-check/00000000-0000-0000-0000-000000000000/corroborator/investing_com/refresh"
         )
     assert resp.status_code == 404
 
@@ -400,12 +375,8 @@ async def test_refresh_400_when_no_ticker_can_be_resolved(
         await s.commit()
     sid = ids[0]
     try:
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            resp = await client.post(
-                f"/dq/spot-check/{sid}/corroborator/investing_com/refresh"
-            )
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(f"/dq/spot-check/{sid}/corroborator/investing_com/refresh")
         assert resp.status_code == 400
     finally:
         async with session_factory() as s:

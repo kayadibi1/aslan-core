@@ -145,9 +145,7 @@ async def test_dashboard_role_can_select(
     aslan_dashboard_conn: asyncpg.Connection,
 ) -> None:
     """The aslan_dashboard role has SELECT on audit.scorecard_snapshot."""
-    n = await aslan_dashboard_conn.fetchval(
-        "SELECT count(*) FROM audit.scorecard_snapshot"
-    )
+    n = await aslan_dashboard_conn.fetchval("SELECT count(*) FROM audit.scorecard_snapshot")
     assert int(n) >= 0
 
 

@@ -22,13 +22,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-_MODULE_PATH = (
-    Path(__file__).resolve().parents[3]
-    / "src"
-    / "aslan_core"
-    / "dq"
-    / "corroborator.py"
-)
+_MODULE_PATH = Path(__file__).resolve().parents[3] / "src" / "aslan_core" / "dq" / "corroborator.py"
 
 
 _FORBIDDEN_NETWORK_IMPORTS = frozenset(
@@ -131,11 +125,7 @@ def test_firecrawl_fetch_is_the_single_entry_point() -> None:
     SDK or CLI helpers directly."""
     tree = _module_tree()
     refresh_fn = next(
-        (
-            n
-            for n in tree.body
-            if isinstance(n, ast.AsyncFunctionDef) and n.name == "refresh"
-        ),
+        (n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "refresh"),
         None,
     )
     assert refresh_fn is not None, "refresh() not found in corroborator module"
@@ -145,7 +135,6 @@ def test_firecrawl_fetch_is_the_single_entry_point() -> None:
             if sub.func.id == "_firecrawl_fetch":
                 found = True
             assert sub.func.id not in ("_firecrawl_via_cli", "_firecrawl_via_sdk"), (
-                f"refresh() calls {sub.func.id} directly — must go through "
-                f"_firecrawl_fetch"
+                f"refresh() calls {sub.func.id} directly — must go through _firecrawl_fetch"
             )
     assert found, "refresh() does not call _firecrawl_fetch"

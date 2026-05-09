@@ -77,11 +77,7 @@ def test_extract_investing_handles_none_markdown() -> None:
 def test_extract_kap_ir_preserves_turkish_text() -> None:
     """Per workspace CLAUDE.md: Turkish text is preserved verbatim,
     never auto-translated."""
-    md = (
-        "Şirket Adı: Akbank T.A.Ş.\n"
-        "Sektör: Bankacılık\n"
-        "BIST Kodu: AKBNK\n"
-    )
+    md = "Şirket Adı: Akbank T.A.Ş.\nSektör: Bankacılık\nBIST Kodu: AKBNK\n"
     payload = _extract_payload("kap_ir", md)
     assert payload.get("company_name") == "Akbank T.A.Ş."
     assert payload.get("sector") == "Bankacılık"

@@ -30,11 +30,19 @@ from aslan_core.dashboard.app import app, configure_app
 pytestmark = pytest.mark.integration
 
 # Routes permitted to expose POST. Mirrors the unit-test allowlist
-# in tests/unit/test_dashboard_routes_are_get_only.py.
+# in tests/unit/test_dashboard_routes_are_get_only.py — keep the two
+# in sync. Entries here are excluded from the 405-on-POST sweep
+# because their POST handler is the documented audit-write workflow.
 _MUTATION_ROUTES: frozenset[str] = frozenset(
     {
+        # dq M2: spot-check labelling form.
         "/dq/spot-check/{sample_id}",
+        # dq M4: Bloomberg-comparison manual-entry form.
         "/dq/bloomberg/cells/{cell_id}",
+        # dq M5: regression-flag review form.
+        "/dq/validation/regression/{flag_id}",
+        # NG6: external-corroborator refresh button.
+        "/dq/spot-check/{sample_id}/corroborator/{source}/refresh",
     }
 )
 
@@ -61,6 +69,11 @@ def _gettable_paths() -> list[str]:
             path = path.replace("{sample_id}", "00000000-0000-0000-0000-000000000000")
             path = path.replace("{cell_id}", "00000000-0000-0000-0000-000000000000")
             path = path.replace("{run_id}", "00000000-0000-0000-0000-000000000000")
+            path = path.replace("{flag_id}", "00000000-0000-0000-0000-000000000000")
+            # NG6 corroborator refresh route is parameterised by `{source}`
+            # (kap_ir / investing_com); pick a representative literal so the
+            # converter resolves rather than 404-ing before the 405 check.
+            path = path.replace("{source}", "kap_ir")
         paths.append(path)
     return paths
 

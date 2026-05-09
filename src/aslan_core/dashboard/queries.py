@@ -958,9 +958,7 @@ def _corroborator_payload_pairs(
     ]
 
 
-async def _entity_ticker_for_sample(
-    session: AsyncSession, *, source: str, record_pk: Any
-) -> str:
+async def _entity_ticker_for_sample(session: AsyncSession, *, source: str, record_pk: Any) -> str:
     """Resolve a BIST ticker from the sample's source + record_pk.
 
     KAP samples carry ``disclosure_id``; we project to the canonical
@@ -1048,9 +1046,9 @@ async def _build_corroborator_panels(
                 )
             ).one_or_none()
         if not implemented:
-            cache_state: Literal[
-                "fresh", "stale", "miss", "error", "unimplemented"
-            ] = "unimplemented"
+            cache_state: Literal["fresh", "stale", "miss", "error", "unimplemented"] = (
+                "unimplemented"
+            )
             panels.append(
                 DqSpotCheckCorroboratorPanelVM(
                     source=source,
@@ -1163,9 +1161,7 @@ async def dq_spot_check_sample_detail(
         # branch — fall back to empty ticker so the corroborator panel
         # renders the "ticker unresolved" placeholder.
         entity_ticker = ""
-    corroborator_panels = await _build_corroborator_panels(
-        session, entity_ticker=entity_ticker
-    )
+    corroborator_panels = await _build_corroborator_panels(session, entity_ticker=entity_ticker)
     return DqSpotCheckSampleDetailVM(
         sample_id=sample_row.sample_id,
         source=sample_row.source,
@@ -1519,9 +1515,7 @@ async def dq_scorecard(
     fail_count = sum(1 for r in rows if r.status == "fail")
     pass_pct = (100.0 * pass_count / len(rows)) if rows else 0.0
 
-    history_raw = (
-        await session.execute(_SCORECARD_HISTORY_SQL, {"limit": history_limit})
-    ).all()
+    history_raw = (await session.execute(_SCORECARD_HISTORY_SQL, {"limit": history_limit})).all()
     history: list[DqScorecardWeekSummaryVM] = [
         DqScorecardWeekSummaryVM(
             week_start=_date_to_dt(h.week_start),

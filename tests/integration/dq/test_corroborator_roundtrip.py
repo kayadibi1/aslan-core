@@ -51,9 +51,7 @@ async def test_lookup_returns_none_for_cache_miss(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     async with session_factory() as s:
-        result = await corroborator.lookup(
-            session=s, source="investing_com", entity_ticker="AKBNK"
-        )
+        result = await corroborator.lookup(session=s, source="investing_com", entity_ticker="AKBNK")
     assert result is None
 
 
@@ -77,9 +75,7 @@ async def test_lookup_returns_recent_row(
         )
         await s.commit()
     async with session_factory() as s:
-        result = await corroborator.lookup(
-            session=s, source="investing_com", entity_ticker="AKBNK"
-        )
+        result = await corroborator.lookup(session=s, source="investing_com", entity_ticker="AKBNK")
     assert result is not None
     assert result.source == "investing_com"
     assert result.entity_ticker == "AKBNK"
@@ -124,9 +120,7 @@ async def test_lookup_rejects_unknown_source(
 ) -> None:
     async with session_factory() as s:
         with pytest.raises(ValueError, match="unknown source"):
-            await corroborator.lookup(
-                session=s, source="totally_made_up", entity_ticker="AKBNK"
-            )
+            await corroborator.lookup(session=s, source="totally_made_up", entity_ticker="AKBNK")
 
 
 async def test_lookup_rejects_non_positive_max_age(
@@ -162,9 +156,7 @@ async def test_fetch_writes_cache_row_on_miss(
         ),
     )
     async with session_factory() as s:
-        result = await corroborator.fetch(
-            session=s, source="investing_com", entity_ticker="AKBNK"
-        )
+        result = await corroborator.fetch(session=s, source="investing_com", entity_ticker="AKBNK")
         await s.commit()
     assert result.fetch_status == "ok"
     assert result.payload.get("latest_price") == "45.20"
@@ -210,9 +202,7 @@ async def test_fetch_returns_cache_hit_without_firecrawl_call(
 
     monkeypatch.setattr(corroborator, "_firecrawl_fetch", _trap)
     async with session_factory() as s:
-        result = await corroborator.fetch(
-            session=s, source="investing_com", entity_ticker="AKBNK"
-        )
+        result = await corroborator.fetch(session=s, source="investing_com", entity_ticker="AKBNK")
     assert isinstance(result, CorroboratorResult)
     assert call_count["n"] == 0, "fetch() called _firecrawl_fetch on a cache hit"
 
@@ -234,9 +224,7 @@ async def test_fetch_writes_error_row_on_failure(
         ),
     )
     async with session_factory() as s:
-        result = await corroborator.fetch(
-            session=s, source="investing_com", entity_ticker="AKBNK"
-        )
+        result = await corroborator.fetch(session=s, source="investing_com", entity_ticker="AKBNK")
         await s.commit()
     assert result.fetch_status == "rate_limited"
     assert result.payload == {}
@@ -313,9 +301,7 @@ async def test_refresh_unimplemented_raises(
 ) -> None:
     async with session_factory() as s:
         with pytest.raises(NotImplementedError, match="not yet implemented"):
-            await corroborator.refresh(
-                session=s, source="tradingview", entity_ticker="AKBNK"
-            )
+            await corroborator.refresh(session=s, source="tradingview", entity_ticker="AKBNK")
 
 
 async def test_refresh_unknown_source_raises(
@@ -324,9 +310,7 @@ async def test_refresh_unknown_source_raises(
 ) -> None:
     async with session_factory() as s:
         with pytest.raises(ValueError, match="unknown source"):
-            await corroborator.refresh(
-                session=s, source="totally_made_up", entity_ticker="AKBNK"
-            )
+            await corroborator.refresh(session=s, source="totally_made_up", entity_ticker="AKBNK")
 
 
 async def test_refresh_kap_ir_extracts_turkish_payload(
@@ -341,18 +325,12 @@ async def test_refresh_kap_ir_extracts_turkish_payload(
         "_firecrawl_fetch",
         lambda _url: _FirecrawlOutcome(
             status="ok",
-            markdown=(
-                "Şirket Adı: Akbank T.A.Ş.\n"
-                "Sektör: Bankacılık\n"
-                "BIST Kodu: AKBNK\n"
-            ),
+            markdown=("Şirket Adı: Akbank T.A.Ş.\nSektör: Bankacılık\nBIST Kodu: AKBNK\n"),
             error_summary=None,
         ),
     )
     async with session_factory() as s:
-        result = await corroborator.refresh(
-            session=s, source="kap_ir", entity_ticker="AKBNK"
-        )
+        result = await corroborator.refresh(session=s, source="kap_ir", entity_ticker="AKBNK")
         await s.commit()
     assert result.fetch_status == "ok"
     assert result.payload.get("company_name") == "Akbank T.A.Ş."

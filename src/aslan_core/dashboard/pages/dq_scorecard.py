@@ -81,8 +81,7 @@ def _build_metrics_table(rows: list[DqScorecardRowVM]) -> object:
         body.append(
             Tr(
                 Td(
-                    "No scorecard rows yet. Run "
-                    "`aslan-core audit scorecard` to populate.",
+                    "No scorecard rows yet. Run `aslan-core audit scorecard` to populate.",
                     colspan="5",
                 )
             )

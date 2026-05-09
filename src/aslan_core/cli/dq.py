@@ -1143,15 +1143,9 @@ async def _run_scorecard(week_start_value: date) -> dict[str, Any]:
     try:
         async with factory() as s:
             rows = await scorecard.compute(session=s, week_start=week_start_value)
-            written = await scorecard.write(
-                session=s, week_start=week_start_value, rows=rows
-            )
-            subject, body_html = scorecard.render_email(
-                week_start=week_start_value, rows=rows
-            )
-            body_text = scorecard.render_text_fallback(
-                week_start=week_start_value, rows=rows
-            )
+            written = await scorecard.write(session=s, week_start=week_start_value, rows=rows)
+            subject, body_html = scorecard.render_email(week_start=week_start_value, rows=rows)
+            body_text = scorecard.render_text_fallback(week_start=week_start_value, rows=rows)
             await event.emit(
                 session=s,
                 event_type="scorecard_generated",

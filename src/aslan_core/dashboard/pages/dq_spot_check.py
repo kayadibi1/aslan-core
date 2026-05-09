@@ -271,9 +271,7 @@ def _cache_state_label(state: str) -> str:
     }.get(state, state)
 
 
-def _build_corroborator_panel(
-    panel: DqSpotCheckCorroboratorPanelVM, *, sample_id: str
-) -> object:
+def _build_corroborator_panel(panel: DqSpotCheckCorroboratorPanelVM, *, sample_id: str) -> object:
     """Render one corroborator source as a panel block.
 
     The block surfaces cache age, fetch latency, fetch status, the
@@ -284,8 +282,7 @@ def _build_corroborator_panel(
     pieces: list[object] = [
         H2(f"Corroborator — {panel.source}"),
         P(
-            f"State: {_cache_state_label(panel.cache_state)}. "
-            f"Cache age: {panel.cached_age_label}.",
+            f"State: {_cache_state_label(panel.cache_state)}. Cache age: {panel.cached_age_label}.",
             _id=f"dq-corroborator-{panel.source}-state",
         ),
     ]
@@ -323,8 +320,7 @@ def _build_corroborator_panel(
     if panel.fetch_status is not None and panel.fetch_latency_ms is not None:
         pieces.append(
             P(
-                f"Last fetch: status={panel.fetch_status}, "
-                f"latency={panel.fetch_latency_ms} ms.",
+                f"Last fetch: status={panel.fetch_status}, latency={panel.fetch_latency_ms} ms.",
                 _id=f"dq-corroborator-{panel.source}-fetch-meta",
             )
         )
@@ -341,9 +337,7 @@ def _build_corroborator_panel(
         payload_rows: list[object] = [Tr(Th("Field"), Th("Value"))]
         for pair in panel.payload_pairs:
             payload_rows.append(Tr(Th(pair.key), Td(pair.value)))
-        pieces.append(
-            Table(*payload_rows, cls="aslan-spot-check-corroborator-payload")
-        )
+        pieces.append(Table(*payload_rows, cls="aslan-spot-check-corroborator-payload"))
     else:
         pieces.append(
             P(
@@ -363,10 +357,7 @@ def _build_corroborator_panel(
 
     return Div(
         *pieces,
-        cls=(
-            "aslan-spot-check-corroborator "
-            f"aslan-spot-check-corroborator-{panel.source}"
-        ),
+        cls=(f"aslan-spot-check-corroborator aslan-spot-check-corroborator-{panel.source}"),
         _id=f"dq-corroborator-{panel.source}",
     )
 
@@ -399,9 +390,7 @@ def _build_corroborator_section(vm: DqSpotCheckSampleDetailVM) -> object:
         ),
     ]
     for panel in vm.corroborator_panels:
-        pieces.append(
-            _build_corroborator_panel(panel, sample_id=str(vm.sample_id))
-        )
+        pieces.append(_build_corroborator_panel(panel, sample_id=str(vm.sample_id)))
     return Div(
         *pieces,
         cls="aslan-spot-check-corroborator-section",
@@ -585,8 +574,6 @@ async def dq_spot_check_corroborator_refresh(
                 "<h1>Could not resolve entity ticker for this sample</h1>",
                 status_code=400,
             )
-        await corroborator.refresh(
-            session=session, source=source, entity_ticker=entity_ticker
-        )
+        await corroborator.refresh(session=session, source=source, entity_ticker=entity_ticker)
         await session.commit()
     return RedirectResponse(url=f"/dq/spot-check/{sid}", status_code=303)

@@ -82,9 +82,7 @@ async def _seeded(
     async with session_factory() as s:
         # Clean slate for the test week.
         await s.execute(
-            text(
-                "DELETE FROM audit.scorecard_snapshot WHERE week_start = :w"
-            ),
+            text("DELETE FROM audit.scorecard_snapshot WHERE week_start = :w"),
             {"w": _TEST_WEEK_START},
         )
         await s.execute(
@@ -109,12 +107,7 @@ async def _seeded(
                 "  AND dimension = 'entity'"
             )
         )
-        await s.execute(
-            text(
-                "DELETE FROM audit.event "
-                "WHERE event_type = 'scorecard_generated'"
-            )
-        )
+        await s.execute(text("DELETE FROM audit.event WHERE event_type = 'scorecard_generated'"))
 
         # Seed two recency rows (low lags → pass).
         for hours_offset, lag in [(2, 100), (24, 250)]:
@@ -210,10 +203,7 @@ async def test_cli_writes_rows_and_emits_event(
     async with engine.connect() as conn:
         n_rows = (
             await conn.execute(
-                text(
-                    "SELECT count(*)::int FROM audit.scorecard_snapshot "
-                    "WHERE week_start = :w"
-                ),
+                text("SELECT count(*)::int FROM audit.scorecard_snapshot WHERE week_start = :w"),
                 {"w": _TEST_WEEK_START},
             )
         ).scalar_one()
@@ -304,10 +294,7 @@ async def test_cli_idempotent_rerun(
     async with engine.connect() as conn:
         n = (
             await conn.execute(
-                text(
-                    "SELECT count(*)::int FROM audit.scorecard_snapshot "
-                    "WHERE week_start = :w"
-                ),
+                text("SELECT count(*)::int FROM audit.scorecard_snapshot WHERE week_start = :w"),
                 {"w": _TEST_WEEK_START},
             )
         ).scalar_one()

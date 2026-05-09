@@ -511,9 +511,7 @@ _SELECT_LATEST_CLOSED_RUN_WINS = text(
 )
 
 
-async def _metric_bloomberg_wins(
-    *, session: AsyncSession
-) -> ScorecardRow:
+async def _metric_bloomberg_wins(*, session: AsyncSession) -> ScorecardRow:
     """``bloomberg_wins_count``: count of cells with aslan_advantage='wins'
     in the latest closed run."""
     if not await _table_present(session, "audit", "bloomberg_comparison_cell"):
@@ -549,9 +547,7 @@ _SELECT_REGRESSION_OPEN = text(
 )
 
 
-async def _metric_regression_open(
-    *, session: AsyncSession
-) -> ScorecardRow:
+async def _metric_regression_open(*, session: AsyncSession) -> ScorecardRow:
     """``regression_flag_open_count``: count of audit.regression_flag rows
     with status='open' (point-in-time, not week-windowed)."""
     if not await _table_present(session, "audit", "regression_flag"):
@@ -651,16 +647,12 @@ async def compute(
     rows: list[ScorecardRow] = []
 
     # Recency p95/p99 (KAP).
-    p95_row, p99_row = await _metric_kap_recency(
-        session=session, start_at=start_at, end_at=end_at
-    )
+    p95_row, p99_row = await _metric_kap_recency(session=session, start_at=start_at, end_at=end_at)
     rows.append(p95_row)
     rows.append(p99_row)
 
     # EVDS freshness.
-    rows.append(
-        await _metric_evds_freshness(session=session, start_at=start_at, end_at=end_at)
-    )
+    rows.append(await _metric_evds_freshness(session=session, start_at=start_at, end_at=end_at))
 
     # Coverage snapshots.
     rows.append(
@@ -690,9 +682,7 @@ async def compute(
 
     # Validation pass rate (KAP).
     rows.append(
-        await _metric_validation_pass_rate_kap(
-            session=session, start_at=start_at, end_at=end_at
-        )
+        await _metric_validation_pass_rate_kap(session=session, start_at=start_at, end_at=end_at)
     )
 
     # Spot-check completion (trailing 4 weeks).
@@ -804,7 +794,7 @@ def _render_table_html(rows: list[ScorecardRow]) -> str:
             f"<td><code>{html_escape(r.metric_name)}</code></td>"
             f"<td>{html_escape(r.target)}</td>"
             f"<td><strong>{html_escape(r.actual)}</strong></td>"
-            f'<td><strong>{html_escape(r.status.upper())}</strong></td>'
+            f"<td><strong>{html_escape(r.status.upper())}</strong></td>"
             f"<td>{html_escape(r.notes or '')}</td>"
             f"</tr>"
         )
@@ -888,8 +878,7 @@ def render_text_fallback(*, week_start: date, rows: list[ScorecardRow]) -> str:
     ]
     for r in rows:
         lines.append(
-            f"{r.metric_name:40s} {r.target:20s} {r.actual:20s} "
-            f"{r.status:6s} {r.notes or ''}"
+            f"{r.metric_name:40s} {r.target:20s} {r.actual:20s} {r.status:6s} {r.notes or ''}"
         )
     return "\n".join(lines) + "\n"
 
