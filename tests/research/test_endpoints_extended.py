@@ -352,21 +352,75 @@ def test_redact_event_payload_unredacted_for_pii_unredacted_principal() -> None:
 
 
 # ---------------------------------------------------------------------
-# 6. Pre-bitemporal warning on /disclosures (TC-008)
+# 6. Pre-bitemporal provenance on /disclosures rows (TC-008 — revised)
 # ---------------------------------------------------------------------
 
 
-def test_disclosures_envelope_carries_pre_bitemporal_warning(
+def test_disclosures_rows_carry_as_of_provenance(
     client: TestClient, db_dsn: str
 ) -> None:
-    """TC-008 — /disclosures envelope ``metadata.warnings`` contains
-    ``code=PRE_BITEMPORAL_TABLE`` per the warning helper in research.py.
+    """TC-008 (round-6 revision) — after migration 0051's SCD-4
+    upgrade, ``/v1/research/disclosures`` no longer attaches a
+    ``PRE_BITEMPORAL_TABLE`` envelope warning (the table IS bitemporal).
+    Per-row provenance is surfaced via the ``as_of_provenance`` enum
+    on each disclosure record; rows backfilled without a real
+    ``as_of`` are tagged ``pre_bitemporal_unknown`` and additionally
+    carry ``pre_bitemporal=true``.
+
+    The ``PRE_BITEMPORAL_TABLE`` warning still surfaces on
+    ``/v1/research/filings`` (no ``doc.filing_at`` PIT function in
+    v1) — covered separately in
+    ``test_filings_envelope_carries_pre_bitemporal_warning``.
+
+    This test asserts the response shape, not specific values; an
+    empty result set is acceptable.
     """
     _set_master_flag(db_dsn, value=True)
     try:
         key_id, secret = _seed_api_key(db_dsn)
         resp = client.get(
             "/v1/research/disclosures",
+            headers={"X-Aslan-Api-Key": f"{key_id}:{secret}"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+        # /disclosures must NOT carry the PRE_BITEMPORAL_TABLE warning
+        # any more — that warning is reserved for /filings (Class F).
+        warnings = body.get("metadata", {}).get("warnings", [])
+        codes = {w.get("code") for w in warnings}
+        assert "PRE_BITEMPORAL_TABLE" not in codes, (
+            "post-0051 /disclosures is bitemporal; warning belongs to /filings only"
+        )
+
+        # If any rows are present, every row must carry as_of_provenance.
+        for row in body.get("data", []) or []:
+            assert "as_of_provenance" in row
+            assert row["as_of_provenance"] in {
+                "live",
+                "index_fetched_at",
+                "body_fetched_at",
+                "published_at",
+                "pre_bitemporal_unknown",
+            }
+            if row["as_of_provenance"] == "pre_bitemporal_unknown":
+                assert row.get("pre_bitemporal") is True
+    finally:
+        _set_master_flag(db_dsn, value=False)
+
+
+def test_filings_envelope_carries_pre_bitemporal_warning(
+    client: TestClient, db_dsn: str
+) -> None:
+    """TC-008b — the PRE_BITEMPORAL_TABLE warning moved from
+    /disclosures (now bitemporal via 0051) to /filings (Class F;
+    no ``doc.filing_at`` PIT function in v1; v1.0.0-beta follow-up).
+    """
+    _set_master_flag(db_dsn, value=True)
+    try:
+        key_id, secret = _seed_api_key(db_dsn)
+        resp = client.get(
+            "/v1/research/filings",
             headers={"X-Aslan-Api-Key": f"{key_id}:{secret}"},
         )
         assert resp.status_code == 200

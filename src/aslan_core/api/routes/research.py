@@ -1833,6 +1833,7 @@ async def quality_scores(
     flags: FeatureFlagState = Depends(require_master_flag),
     ctx: RequestContext = Depends(get_request_context),
     as_of: str | None = Query(default=None),
+    as_of_range: str | None = Query(default=None),
     entity_id: UUID | None = Query(default=None),
     period_end_from: datetime | None = Query(default=None),
     period_end_to: datetime | None = Query(default=None),
@@ -1845,18 +1846,27 @@ async def quality_scores(
 ) -> dict[str, Any]:
     """Per SCOPE.md D1: ``ts.entity_quality_score_at(p_as_of)``.
 
-    D6/D7/D17/D18/D25 wired.
+    D2 interval, D6/D7/D17/D18/D25 wired.
     """
+    _reject_pit_with_interval(as_of=as_of, as_of_range=as_of_range)
+    interval = _parse_as_of_range(as_of_range)
+    _enforce_query_cost(as_of_range=interval, limit=limit)
     requested = _parse_as_of(as_of)
     resolved = requested or now_utc()
     ctx.api_key_id = principal.key_id if principal else None
     ctx.rate_tier = principal.rate_tier if principal else "anonymous"
     ctx.as_of_requested = requested
     ctx.as_of_resolved = resolved
+    ctx.as_of_range = interval
     ctx.feature_flags_active = _active_flags(flags)
 
     where_parts: list[str] = []
-    params: dict[str, Any] = {"as_of": resolved, "limit": limit}
+    params: dict[str, Any] = {"limit": limit}
+    if interval is None:
+        params["as_of"] = resolved
+    else:
+        params["as_of_lower"] = interval[0]
+        params["as_of_upper"] = interval[1]
     if entity_id is not None:
         where_parts.append("entity_id = :entity_id")
         params["entity_id"] = str(entity_id)
@@ -1871,7 +1881,12 @@ async def quality_scores(
         params["restatement_basis"] = restatement_basis
 
     filters_for_cursor: dict[str, Any] = {
-        "as_of": resolved.isoformat(),
+        "as_of": resolved.isoformat() if interval is None else None,
+        "as_of_range": (
+            [interval[0].isoformat(), interval[1].isoformat()]
+            if interval
+            else None
+        ),
         "entity_id": str(entity_id) if entity_id else None,
         "period_end_from": (
             period_end_from.isoformat() if period_end_from else None
@@ -1890,6 +1905,7 @@ async def quality_scores(
         pit_call="ts.entity_quality_score_at(:as_of)",
         where_parts=where_parts,
         order_by="ORDER BY period_end DESC",
+        as_of_range=interval,
     )
     result = await session.execute(text(sql), params)
     columns = list(result.keys())
@@ -1929,6 +1945,7 @@ async def quality_scores(
         request_id=ctx.request_id,
         as_of_requested=requested,
         as_of_resolved=resolved,
+        as_of_range=interval,
         feature_flags_active=_active_flags(flags),
         pagination=pagination,
     )

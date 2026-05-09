@@ -155,13 +155,27 @@ paths:
         - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/DisplayTz'
-        - name: series_id
+        - name: series_code
           in: query
-          required: true
-          description: Catalog series identifier (e.g. `BIST.GARAN.close`).
+          required: false
+          description: |
+            Catalog series code (e.g. `BIST.GARAN.close`). Resolved at the
+            API boundary to the numeric `series_id` via `ts.series_catalog`.
+            Pass either `series_code` (string) or `series_id` (int); pass
+            at least one for sub-100ms p99 (D19, P2).
           schema:
             type: string
             example: BIST.GARAN.close
+        - name: series_id
+          in: query
+          required: false
+          description: |
+            Numeric `ts.series_catalog.series_id`. Direct DB-id access path;
+            most clients should prefer `series_code`.
+          schema:
+            type: integer
+            format: int64
+            example: 1234
         - name: ts_from
           in: query
           required: false
@@ -207,13 +221,13 @@ paths:
                   summary: GARAN close prices in June 2024
                   value:
                     data:
-                      - series_id: BIST.GARAN.close
+                      - series_id: 1234
                         ts: 2024-06-03T15:30:00Z
                         value: 86.45
                         unit: TRY
                         as_of: 2024-06-03T15:30:11Z
                         local_time: 2024-06-03T18:30:11+03:00
-                      - series_id: BIST.GARAN.close
+                      - series_id: 1234
                         ts: 2024-06-04T15:30:00Z
                         value: 87.10
                         unit: TRY
@@ -2107,8 +2121,13 @@ components:
       description: A `ts.observation` row (PIT projection).
       properties:
         series_id:
-          type: string
-          example: BIST.GARAN.close
+          type: integer
+          format: int64
+          description: |
+            Numeric `ts.series_catalog.series_id` referenced by the row. Use
+            the `/observations` `series_code` query param to look up by
+            string code (e.g. `BIST.GARAN.close`).
+          example: 1234
         ts:
           type: string
           format: date-time
@@ -2260,6 +2279,27 @@ components:
           type: string
           format: date-time
           example: 2026-01-15T10:00:00Z
+        lineage_events:
+          type: array
+          description: |
+            Merge / split / rename events for this entity at or before
+            `as_of`, sourced from `ref.entity_lineage_at(:as_of)`.
+          items:
+            type: object
+            properties:
+              event_kind:
+                type: string
+                enum: [created, updated, merged, split, renamed, deleted]
+              from:
+                type: [string, 'null']
+              into:
+                type: [string, 'null']
+              event_at:
+                type: [string, 'null']
+                format: date-time
+              reason:
+                type: [string, 'null']
+            required: [event_kind, from, into, event_at, reason]
       required:
         - entity_id
         - canonical_name
@@ -2268,6 +2308,7 @@ components:
         - merged_from_entity_ids
         - split_from_entity_id
         - as_of
+        - lineage_events
 
     Identifier:
       type: object
@@ -2315,8 +2356,18 @@ components:
           example: ASL-ENT-00000001
         form_type:
           type: string
-          description: KAP form type code (Turkish; preserved verbatim).
+          description: |
+            KAP form type code (Turkish; preserved verbatim). Aliased
+            from the underlying `category_code` column.
           example: ÖDA
+        category_code:
+          type: string
+          description: KAP category code (same as `form_type`; surfaced for direct DB alignment).
+          example: ÖDA
+        subcategory_code:
+          type: [string, 'null']
+          description: KAP subcategory code where present.
+          example: null
         title:
           type: string
           description: Disclosure title (Turkish; preserved verbatim per ADR-002).
@@ -2326,6 +2377,10 @@ components:
           format: date-time
           description: Official KAP publication time.
           example: 2024-03-15T10:00:00Z
+        is_amendment:
+          type: boolean
+          description: True when this disclosure amends an earlier filing.
+          example: false
         body_fetched:
           type: boolean
           example: true
@@ -2335,8 +2390,19 @@ components:
           example: 2024-03-15T10:00:11Z
         republished_as:
           type: [string, 'null']
-          description: Disclosure ID of the amendment, if this was superseded.
+          description: |
+            Disclosure ID of the amendment, if this was superseded. Maps
+            to the physical `parent_disclosure_id` column (see migration
+            0051).
           example: KAP-2024-1234568
+        event_kind:
+          type: [string, 'null']
+          description: |
+            Bitemporal event that produced this version (one of
+            `indexed`, `body_fetched`, `republished`, `updated`,
+            `deleted`). Sourced from `kap.disclosures_at(:as_of)`.
+          enum: [indexed, body_fetched, republished, updated, deleted, null]
+          example: body_fetched
         as_of:
           type: [string, 'null']
           format: date-time
@@ -2408,14 +2474,29 @@ components:
       properties:
         event_id:
           type: string
+          description: |
+            Surface alias for the physical `filing_event_id` UUID
+            (renamed at the API boundary per OpenAPI).
           example: AGG-FE-2024-0000123
         filing_id:
           type: string
           example: KAP-2024-1234567
+        source_id:
+          type: [string, 'null']
+          description: Source system identity (e.g. `kap`, `bist`).
+          example: kap
+        source_filing_ref:
+          type: [string, 'null']
+          description: Source-system filing reference passed through verbatim.
+          example: '2024-1234567'
         entity_id:
           type: string
           pattern: '^ASL-ENT-[0-9]{8}$'
           example: ASL-ENT-00000001
+        counterparty_entity_id:
+          type: [string, 'null']
+          description: Aslan-canonical entity ID of the counterparty (D30).
+          example: null
         event_type:
           type: string
           description: One of the 32-event taxonomy values (Moat 7).
@@ -2427,23 +2508,46 @@ components:
         occurred_at:
           type: string
           format: date-time
+          description: |
+            Wall-clock event timestamp (UTC). Aliased at the API boundary
+            from the physical `event_ts` column.
           example: 2024-03-15T10:00:00Z
+        effective_dt:
+          type: [string, 'null']
+          format: date
+          description: Calendar date at which the event takes effect, when distinct.
+          example: 2024-04-01
         attributes:
           type: object
-          description: Event-type-specific structured fields.
+          description: |
+            Event-type-specific structured fields. PII keys
+            (counterparty_name, counterparty_address, signatory_name)
+            are redacted to `<REDACTED:counterparty>` unless the
+            principal carries `pii_unredacted=true` (D30). Aliased at
+            the API boundary from the physical `payload` column.
           additionalProperties: true
-        raw_quote:
-          type: string
-          description: Verbatim Turkish quote from the source body.
-          example: Yönetim Kurulumuzun 15.03.2024 tarihli kararıyla, hissedarlarımıza brüt 1,50 TL kâr payı dağıtılmasına karar verilmiştir.
         as_of:
           type: string
           format: date-time
           example: 2024-03-15T10:00:33Z
-        superseded_at:
+        primary_confidence:
+          type: [number, 'null']
+          minimum: 0
+          maximum: 1
+          description: Primary-extraction confidence score.
+          example: 0.97
+        final_confidence:
+          type: [number, 'null']
+          minimum: 0
+          maximum: 1
+          description: Final (post-verification) confidence score.
+          example: 0.99
+        primary_model_version:
           type: [string, 'null']
-          format: date-time
-          description: Set when a later event row supersedes this one.
+          example: claude-3-7-sonnet-20250219
+        primary_prompt_version:
+          type: [string, 'null']
+          example: filing_event_v3
       required:
         - event_id
         - filing_id
@@ -2452,7 +2556,6 @@ components:
         - event_seq
         - occurred_at
         - attributes
-        - raw_quote
         - as_of
 
     # Per-endpoint envelopes (D15 generic-style via per-endpoint specialization).

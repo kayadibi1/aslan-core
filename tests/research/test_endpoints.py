@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
+from datetime import UTC
 
 import psycopg
 import pytest
@@ -222,13 +223,12 @@ def test_future_as_of_rejected() -> None:
 
 def test_utc_z_suffix_accepted() -> None:
     """TC-042 — ``Z`` suffix is the canonical accepted form."""
-    from datetime import timezone
 
     from aslan_core.api.routes.research import _parse_as_of
 
     parsed = _parse_as_of("2024-06-15T13:30:00Z")
     assert parsed is not None
-    assert parsed.tzinfo == timezone.utc
+    assert parsed.tzinfo == UTC
 
 
 # ---------------------------------------------------------------------

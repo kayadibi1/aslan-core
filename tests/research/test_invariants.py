@@ -52,7 +52,7 @@ def _run_invariants(dsn: str) -> tuple[int, dict]:
     env["PYTHONPATH"] = (
         f"{src_path}{os.pathsep}{existing_pp}" if existing_pp else src_path
     )
-    proc = subprocess.run(
+    proc = subprocess.run(  # noqa: S603 — fixed argv from this test module
         [sys.executable, str(INVARIANTS_SCRIPT), "--dsn", dsn, "--json"],
         capture_output=True,
         text=True,

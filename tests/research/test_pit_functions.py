@@ -21,7 +21,7 @@ Per SCOPE.md D1, D8, D12, D29.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
 
@@ -182,7 +182,7 @@ async def test_observation_at_multi_version_picks_latest_le_as_of(
         "PIT must return latest as_of <= requested (v2)"
     )
     # v3's as_of must NOT have been picked.
-    assert rows[0].as_of < datetime(2024, 8, 5, tzinfo=timezone.utc)
+    assert rows[0].as_of < datetime(2024, 8, 5, tzinfo=UTC)
 
     await session.execute(
         text("DELETE FROM ts.observation WHERE series_id = :sid"),
