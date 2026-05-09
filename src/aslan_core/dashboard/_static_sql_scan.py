@@ -311,6 +311,17 @@ _FULL_TABLE_GRANTS: frozenset[str] = frozenset(
         "ref.currency",
         "ref.sector",
         "doc.filing_attachment",
+        # dq M-AU-04 (migration 0057): table-level SELECT for the
+        # audit.* tables that back the M1 /dq/* dashboard pages.
+        "audit.sync_log",
+        "audit.event",
+        "audit.severity_rule",
+        "audit.alert_dispatch",
+        "audit.recency_sla",
+        "audit.recency_observation",
+        "audit.evds_release_calendar",
+        "audit.coverage_snapshot",
+        "audit.validation_failure",
     }
 )
 

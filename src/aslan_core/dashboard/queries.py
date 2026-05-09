@@ -50,6 +50,13 @@ from aslan_core.dashboard.view_models import (
     AuditVM,
     DocumentRowVM,
     DocumentsVM,
+    DqCoverageRowVM,
+    DqCoverageVM,
+    DqHeatmapCellState,
+    DqHeatmapCellVM,
+    DqOverviewVM,
+    DqRecencyRowVM,
+    DqRecencyVM,
     IngestionRowVM,
     IngestionVM,
     OutboxRowVM,
@@ -62,6 +69,12 @@ from aslan_core.dashboard.view_models import (
     TimeseriesVM,
 )
 from aslan_core.streams.names import STREAMS
+
+# Sources iterated by the /dq/* heatmap and aggregates. Mirrors
+# `aslan_core.dq.probes.SOURCES` but the dashboard module imports
+# this list from queries.py so the static-SQL scanner does not also
+# need to whitelist `aslan_core.dq.probes`.
+_DQ_SOURCES: tuple[str, ...] = ("kap", "evds", "bist", "tefas", "mkk")
 
 # ── Overview ───────────────────────────────────────────────────────
 
@@ -482,10 +495,332 @@ async def review_overview(session: AsyncSession) -> ReviewVM:
     )
 
 
+# ── DQ M1: heatmap, recency, coverage ─────────────────────────────
+
+
+def _classify_recency(lag_seconds: int | None, sla: int | None) -> DqHeatmapCellState:
+    """Map (lag, sla) to the heatmap colour bucket.
+
+    None lag (no observation) → EMPTY. lag <= sla → OK. lag <= 2 sla
+    → WARN. lag > 2 sla → CRIT. None sla treated as missing config.
+    """
+    if lag_seconds is None or sla is None:
+        return DqHeatmapCellState.EMPTY
+    if lag_seconds <= sla:
+        return DqHeatmapCellState.OK
+    if lag_seconds <= 2 * sla:
+        return DqHeatmapCellState.WARN
+    return DqHeatmapCellState.CRIT
+
+
+def _classify_coverage(coverage_pct: float | None, target_pct: float) -> DqHeatmapCellState:
+    """Coverage cell verdict per spec §10.2.
+
+    None or no snapshot → EMPTY. >= target → OK. >= target - 5pp →
+    WARN. otherwise → CRIT.
+    """
+    if coverage_pct is None:
+        return DqHeatmapCellState.EMPTY
+    if coverage_pct >= target_pct:
+        return DqHeatmapCellState.OK
+    if coverage_pct >= target_pct - 5.0:
+        return DqHeatmapCellState.WARN
+    return DqHeatmapCellState.CRIT
+
+
+async def _latest_recency_per_source(
+    session: AsyncSession,
+) -> dict[str, tuple[int, int]]:
+    """Return {source: (lag_seconds, sla_target_seconds)} for the
+    most-recent recency_observation per source. Sources without an
+    observation are absent from the dict."""
+    rows = (
+        await session.execute(
+            text(
+                "SELECT DISTINCT ON (source) "
+                "  source, lag_seconds, sla_target_seconds "
+                "FROM audit.recency_observation "
+                "ORDER BY source, observed_at DESC"
+            )
+        )
+    ).all()
+    return {r.source: (int(r.lag_seconds), int(r.sla_target_seconds)) for r in rows}
+
+
+async def _latest_coverage_per_source(
+    session: AsyncSession,
+) -> dict[str, tuple[float | None, float]]:
+    """Return {source: (coverage_pct, target_pct)} for the most-recent
+    coverage_snapshot per source (any dimension; we pick the freshest)."""
+    rows = (
+        await session.execute(
+            text(
+                "SELECT DISTINCT ON (source) "
+                "  source, coverage_pct, target_pct "
+                "FROM audit.coverage_snapshot "
+                "ORDER BY source, observed_at DESC"
+            )
+        )
+    ).all()
+    return {
+        r.source: (
+            float(r.coverage_pct) if r.coverage_pct is not None else None,
+            float(r.target_pct),
+        )
+        for r in rows
+    }
+
+
+async def _validation_pass_rate_last_hour(
+    session: AsyncSession,
+) -> dict[str, float]:
+    """Rolling 1-hour validation pass rate per source.
+
+    pass_rate = 1 - (failures / total). For v1 we approximate "total"
+    as failures + 100 (the dashboard does not currently observe how
+    many records were validated, only how many failed). The denominator
+    is conservative; the heatmap cell value should be read as a
+    relative trend rather than absolute correctness.
+
+    # TODO(M1.1): wire to a counter of validated records per source so
+    the denominator is real.
+    """
+    rows = (
+        await session.execute(
+            text(
+                "SELECT source, count(*)::int AS failures FROM audit.validation_failure "
+                "WHERE detected_at >= now() - INTERVAL '1 hour' "
+                "GROUP BY source"
+            )
+        )
+    ).all()
+    return {r.source: 1.0 - (int(r.failures) / (int(r.failures) + 100.0)) for r in rows}
+
+
+async def dq_overview(session: AsyncSession) -> DqOverviewVM:
+    """5x4 heatmap of (source, dimension) -> cell.
+
+    Dimensions: recency, coverage, validation, spot_check (M2-deferred).
+    Each cell is built from the most-recent observation of that
+    (source, dimension)."""
+    recency = await _latest_recency_per_source(session)
+    coverage_data = await _latest_coverage_per_source(session)
+    validation = await _validation_pass_rate_last_hour(session)
+    cells: list[DqHeatmapCellVM] = []
+    for source in _DQ_SOURCES:
+        # Recency cell
+        rec = recency.get(source)
+        if rec is None:
+            cells.append(
+                DqHeatmapCellVM(
+                    source=source,
+                    dimension="recency",
+                    state=DqHeatmapCellState.EMPTY,
+                    text="—",
+                )
+            )
+        else:
+            lag, sla = rec
+            cells.append(
+                DqHeatmapCellVM(
+                    source=source,
+                    dimension="recency",
+                    state=_classify_recency(lag, sla),
+                    text=f"{lag}s / {sla}s",
+                )
+            )
+        # Coverage cell
+        cov = coverage_data.get(source)
+        if cov is None:
+            cells.append(
+                DqHeatmapCellVM(
+                    source=source,
+                    dimension="coverage",
+                    state=DqHeatmapCellState.EMPTY,
+                    text="—",
+                )
+            )
+        else:
+            pct, target = cov
+            cells.append(
+                DqHeatmapCellVM(
+                    source=source,
+                    dimension="coverage",
+                    state=_classify_coverage(pct, target),
+                    text=f"{pct:.1f}%" if pct is not None else "—",
+                )
+            )
+        # Validation cell — pass rate
+        val = validation.get(source)
+        if val is None:
+            cells.append(
+                DqHeatmapCellVM(
+                    source=source,
+                    dimension="validation",
+                    state=DqHeatmapCellState.OK,
+                    text="100.0%",
+                )
+            )
+        else:
+            cells.append(
+                DqHeatmapCellVM(
+                    source=source,
+                    dimension="validation",
+                    state=(
+                        DqHeatmapCellState.OK
+                        if val >= 0.99
+                        else DqHeatmapCellState.WARN
+                        if val >= 0.95
+                        else DqHeatmapCellState.CRIT
+                    ),
+                    text=f"{val * 100:.1f}%",
+                )
+            )
+        # Spot-check — M2-deferred
+        cells.append(
+            DqHeatmapCellVM(
+                source=source,
+                dimension="spot_check",
+                state=DqHeatmapCellState.EMPTY,
+                text="—",
+            )
+        )
+    return DqOverviewVM(cells=cells)
+
+
+_RECENCY_BUCKETS: tuple[tuple[str, str], ...] = (
+    ("1h", "1 hour"),
+    ("24h", "24 hours"),
+    ("7d", "7 days"),
+    ("30d", "30 days"),
+)
+
+
+async def dq_recency(session: AsyncSession) -> DqRecencyVM:
+    """Per-source lag aggregates over four trailing windows.
+
+    Returns one row per (source, bucket) — empty rows omitted. The
+    aggregates are computed by Postgres via percentile_cont so the
+    page handler does no math.
+    """
+    rows: list[DqRecencyRowVM] = []
+    # We issue four parameterised queries (one per bucket) rather than
+    # a UNION ALL to keep the SQL literal in queries.py simple. Each
+    # query is on the recency_observation hypertable index
+    # (source, observed_at DESC) so all four are sub-millisecond.
+    for bucket_label, _interval in _RECENCY_BUCKETS:
+        sql = _RECENCY_BUCKET_SQL[bucket_label]
+        result_rows = (await session.execute(sql)).all()
+        for r in result_rows:
+            rows.append(
+                DqRecencyRowVM(
+                    source=r.source,
+                    bucket=bucket_label,
+                    avg_lag_seconds=(
+                        float(r.avg_lag_seconds) if r.avg_lag_seconds is not None else None
+                    ),
+                    p95_lag_seconds=(
+                        float(r.p95_lag_seconds) if r.p95_lag_seconds is not None else None
+                    ),
+                    max_lag_seconds=(
+                        int(r.max_lag_seconds) if r.max_lag_seconds is not None else None
+                    ),
+                    breach_count=int(r.breach_count),
+                )
+            )
+    return DqRecencyVM(rows=rows)
+
+
+# Each bucket gets its own static literal — the static-SQL scanner
+# requires text() arguments be `Constant(str)`, which rules out string
+# interpolation. This is wordy but lints cleanly.
+_RECENCY_BUCKET_SQL: dict[str, Any] = {
+    "1h": text(
+        "SELECT source, "
+        "  avg(lag_seconds)::float AS avg_lag_seconds, "
+        "  percentile_cont(0.95) WITHIN GROUP (ORDER BY lag_seconds)::float AS p95_lag_seconds, "
+        "  max(lag_seconds)::int AS max_lag_seconds, "
+        "  count(*) FILTER (WHERE sla_breached)::int AS breach_count "
+        "FROM audit.recency_observation "
+        "WHERE observed_at >= now() - INTERVAL '1 hour' "
+        "GROUP BY source "
+        "ORDER BY source"
+    ),
+    "24h": text(
+        "SELECT source, "
+        "  avg(lag_seconds)::float AS avg_lag_seconds, "
+        "  percentile_cont(0.95) WITHIN GROUP (ORDER BY lag_seconds)::float AS p95_lag_seconds, "
+        "  max(lag_seconds)::int AS max_lag_seconds, "
+        "  count(*) FILTER (WHERE sla_breached)::int AS breach_count "
+        "FROM audit.recency_observation "
+        "WHERE observed_at >= now() - INTERVAL '24 hours' "
+        "GROUP BY source "
+        "ORDER BY source"
+    ),
+    "7d": text(
+        "SELECT source, "
+        "  avg(lag_seconds)::float AS avg_lag_seconds, "
+        "  percentile_cont(0.95) WITHIN GROUP (ORDER BY lag_seconds)::float AS p95_lag_seconds, "
+        "  max(lag_seconds)::int AS max_lag_seconds, "
+        "  count(*) FILTER (WHERE sla_breached)::int AS breach_count "
+        "FROM audit.recency_observation "
+        "WHERE observed_at >= now() - INTERVAL '7 days' "
+        "GROUP BY source "
+        "ORDER BY source"
+    ),
+    "30d": text(
+        "SELECT source, "
+        "  avg(lag_seconds)::float AS avg_lag_seconds, "
+        "  percentile_cont(0.95) WITHIN GROUP (ORDER BY lag_seconds)::float AS p95_lag_seconds, "
+        "  max(lag_seconds)::int AS max_lag_seconds, "
+        "  count(*) FILTER (WHERE sla_breached)::int AS breach_count "
+        "FROM audit.recency_observation "
+        "WHERE observed_at >= now() - INTERVAL '30 days' "
+        "GROUP BY source "
+        "ORDER BY source"
+    ),
+}
+
+
+async def dq_coverage(session: AsyncSession) -> DqCoverageVM:
+    """Latest coverage_snapshot per (source, dimension)."""
+    result = (
+        await session.execute(
+            text(
+                "SELECT DISTINCT ON (source, dimension) "
+                "  source, dimension, expected_count, actual_count, "
+                "  coverage_pct, target_pct, observed_at "
+                "FROM audit.coverage_snapshot "
+                "ORDER BY source, dimension, observed_at DESC"
+            )
+        )
+    ).all()
+    rows: list[DqCoverageRowVM] = []
+    for r in result:
+        pct = float(r.coverage_pct) if r.coverage_pct is not None else None
+        target = float(r.target_pct)
+        rows.append(
+            DqCoverageRowVM(
+                source=r.source,
+                dimension=r.dimension,
+                expected_count=int(r.expected_count) if r.expected_count is not None else None,
+                actual_count=int(r.actual_count) if r.actual_count is not None else None,
+                coverage_pct=pct,
+                target_pct=target,
+                observed_at=r.observed_at,
+                state=_classify_coverage(pct, target),
+            )
+        )
+    return DqCoverageVM(rows=rows)
+
+
 __all__ = [
     "audit_recent",
     "deadletter_recent",
     "documents_recent",
+    "dq_coverage",
+    "dq_overview",
+    "dq_recency",
     "ingestion_recent",
     "outbox_recent",
     "overview",

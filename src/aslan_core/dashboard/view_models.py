@@ -269,6 +269,85 @@ class ReviewVM(_VMBase):
     couldn't process (oversized, parse-failed, low-confidence)."""
 
 
+# ── DQ M1: heatmap, recency, coverage ──────────────────────────────
+
+
+class DqHeatmapCellState(StrEnum):
+    """Heatmap cell verdict per spec §10.2.
+
+    OK — observation/snapshot within target.
+    WARN — within 5 percentage points of target, or recency lag <= 2x SLA.
+    CRIT — coverage below (target - 5pp), or recency lag > 2x SLA.
+    EMPTY — no recent observation / snapshot for this cell.
+    """
+
+    OK = "ok"
+    WARN = "warn"
+    CRIT = "crit"
+    EMPTY = "empty"
+
+
+class DqHeatmapCellVM(_VMBase):
+    """One cell of the /dq/overview 5x4 heatmap.
+
+    `dimension` is one of "recency", "coverage", "validation",
+    "spot_check". `state` is the colour bucket; `text` is a short
+    glyph (lag in seconds for recency, percentage for coverage, etc.).
+    """
+
+    source: Literal["kap", "evds", "bist", "tefas", "mkk"]
+    dimension: Literal["recency", "coverage", "validation", "spot_check"]
+    state: DqHeatmapCellState
+    text: str
+
+
+class DqOverviewVM(_VMBase):
+    """5x4 heatmap (sources x dimensions) for /dq/overview."""
+
+    cells: list[DqHeatmapCellVM]
+
+
+class DqRecencyRowVM(_VMBase):
+    """One bucket of recency aggregate per source.
+
+    `bucket` is "1h", "24h", "7d", or "30d" — the trailing window
+    aggregated from `audit.recency_observation`. Aggregates are
+    computed server-side via percentile_cont and avg.
+    """
+
+    source: Literal["kap", "evds", "bist", "tefas", "mkk"]
+    bucket: Literal["1h", "24h", "7d", "30d"]
+    avg_lag_seconds: float | None
+    p95_lag_seconds: float | None
+    max_lag_seconds: int | None
+    breach_count: int
+
+
+class DqRecencyVM(_VMBase):
+    """Per-source lag time-series view for /dq/recency."""
+
+    rows: list[DqRecencyRowVM]
+
+
+class DqCoverageRowVM(_VMBase):
+    """Latest coverage snapshot for one (source, dimension)."""
+
+    source: str
+    dimension: str
+    expected_count: int | None
+    actual_count: int | None
+    coverage_pct: float | None
+    target_pct: float
+    observed_at: datetime
+    state: DqHeatmapCellState
+
+
+class DqCoverageVM(_VMBase):
+    """Tabular coverage view for /dq/coverage."""
+
+    rows: list[DqCoverageRowVM]
+
+
 # ── DQ M0 stubs ────────────────────────────────────────────────────
 
 
