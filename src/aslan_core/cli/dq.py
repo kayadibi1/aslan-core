@@ -178,7 +178,13 @@ class _CoverageProbe(Protocol):
 async def _coverage_bist_entity(
     session: AsyncSession, now: datetime
 ) -> tuple[int | None, int | None, dict[str, Any] | None]:
-    """BIST roster coverage: ref.entity WHERE bist_listed = true.
+    """BIST roster coverage: distinct entities holding a `bist_ticker`
+    identifier in `ref.identifier`.
+
+    Per the workspace convention (see `aslan_core.query.entity`), an
+    entity is considered BIST-listed when it has a current
+    `ref.identifier(namespace='bist_ticker')` row. The valid_to clause
+    keeps the count bitemporally point-in-time correct.
 
     Expected count is hard-coded at 502 — the BIST main board hovers
     around 500 issuers. # TODO(M1.1): replace with the BIST puller's
@@ -186,11 +192,16 @@ async def _coverage_bist_entity(
     source='bist').
     """
     _ = now
-    if not await _table_present(session, "ref", "entity"):
-        return None, None, {"reason": "ref.entity not present"}
+    if not await _table_present(session, "ref", "identifier"):
+        return None, None, {"reason": "ref.identifier not present"}
     actual_row = (
         await session.execute(
-            text("SELECT count(*)::int AS n FROM ref.entity WHERE bist_listed = true")
+            text(
+                "SELECT count(DISTINCT entity_id)::int AS n "
+                "FROM ref.identifier "
+                "WHERE namespace = 'bist_ticker' "
+                "  AND valid_from <= current_date AND valid_to > current_date"
+            )
         )
     ).one()
     actual = int(actual_row.n)
@@ -234,13 +245,17 @@ async def _coverage_kap_historical_depth(
     _ = now
     if not await _table_present(session, "ts", "canonical_financial"):
         return None, None, {"reason": "ts.canonical_financial not present"}
+    if not await _table_present(session, "ref", "identifier"):
+        return None, None, {"reason": "ref.identifier not present"}
     row = (
         await session.execute(
             text(
                 "SELECT "
                 "  (SELECT count(DISTINCT entity_id)::int FROM ts.canonical_financial "
                 "     WHERE period_end >= current_date - INTERVAL '5 years') AS depth_ok, "
-                "  (SELECT count(*)::int FROM ref.entity WHERE bist_listed = true) "
+                "  (SELECT count(DISTINCT entity_id)::int FROM ref.identifier "
+                "     WHERE namespace = 'bist_ticker' "
+                "       AND valid_from <= current_date AND valid_to > current_date) "
                 "    AS expected"
             )
         )
