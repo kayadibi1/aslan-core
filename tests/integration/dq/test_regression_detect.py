@@ -159,35 +159,60 @@ async def _kap_disclosures_for_v2(
     _v1_seeded: UUID,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> AsyncIterator[UUID]:
-    """Synthetic kap.disclosures with one material_event filing on
-    the seeded entity within the v2 correlation window."""
+    """Synthetic doc.filing with one material_event filing on
+    the seeded entity within the v2 correlation window.
+
+    The production query reads from `doc.filing` (the canonical
+    cross-source mirror — see crawl commit 824ad5c) rather than
+    `kap.disclosures` directly, since `doc.filing.kind` is the
+    already-projected conceptual category.
+    """
     eid = _v1_seeded
+    fid = uuid4()
+    pub = datetime.now(UTC) - timedelta(days=2)
     async with session_factory() as s:
-        await s.execute(text("CREATE SCHEMA IF NOT EXISTS kap"))
+        # src.source has FK from src.ingestion_run; seed it if not present
+        await s.execute(text(
+            "INSERT INTO src.source(source_id, name, kind, license_status) "
+            "VALUES ('kap', 'KAP', 'public', 'public_data') ON CONFLICT DO NOTHING"
+        ))
+        # ingestion_run row required by doc.filing FK
+        run_row = (await s.execute(text(
+            "INSERT INTO src.ingestion_run(job_name, source_id, started_at) "
+            "VALUES ('regression_v2_test_fixture', 'kap', now()) "
+            "RETURNING ingestion_run_id"
+        ))).first()
+        run_id = run_row.ingestion_run_id
         await s.execute(
             text(
-                "CREATE TABLE IF NOT EXISTS kap.disclosures ("
-                "  disclosure_id BIGSERIAL PRIMARY KEY, "
-                "  entity_id UUID, "
-                "  category TEXT NOT NULL, "
-                "  published_at TIMESTAMPTZ NOT NULL"
+                "INSERT INTO doc.filing("
+                "  filing_id, source_id, source_filing_ref, kind, title, language, "
+                "  published_at, primary_object_key, primary_mime, primary_sha256, "
+                "  primary_bytes, entity_id, ingestion_run_id, revision_no, "
+                "  actor_id, actor_kind"
+                ") VALUES ("
+                "  :fid, 'kap', :ref, 'material_event', 'v2 test fixture', 'tr', "
+                "  :pub, 'k', 'text/html', :sha, 1, :eid, :run, 1, "
+                "  'system:test', 'system'"
                 ")"
-            )
-        )
-        await s.execute(text("DELETE FROM kap.disclosures"))
-        # Filing 2 days before now (within the [-7d, +1d] window)
-        await s.execute(
-            text(
-                "INSERT INTO kap.disclosures(entity_id, category, published_at) "
-                "VALUES (:eid, 'material_event', now() - INTERVAL '2 days')"
             ),
-            {"eid": eid},
+            {
+                "fid": fid,
+                "ref": f"V2-FIXTURE-{fid.hex[:8]}",
+                "pub": pub,
+                "sha": "f" * 64,
+                "eid": eid,
+                "run": run_id,
+            },
         )
         await s.commit()
     yield eid
     async with session_factory() as s:
-        await s.execute(text("DROP TABLE IF EXISTS kap.disclosures"))
-        await s.execute(text("DROP SCHEMA IF EXISTS kap CASCADE"))
+        await s.execute(text("DELETE FROM doc.filing WHERE filing_id = :fid"), {"fid": fid})
+        await s.execute(
+            text("DELETE FROM src.ingestion_run WHERE ingestion_run_id = :run"),
+            {"run": run_id},
+        )
         await s.commit()
 
 
@@ -226,12 +251,15 @@ async def test_v2_keeps_flag_open_when_no_kap_filing(
     _v1_seeded: UUID,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Without a recent KAP filing for the entity, v2 leaves the flag
-    open. Run with no kap.disclosures present (the fixture is the
-    v1-only seed)."""
+    """Without a recent justifying filing on doc.filing for the entity,
+    v2 leaves the flag open."""
     async with session_factory() as s:
-        # No kap schema present
-        await s.execute(text("DROP SCHEMA IF EXISTS kap CASCADE"))
+        # Purge any test-fixture filings and any existing flags so the
+        # detector starts clean. doc.filing is shared with other tests,
+        # so only delete v2-fixture-tagged rows.
+        await s.execute(text(
+            "DELETE FROM doc.filing WHERE source_filing_ref LIKE 'V2-FIXTURE-%'"
+        ))
         await s.execute(text("DELETE FROM audit.regression_flag"))
         summary = await regression_detect.detect_and_correlate(session=s)
         await s.commit()
@@ -244,29 +272,46 @@ async def test_correlate_v2_window_boundary(
     _v1_seeded: UUID,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """A KAP filing 8 days before detected_at falls outside the [-7d,+1d]
+    """A doc.filing 8 days before detected_at falls outside the [-7d,+1d]
     window and does NOT auto-dismiss the flag."""
     eid = _v1_seeded
+    fid = uuid4()
     async with session_factory() as s:
-        await s.execute(text("CREATE SCHEMA IF NOT EXISTS kap"))
+        # Purge any prior fixture rows so this test is independent.
+        await s.execute(text(
+            "DELETE FROM doc.filing WHERE source_filing_ref LIKE 'V2-FIXTURE-%'"
+        ))
+        await s.execute(text(
+            "INSERT INTO src.source(source_id, name, kind, license_status) "
+            "VALUES ('kap', 'KAP', 'public', 'public_data') ON CONFLICT DO NOTHING"
+        ))
+        run_row = (await s.execute(text(
+            "INSERT INTO src.ingestion_run(job_name, source_id, started_at) "
+            "VALUES ('regression_v2_window_test', 'kap', now()) "
+            "RETURNING ingestion_run_id"
+        ))).first()
+        run_id = run_row.ingestion_run_id
+        # Filing 8 days back → outside the [-7d, +1d] correlation window
         await s.execute(
             text(
-                "CREATE TABLE IF NOT EXISTS kap.disclosures ("
-                "  disclosure_id BIGSERIAL PRIMARY KEY, "
-                "  entity_id UUID, "
-                "  category TEXT NOT NULL, "
-                "  published_at TIMESTAMPTZ NOT NULL"
+                "INSERT INTO doc.filing("
+                "  filing_id, source_id, source_filing_ref, kind, title, language, "
+                "  published_at, primary_object_key, primary_mime, primary_sha256, "
+                "  primary_bytes, entity_id, ingestion_run_id, revision_no, "
+                "  actor_id, actor_kind"
+                ") VALUES ("
+                "  :fid, 'kap', :ref, 'material_event', 'window-edge test', 'tr', "
+                "  now() - INTERVAL '8 days', 'k', 'text/html', :sha, 1, "
+                "  :eid, :run, 1, 'system:test', 'system'"
                 ")"
-            )
-        )
-        await s.execute(text("DELETE FROM kap.disclosures"))
-        # Filing 8 days before now → outside window
-        await s.execute(
-            text(
-                "INSERT INTO kap.disclosures(entity_id, category, published_at) "
-                "VALUES (:eid, 'material_event', now() - INTERVAL '8 days')"
             ),
-            {"eid": eid},
+            {
+                "fid": fid,
+                "ref": f"V2-FIXTURE-WINDOW-{fid.hex[:8]}",
+                "sha": "f" * 64,
+                "eid": eid,
+                "run": run_id,
+            },
         )
         await s.execute(text("DELETE FROM audit.regression_flag"))
         await s.commit()
@@ -275,14 +320,16 @@ async def test_correlate_v2_window_boundary(
             now = datetime.now(UTC)
             v1 = await regression_detect.detect_v1(session=s, now=now)
             assert len(v1) >= 1
-            # Tighten v2 to the same now; the filing is 8d back.
             v2 = await regression_detect.correlate_v2(session=s, flags=v1)
             await s.commit()
         assert all(not r.dismissed for r in v2)
     finally:
         async with session_factory() as s:
-            await s.execute(text("DROP TABLE IF EXISTS kap.disclosures"))
-            await s.execute(text("DROP SCHEMA IF EXISTS kap CASCADE"))
+            await s.execute(text("DELETE FROM doc.filing WHERE filing_id = :fid"), {"fid": fid})
+            await s.execute(
+                text("DELETE FROM src.ingestion_run WHERE ingestion_run_id = :run"),
+                {"run": run_id},
+            )
             await s.commit()
 
 

@@ -298,11 +298,18 @@ _V2_MATERIAL_CATEGORIES: tuple[str, ...] = (
 )
 
 
+# Use doc.filing (the canonical cross-source mirror — see crawl commit
+# 824ad5c) instead of kap.disclosures directly. doc.filing.kind is the
+# already-projected conceptual category ("material_event" /
+# "continuous_disclosure" / "financial_report" / etc.) so we don't need
+# KAP's source-specific category_code → kind mapping. Doc.filing is also
+# source-agnostic which means v2 correlation will pick up justifying
+# filings from non-KAP sources once those write to doc.filing too.
 _SELECT_KAP_JUSTIFYING_FILING = text(
-    "SELECT disclosure_id, category, published_at "
-    "FROM kap.disclosures "
-    "WHERE entity_id = :entity_id "
-    "  AND category = ANY(:categories) "
+    "SELECT source_filing_ref AS disclosure_id, kind AS category, published_at "
+    "FROM doc.filing "
+    "WHERE entity_id = CAST(:entity_id AS uuid) "
+    "  AND kind = ANY(:categories) "
     "  AND published_at >= :window_start "
     "  AND published_at <= :window_end "
     "ORDER BY published_at DESC "
@@ -322,11 +329,12 @@ async def correlate_v2(
     session: AsyncSession,
     flags: list[RegressionFlag] | list[V1Result],
 ) -> list[V2Result]:
-    """Auto-dismiss v1 flags justified by a recent KAP filing.
+    """Auto-dismiss v1 flags justified by a recent material filing.
 
-    For each flag, query ``kap.disclosures`` for the flag's entity_id
-    in the window ``[detected_at - 7d, detected_at + 1d]`` for any
-    filing in ``_V2_MATERIAL_CATEGORIES``. On a match, call
+    For each flag, query ``doc.filing`` (the canonical cross-source
+    mirror — see crawl commit 824ad5c) for the flag's entity_id in the
+    window ``[detected_at - 7d, detected_at + 1d]`` for any filing whose
+    ``kind`` is in ``_V2_MATERIAL_CATEGORIES``. On a match, call
     ``regression.set_status(status='dismissed', ...)`` and emit a
     ``regression_auto_dismissed`` event.
 
@@ -336,13 +344,13 @@ async def correlate_v2(
     ``detected_at`` + ``record_pk.entity_id`` we need.
     """
     results: list[V2Result] = []
-    if not await _table_present(session, "kap", "disclosures"):
+    if not await _table_present(session, "doc", "filing"):
         await dq_event.emit(
             session=session,
             event_type="regression_v2_skipped",
             emitter="dq.regression_detect.correlate_v2",
             severity=Severity.INFO,
-            payload={"reason": "kap.disclosures not present"},
+            payload={"reason": "doc.filing not present"},
         )
         return results
     for f in flags:
