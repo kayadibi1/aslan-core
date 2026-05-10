@@ -161,7 +161,7 @@ def test_corroborator_result_is_frozen() -> None:
 
 
 def test_firecrawl_via_cli_unavailable_returns_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(corroborator.shutil, "which", lambda _name: None)
+    monkeypatch.setattr("aslan_core.dq.corroborator.shutil.which", lambda _name: None)
     outcome = _firecrawl_via_cli("https://example/x")
     assert outcome.status == "error"
     assert outcome.error_summary == "firecrawl unavailable"
@@ -190,7 +190,7 @@ def test_firecrawl_fetch_falls_back_when_unavailable(
     """End-to-end: when both SDK and CLI are unreachable, the public
     ``_firecrawl_fetch`` returns the graceful-degradation shape."""
     monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
-    monkeypatch.setattr(corroborator.shutil, "which", lambda _name: None)
+    monkeypatch.setattr("aslan_core.dq.corroborator.shutil.which", lambda _name: None)
     outcome = corroborator._firecrawl_fetch("https://example/x")
     assert outcome.status == "error"
     assert outcome.markdown is None

@@ -229,9 +229,7 @@ async def test_bist_upstream_calendar_mode_with_holiday() -> None:
     from datetime import date
 
     holiday_eve = date(2026, 4, 22)  # Day before 2026-04-23 holiday
-    session = _fake_session_with_results(
-        [_row(present=True), _row(trade_date=holiday_eve)]
-    )
+    session = _fake_session_with_results([_row(present=True), _row(trade_date=holiday_eve)])
     probe = BistProbe()
     ts, detail = await probe.upstream_latest(session, "trade_close_to_ohlcv")
     assert ts is not None
@@ -257,9 +255,7 @@ async def test_bist_upstream_fallback_when_calendar_absent() -> None:
 @pytest.mark.asyncio
 async def test_bist_upstream_fallback_when_calendar_empty() -> None:
     """Calendar table present but empty -> Mon-Fri fallback."""
-    session = _fake_session_with_results(
-        [_row(present=True), _row(trade_date=None)]
-    )
+    session = _fake_session_with_results([_row(present=True), _row(trade_date=None)])
     probe = BistProbe()
     ts, detail = await probe.upstream_latest(session, "trade_close_to_ohlcv")
     assert ts is not None

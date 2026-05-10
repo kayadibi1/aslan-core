@@ -69,15 +69,10 @@ async def test_calendar_tr_seed_holiday_count(engine: AsyncEngine) -> None:
     async with engine.connect() as conn:
         n = (
             await conn.execute(
-                text(
-                    "SELECT count(*)::int FROM ref.calendar_tr "
-                    "WHERE is_trading_day = false"
-                )
+                text("SELECT count(*)::int FROM ref.calendar_tr WHERE is_trading_day = false")
             )
         ).scalar_one()
-    assert n == _EXPECTED_HOLIDAY_COUNT, (
-        f"expected {_EXPECTED_HOLIDAY_COUNT} holiday rows, got {n}"
-    )
+    assert n == _EXPECTED_HOLIDAY_COUNT, f"expected {_EXPECTED_HOLIDAY_COUNT} holiday rows, got {n}"
 
 
 async def test_calendar_tr_on_conflict_do_nothing_does_not_corrupt(
@@ -89,10 +84,7 @@ async def test_calendar_tr_on_conflict_do_nothing_does_not_corrupt(
     async with engine.begin() as conn:
         before = (
             await conn.execute(
-                text(
-                    "SELECT holiday_name FROM ref.calendar_tr "
-                    "WHERE trade_date = :d"
-                ),
+                text("SELECT holiday_name FROM ref.calendar_tr WHERE trade_date = :d"),
                 {"d": target},
             )
         ).scalar_one()
@@ -109,10 +101,7 @@ async def test_calendar_tr_on_conflict_do_nothing_does_not_corrupt(
         )
         after = (
             await conn.execute(
-                text(
-                    "SELECT holiday_name FROM ref.calendar_tr "
-                    "WHERE trade_date = :d"
-                ),
+                text("SELECT holiday_name FROM ref.calendar_tr WHERE trade_date = :d"),
                 {"d": target},
             )
         ).scalar_one()

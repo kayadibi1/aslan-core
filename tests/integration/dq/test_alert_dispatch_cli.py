@@ -322,7 +322,12 @@ async def test_test_alert_counts_suppressed_and_failed(
     failed; success → delivered. The CLI summary tracks each."""
 
     class _RaisingSink:
-        async def deliver(self, **_: Any) -> bool:
+        async def deliver(
+            self,
+            payload: dict[str, object],
+            severity: str,
+            rule_name: str,
+        ) -> bool:
             raise RuntimeError("kaboom")
 
     glitchtip = _RecordingSink()

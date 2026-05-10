@@ -172,16 +172,22 @@ async def _kap_disclosures_for_v2(
     pub = datetime.now(UTC) - timedelta(days=2)
     async with session_factory() as s:
         # src.source has FK from src.ingestion_run; seed it if not present
-        await s.execute(text(
-            "INSERT INTO src.source(source_id, name, kind, license_status) "
-            "VALUES ('kap', 'KAP', 'public', 'public_data') ON CONFLICT DO NOTHING"
-        ))
+        await s.execute(
+            text(
+                "INSERT INTO src.source(source_id, name, kind, license_status) "
+                "VALUES ('kap', 'KAP', 'public', 'public_data') ON CONFLICT DO NOTHING"
+            )
+        )
         # ingestion_run row required by doc.filing FK
-        run_row = (await s.execute(text(
-            "INSERT INTO src.ingestion_run(job_name, source_id, started_at) "
-            "VALUES ('regression_v2_test_fixture', 'kap', now()) "
-            "RETURNING ingestion_run_id"
-        ))).first()
+        run_row = (
+            await s.execute(
+                text(
+                    "INSERT INTO src.ingestion_run(job_name, source_id, started_at) "
+                    "VALUES ('regression_v2_test_fixture', 'kap', now()) "
+                    "RETURNING ingestion_run_id"
+                )
+            )
+        ).one()
         run_id = run_row.ingestion_run_id
         await s.execute(
             text(
@@ -257,9 +263,7 @@ async def test_v2_keeps_flag_open_when_no_kap_filing(
         # Purge any test-fixture filings and any existing flags so the
         # detector starts clean. doc.filing is shared with other tests,
         # so only delete v2-fixture-tagged rows.
-        await s.execute(text(
-            "DELETE FROM doc.filing WHERE source_filing_ref LIKE 'V2-FIXTURE-%'"
-        ))
+        await s.execute(text("DELETE FROM doc.filing WHERE source_filing_ref LIKE 'V2-FIXTURE-%'"))
         await s.execute(text("DELETE FROM audit.regression_flag"))
         summary = await regression_detect.detect_and_correlate(session=s)
         await s.commit()
@@ -278,18 +282,22 @@ async def test_correlate_v2_window_boundary(
     fid = uuid4()
     async with session_factory() as s:
         # Purge any prior fixture rows so this test is independent.
-        await s.execute(text(
-            "DELETE FROM doc.filing WHERE source_filing_ref LIKE 'V2-FIXTURE-%'"
-        ))
-        await s.execute(text(
-            "INSERT INTO src.source(source_id, name, kind, license_status) "
-            "VALUES ('kap', 'KAP', 'public', 'public_data') ON CONFLICT DO NOTHING"
-        ))
-        run_row = (await s.execute(text(
-            "INSERT INTO src.ingestion_run(job_name, source_id, started_at) "
-            "VALUES ('regression_v2_window_test', 'kap', now()) "
-            "RETURNING ingestion_run_id"
-        ))).first()
+        await s.execute(text("DELETE FROM doc.filing WHERE source_filing_ref LIKE 'V2-FIXTURE-%'"))
+        await s.execute(
+            text(
+                "INSERT INTO src.source(source_id, name, kind, license_status) "
+                "VALUES ('kap', 'KAP', 'public', 'public_data') ON CONFLICT DO NOTHING"
+            )
+        )
+        run_row = (
+            await s.execute(
+                text(
+                    "INSERT INTO src.ingestion_run(job_name, source_id, started_at) "
+                    "VALUES ('regression_v2_window_test', 'kap', now()) "
+                    "RETURNING ingestion_run_id"
+                )
+            )
+        ).one()
         run_id = run_row.ingestion_run_id
         # Filing 8 days back → outside the [-7d, +1d] correlation window
         await s.execute(

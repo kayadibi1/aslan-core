@@ -244,9 +244,7 @@ async def test_kap_filing_count_recon_http_mode_compares_with_upstream(
                 {"publishDate": (base - _td(days=d)).strftime("%Y-%m-%d %H:%M:%S")}
             )
     for _ in range(50):  # disagree with DB's 100
-        upstream_rows.append(
-            {"publishDate": (base - _td(days=6)).strftime("%Y-%m-%d %H:%M:%S")}
-        )
+        upstream_rows.append({"publishDate": (base - _td(days=6)).strftime("%Y-%m-%d %H:%M:%S")})
 
     async def _fake_get(self: _Any, url: str, **kw: _Any) -> _Any:
         _ = self, kw
@@ -256,9 +254,7 @@ async def test_kap_filing_count_recon_http_mode_compares_with_upstream(
     monkeypatch.setattr(httpx.AsyncClient, "get", _fake_get)
 
     async with session_factory() as s:
-        results = await cross_source.xs_kap_filing_count_recon(
-            session=s, settings=settings
-        )
+        results = await cross_source.xs_kap_filing_count_recon(session=s, settings=settings)
         await s.commit()
 
     # Only the 100-vs-50 day should fire — the others match exactly.
@@ -306,9 +302,7 @@ async def test_kap_filing_count_recon_http_error_falls_back_to_self_compare(
     monkeypatch.setattr(httpx.AsyncClient, "get", _fake_get)
 
     async with session_factory() as s:
-        results = await cross_source.xs_kap_filing_count_recon(
-            session=s, settings=settings
-        )
+        results = await cross_source.xs_kap_filing_count_recon(session=s, settings=settings)
         await s.commit()
 
     # Self-compare fallback should have fired the 100-day anomaly.
