@@ -886,3 +886,69 @@ Refresh buttons (the GET path stays available).
     `subprocess.run`, no urlopen / get / post / request over HTTP
     string literal, and `refresh()` calls `_firecrawl_fetch` only)
 
+
+### Batch 3 follow-ups (DONE)
+
+* **M4.1 Aslan samplers — graceful skip when upstream absent**
+  (`src/aslan_core/dq/bloomberg.py`). The three placeholder samplers
+  (`material_event_field_count`, `latest_dividend_amount`,
+  `latest_capital_action`) now query the expected upstream extractor
+  table when present:
+  * `material_event_field_count` → `agg.filing_event` (avg
+    `jsonb_array_length(payload->'fields')` over last 90 days);
+  * `latest_dividend_amount` → `agg.dividend_event` (latest
+    `amount_per_share` per entity);
+  * `latest_capital_action` → `agg.capital_action_event` (latest
+    `action_type ratio` descriptor per entity).
+  When the upstream table is missing the sampler still returns a
+  placeholder `_AslanSample` and the existing
+  `bloomberg_sampler_placeholder` event still fires — but with a
+  richer payload `{reason: 'upstream_table_missing' |
+  'upstream_columns_missing', expected_table, expected_cols}` so the
+  dashboard can show "Aslan sampler waiting on extractor M3" rather
+  than "v1 placeholder". When the upstream table is present but the
+  per-entity row is absent (e.g. AKBNK has no dividend on file) the
+  sampler returns a real `value=None` (no event fires), so a
+  legitimate "no data for this entity" outcome is distinguishable
+  from a "missing extractor" outcome.
+
+* **NG6 Investing.com slug map** — migration 0067 ships
+  `audit.investing_com_slug` (PK `ticker`, GENERATED `full_url`
+  column) seeded with 50 BIST tickers + best-effort Investing.com
+  slugs sampled 2026-05-09. The corroborator's `investing_com`
+  adapter consults the table at fetch time via
+  `_resolve_investing_slug_url`; on a slug-table miss it emits a
+  `corroborator_slug_missing` audit event and falls through to the
+  legacy `<ticker>-istanbul-stock-exchange` URL builder so the panel
+  never crashes on a missing row. Slug refinements ship as new
+  migrations (no runtime UPDATE GRANT) so the curation history stays
+  auditable.
+
+* **NG6 corroborator wishlist — 3 of 3 sources implemented**
+  (`src/aslan_core/dq/corroborator.py`). Three new TR-equity
+  reference adapters were registered with `implemented=True`:
+  * `foreks` → `https://www.foreks.com/borsa/hisse-detay/<TICKER>`
+  * `matriks` → `https://www.matriks.com.tr/teknik-analiz/<TICKER>`
+  * `finnet` →
+    `https://www.finnet.gen.tr/CompanyResearch/Equity/<TICKER>`
+  All three share an extractor (`_extract_tr_equity_reference`) that
+  pulls latest_price / market_cap / revenue using both Turkish ("Son
+  Fiyat", "Piyasa Değeri", "Hasılat") and English fall-back labels,
+  per the workspace CLAUDE.md "Turkish-language fidelity" rule
+  (Turkish primary; English fall-back). The dashboard panel
+  (`/dq/spot-check/<sample_id>`) auto-renders all 5 implemented
+  sources (kap_ir, investing_com, foreks, matriks, finnet) plus the
+  2 unimplemented placeholders (tradingview, earningshub). The AST
+  canary (`tests/unit/dq/test_corroborator_no_external_io.py`) still
+  passes — every external call routes through `_firecrawl_fetch`.
+
+* **Production verification deferred** — the slug-map seed and the 3
+  new adapter URL patterns are documented as "best-effort, sampled
+  2026-05-09". Actual scrape verification (slug correctness,
+  Foreks / Matriks / Finnet URL patterns, payload extraction
+  per-source) is a 1-session production-data task that needs sidar
+  to authorize Firecrawl spend on a verification crawl. The
+  unverified rows carry `notes='unverified — sampled 2026-05-09'`
+  in `audit.investing_com_slug` so a verification cron can flip the
+  notes once each slug is confirmed.
+
