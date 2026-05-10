@@ -1,0 +1,53 @@
+# dq subsystem cron — append to user emersus's crontab on Hetzner.
+#
+# Install:
+#   crontab -l | grep -v '^# dq subsystem cron' | grep -v 'aslan audit' \
+#     > /tmp/crontab.before
+#   cat /tmp/crontab.before infra/deploy/cron.dq | crontab -
+#
+# Or simpler (idempotent — re-running won't duplicate):
+#   bash infra/deploy/install-dq.sh
+#
+# Reference: docs/superpowers/handoffs/2026-05-09-dq-m1-emitter-wiring.md
+#
+# Note: alert-dispatch is NOT in this file — it runs as the
+# dq-alert-dispatch docker service (see docker-compose.yml).
+#
+# All entries invoke the host-side `aslan` CLI through `uv run` rather
+# than `docker compose exec` to keep cron output independent of compose
+# health and to match the existing crontab pattern used by the pullers.
+
+# Recency sweep — every 5 min
+*/5 * * * * cd /home/emersus/aslan-core && uv run aslan audit recency-sweep > /tmp/dq-recency.log 2>&1
+
+# Coverage snapshot — hourly
+0 * * * * cd /home/emersus/aslan-core && uv run aslan audit coverage-snapshot > /tmp/dq-coverage.log 2>&1
+
+# Cross-source consistency — nightly 02:00 UTC
+0 2 * * * cd /home/emersus/aslan-core && uv run aslan audit cross-source-consistency > /tmp/dq-xs.log 2>&1
+
+# Regression detect (v1+v2) — nightly 03:00 UTC
+0 3 * * * cd /home/emersus/aslan-core && uv run aslan audit regression-detect > /tmp/dq-regr.log 2>&1
+
+# Bloomberg auto-sample — nightly 04:00 UTC (only writes when an open run exists)
+0 4 * * * cd /home/emersus/aslan-core && uv run aslan audit bloomberg-sample > /tmp/dq-bloomberg-sample.log 2>&1
+
+# Spot-check draw — Mon 06:00 UTC
+0 6 * * 1 cd /home/emersus/aslan-core && uv run aslan audit spot-check-draw > /tmp/dq-spot-check.log 2>&1
+
+# Weekly scorecard — Sun 23:55 UTC
+55 23 * * 0 cd /home/emersus/aslan-core && uv run aslan audit scorecard > /tmp/dq-scorecard.log 2>&1
+
+# Bloomberg quarterly open — 09:00 UTC on the 1st of Jan/Apr/Jul/Oct
+# (cron's day-of-month filter approximates "first Monday"; harmless
+# extra fire if the 1st is not a Monday — bloomberg-open-quarter is
+# a no-op when an open run already exists.)
+0 9 1 1,4,7,10 * cd /home/emersus/aslan-core && uv run aslan audit bloomberg-open-quarter && uv run aslan audit bloomberg-reminder > /tmp/dq-bloomberg-open.log 2>&1
+
+# Bloomberg quarterly close — 09:00 UTC on the 28th of Mar/Jun/Sep/Dec
+# (approximates "last Friday of the quarter"; close-quarter is
+# idempotent on already-closed runs.)
+0 9 28 3,6,9,12 * cd /home/emersus/aslan-core && uv run aslan audit bloomberg-close-quarter --quarter "$(date -u +%Y)Q$((($(date -u +%-m)+2)/3))" > /tmp/dq-bloomberg-close.log 2>&1
+
+# Bloomberg weekly reminder — Mon 09:00 UTC during open quarter
+0 9 * * 1 cd /home/emersus/aslan-core && uv run aslan audit bloomberg-reminder > /tmp/dq-bloomberg-reminder.log 2>&1
