@@ -67,10 +67,10 @@ _HOLIDAYS_2026: tuple[tuple[str, str], ...] = (
     ("2026-04-23", "Ulusal Egemenlik ve Çocuk Bayramı (National Sovereignty + Children's Day)"),  # noqa: RUF001
     ("2026-04-29", "Kurban Bayramı (Eid al-Adha) — Eve"),  # noqa: RUF001
     ("2026-04-30", "Kurban Bayramı (Eid al-Adha) — Day 1"),  # noqa: RUF001
-    ("2026-05-01", "Labour Day / Kurban Bayramı — Day 2"),
+    ("2026-05-01", "Labour Day / Kurban Bayramı — Day 2"),  # noqa: RUF001
     ("2026-05-02", "Kurban Bayramı (Eid al-Adha) — Day 3"),  # noqa: RUF001
     ("2026-05-19", "Atatürk'ü Anma, Gençlik ve Spor Bayramı (Atatürk Memorial Day)"),  # noqa: RUF001
-    ("2026-07-15", "Demokrasi ve Milli Birlik Günü (Democracy Day)"),  # noqa: RUF001
+    ("2026-07-15", "Demokrasi ve Milli Birlik Günü (Democracy Day)"),
     ("2026-08-30", "Zafer Bayramı (Victory Day)"),  # noqa: RUF001
     ("2026-10-29", "Cumhuriyet Bayramı (Republic Day)"),  # noqa: RUF001
 )
@@ -87,7 +87,7 @@ _HOLIDAYS_2027: tuple[tuple[str, str], ...] = (
     ("2027-04-23", "Ulusal Egemenlik ve Çocuk Bayramı (National Sovereignty)"),  # noqa: RUF001
     ("2027-05-01", "Labour Day"),
     ("2027-05-19", "Atatürk'ü Anma, Gençlik ve Spor Bayramı (Atatürk Memorial Day)"),  # noqa: RUF001
-    ("2027-07-15", "Demokrasi ve Milli Birlik Günü (Democracy Day)"),  # noqa: RUF001
+    ("2027-07-15", "Demokrasi ve Milli Birlik Günü (Democracy Day)"),
     ("2027-08-30", "Zafer Bayramı (Victory Day)"),  # noqa: RUF001
     ("2027-10-29", "Cumhuriyet Bayramı (Republic Day)"),  # noqa: RUF001
 )

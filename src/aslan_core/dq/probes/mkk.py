@@ -66,7 +66,9 @@ _MKK_TS_FORMATS: tuple[str, ...] = (
 def _parse_mkk_ts(raw: str) -> datetime | None:
     for fmt in _MKK_TS_FORMATS:
         try:
-            dt = datetime.strptime(raw, fmt)
+            # Same pattern as kap.py — DTZ007 suppressed because the
+            # post-parse .replace(tzinfo=UTC) is unconditional.
+            dt = datetime.strptime(raw, fmt)  # noqa: DTZ007
         except ValueError:
             continue
         if dt.tzinfo is None:
@@ -161,9 +163,7 @@ class MkkProbe:
                     "fallback": "db_only",
                 },
             )
-            ts, detail = await self._db_only_upstream(
-                session, mode="http_error_fallback"
-            )
+            ts, detail = await self._db_only_upstream(session, mode="http_error_fallback")
             detail["http_error"] = str(exc)
             detail["http_error_type"] = type(exc).__name__
             return ts, detail
@@ -181,9 +181,7 @@ class MkkProbe:
                     "fallback": "db_only",
                 },
             )
-            db_ts, detail = await self._db_only_upstream(
-                session, mode="http_parse_fallback"
-            )
+            db_ts, detail = await self._db_only_upstream(session, mode="http_parse_fallback")
             detail["http_parse_error"] = "no eventAt found"
             return db_ts, detail
 

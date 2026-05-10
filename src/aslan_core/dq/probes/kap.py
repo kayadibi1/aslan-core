@@ -83,7 +83,11 @@ def _parse_kap_ts(raw: str) -> datetime | None:
     """
     for fmt in _KAP_TS_FORMATS:
         try:
-            dt = datetime.strptime(raw, fmt)
+            # Explicit fall-through to .replace() below so the parsed
+            # datetime is always tz-aware before return; ruff DTZ007
+            # is suppressed because the post-parse tz attach happens
+            # unconditionally on the next line.
+            dt = datetime.strptime(raw, fmt)  # noqa: DTZ007
         except ValueError:
             continue
         if dt.tzinfo is None:
@@ -100,10 +104,7 @@ def _parse_kap_listing(payload: Any) -> datetime | None:
     unrecognised — caller falls back to DB-only mode and emits an
     error event so the gap is observable.
     """
-    if isinstance(payload, dict) and "data" in payload:
-        rows = payload.get("data")
-    else:
-        rows = payload
+    rows = payload.get("data") if isinstance(payload, dict) and "data" in payload else payload
     if not isinstance(rows, list):
         return None
     candidates: list[datetime] = []
@@ -198,9 +199,7 @@ class KapProbe:
                     "fallback": "db_only",
                 },
             )
-            ts, detail = await self._db_only_upstream(
-                session, mode="http_error_fallback"
-            )
+            ts, detail = await self._db_only_upstream(session, mode="http_error_fallback")
             detail["http_error"] = str(exc)
             detail["http_error_type"] = type(exc).__name__
             return ts, detail
@@ -218,9 +217,7 @@ class KapProbe:
                     "fallback": "db_only",
                 },
             )
-            db_ts, detail = await self._db_only_upstream(
-                session, mode="http_parse_fallback"
-            )
+            db_ts, detail = await self._db_only_upstream(session, mode="http_parse_fallback")
             detail["http_parse_error"] = "no publishDate found"
             return db_ts, detail
 

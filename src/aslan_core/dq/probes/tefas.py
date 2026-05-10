@@ -51,7 +51,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from aslan_core.dq.probes._helpers import absent_detail, table_present
 
-
 # now() - max(median_interval per fund). NULL when no rows in window.
 _TEFAS_UPSTREAM_BY_MEDIAN = text(
     "WITH per_fund_intervals AS ( "

@@ -33,7 +33,7 @@ DEFAULT_TIMEOUT_S = 10.0
 @asynccontextmanager
 async def proxy_aware_client(
     *,
-    timeout: float = DEFAULT_TIMEOUT_S,
+    timeout: float = DEFAULT_TIMEOUT_S,  # noqa: ASYNC109 — httpx-internal timeout
     proxy_env_var: str = "KAP_PROXY_URL",
 ) -> AsyncIterator[tuple[httpx.AsyncClient, str]]:
     """Yield ``(client, proxy_label)`` where ``proxy_label`` is the
