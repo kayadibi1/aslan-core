@@ -277,6 +277,61 @@ services:
     profiles:
       - event-extractor
 
+  # ---- dq subsystem (M3 alerting + NG1 public status) ----
+  # Both services are docker-managed (restart: unless-stopped) instead
+  # of cron-driven so we get supervised stdout/stderr and crash recovery
+  # without competing with the system crontab for buffering.
+  dq-alert-dispatch:
+    build:
+      context: ../..
+      dockerfile: infra/deploy/Dockerfile
+    env_file:
+      - .env
+    environment:
+      ASLAN_PG_DSN: "postgresql+asyncpg://aslan:aslan@postgres:5432/aslan"
+    # The aslan CLI's `audit alert-dispatch` runs evaluator + dispatcher
+    # once and exits; we wrap it in a sleep loop so docker keeps the
+    # process alive. `|| true` prevents one bad cycle (e.g. SMTP blip)
+    # from killing the supervisor — the next iteration will retry.
+    entrypoint:
+      - sh
+      - -c
+      - |
+        while true; do
+          /app/.venv/bin/aslan audit alert-dispatch || true
+          sleep 300
+        done
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  public-status:
+    build:
+      context: ../..
+      dockerfile: infra/deploy/Dockerfile
+    env_file:
+      - .env
+    environment:
+      ASLAN_PG_DSN: "postgresql+asyncpg://aslan:aslan@postgres:5432/aslan"
+      # ASLAN_PUBLIC_STATUS_DSN is supplied via .env (must point at the
+      # public_status_reader role created in migration 0063).
+    entrypoint:
+      - /app/.venv/bin/aslan
+      - public-status
+      - serve
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8081"
+      - --i-know-this-is-unsafe
+    ports:
+      - "127.0.0.1:8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   pg_data:
   minio_data:
