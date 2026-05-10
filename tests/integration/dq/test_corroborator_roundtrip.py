@@ -336,3 +336,141 @@ async def test_refresh_kap_ir_extracts_turkish_payload(
     assert result.payload.get("company_name") == "Akbank T.A.Ş."
     assert result.payload.get("sector") == "Bankacılık"
     assert result.payload.get("bist_ticker") == "AKBNK"
+
+
+# ── NG6 Batch-3 adapters ─────────────────────────────────────────
+
+
+async def test_refresh_investing_com_uses_slug_map(
+    _cache_clean: None,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``audit.investing_com_slug`` carries a row for the ticker,
+    refresh() builds the canonical ``tr.investing.com/equities/<slug>``
+    URL rather than the legacy ``-istanbul-stock-exchange`` shape."""
+    captured: dict[str, str] = {}
+
+    def _capture(url: str) -> _FirecrawlOutcome:
+        captured["url"] = url
+        return _FirecrawlOutcome(status="ok", markdown="Last Price: 1.0\n", error_summary=None)
+
+    monkeypatch.setattr(corroborator, "_firecrawl_fetch", _capture)
+    async with session_factory() as s:
+        await corroborator.refresh(session=s, source="investing_com", entity_ticker="AKBNK")
+        await s.commit()
+    assert captured["url"] == "https://tr.investing.com/equities/akbank", (
+        f"expected slug-map URL, got {captured['url']}"
+    )
+
+
+async def test_refresh_investing_com_emits_slug_missing_event(
+    _cache_clean: None,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ticker missing from the slug map falls through to the legacy
+    URL builder AND emits a ``corroborator_slug_missing`` audit event."""
+    monkeypatch.setattr(
+        corroborator,
+        "_firecrawl_fetch",
+        lambda _url: _FirecrawlOutcome(status="ok", markdown="x", error_summary=None),
+    )
+    async with session_factory() as s:
+        before = (
+            await s.execute(
+                text(
+                    "SELECT count(*)::int FROM audit.event "
+                    "WHERE event_type = 'corroborator_slug_missing'"
+                )
+            )
+        ).scalar_one()
+    async with session_factory() as s:
+        await corroborator.refresh(
+            session=s, source="investing_com", entity_ticker="UNKNOWN_TICKER_XYZ"
+        )
+        await s.commit()
+    async with session_factory() as s:
+        after = (
+            await s.execute(
+                text(
+                    "SELECT count(*)::int FROM audit.event "
+                    "WHERE event_type = 'corroborator_slug_missing'"
+                )
+            )
+        ).scalar_one()
+    assert int(after) == int(before) + 1
+
+
+async def test_refresh_foreks_extracts_payload(
+    _cache_clean: None,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, str] = {}
+
+    def _capture(url: str) -> _FirecrawlOutcome:
+        captured["url"] = url
+        return _FirecrawlOutcome(
+            status="ok",
+            markdown="Son Fiyat: 45.20 TL\nPiyasa Değeri: 250B\n",
+            error_summary=None,
+        )
+
+    monkeypatch.setattr(corroborator, "_firecrawl_fetch", _capture)
+    async with session_factory() as s:
+        result = await corroborator.refresh(session=s, source="foreks", entity_ticker="akbnk")
+        await s.commit()
+    assert captured["url"] == "https://www.foreks.com/borsa/hisse-detay/AKBNK"
+    assert result.fetch_status == "ok"
+    assert result.payload.get("latest_price") == "45.20 TL"
+    assert result.payload.get("market_cap") == "250B"
+
+
+async def test_refresh_matriks_extracts_payload(
+    _cache_clean: None,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, str] = {}
+
+    def _capture(url: str) -> _FirecrawlOutcome:
+        captured["url"] = url
+        return _FirecrawlOutcome(
+            status="ok",
+            markdown="Last Price: 12.34\nMarket Cap: 99B\n",
+            error_summary=None,
+        )
+
+    monkeypatch.setattr(corroborator, "_firecrawl_fetch", _capture)
+    async with session_factory() as s:
+        result = await corroborator.refresh(session=s, source="matriks", entity_ticker="akbnk")
+        await s.commit()
+    assert captured["url"] == "https://www.matriks.com.tr/teknik-analiz/AKBNK"
+    assert result.fetch_status == "ok"
+    assert result.payload.get("latest_price") == "12.34"
+
+
+async def test_refresh_finnet_extracts_payload(
+    _cache_clean: None,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, str] = {}
+
+    def _capture(url: str) -> _FirecrawlOutcome:
+        captured["url"] = url
+        return _FirecrawlOutcome(
+            status="ok",
+            markdown="Last Price: 7.89\nRevenue: 5B\n",
+            error_summary=None,
+        )
+
+    monkeypatch.setattr(corroborator, "_firecrawl_fetch", _capture)
+    async with session_factory() as s:
+        result = await corroborator.refresh(session=s, source="finnet", entity_ticker="akbnk")
+        await s.commit()
+    assert captured["url"] == "https://www.finnet.gen.tr/CompanyResearch/Equity/AKBNK"
+    assert result.fetch_status == "ok"
+    assert result.payload.get("latest_price") == "7.89"
+    assert result.payload.get("revenue") == "5B"

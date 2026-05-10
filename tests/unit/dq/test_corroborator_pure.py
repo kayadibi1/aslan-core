@@ -88,6 +88,60 @@ def test_extract_payload_unknown_source_empty() -> None:
     assert _extract_payload("tradingview", "Last Price: 1.0\n") == {}
 
 
+# ── NG6 Batch-3 adapters: foreks / matriks / finnet ────────────────
+
+
+def test_registered_sources_includes_batch3_adapters() -> None:
+    sources = registered_sources()
+    assert "foreks" in sources
+    assert "matriks" in sources
+    assert "finnet" in sources
+
+
+def test_batch3_adapters_are_implemented() -> None:
+    assert is_implemented("foreks") is True
+    assert is_implemented("matriks") is True
+    assert is_implemented("finnet") is True
+
+
+def test_foreks_url_builder_uppercases() -> None:
+    url = _REGISTERED_SOURCES["foreks"].build_url("akbnk")
+    assert url == "https://www.foreks.com/borsa/hisse-detay/AKBNK"
+
+
+def test_matriks_url_builder_uppercases() -> None:
+    url = _REGISTERED_SOURCES["matriks"].build_url("akbnk")
+    assert url == "https://www.matriks.com.tr/teknik-analiz/AKBNK"
+
+
+def test_finnet_url_builder_uppercases() -> None:
+    url = _REGISTERED_SOURCES["finnet"].build_url("akbnk")
+    assert url == "https://www.finnet.gen.tr/CompanyResearch/Equity/AKBNK"
+
+
+def test_extract_tr_equity_reference_pulls_turkish_labels() -> None:
+    """TR-label primary path: Son Fiyat / Piyasa Değeri / Hasılat."""
+    md = "AKBNK\nSon Fiyat: 45.20 TL\nPiyasa Değeri: 250B\nHasılat: 80B\nOther stuff\n"
+    payload = _extract_payload("foreks", md)
+    assert payload.get("latest_price") == "45.20 TL"
+    assert payload.get("market_cap") == "250B"
+    assert payload.get("revenue") == "80B"
+
+
+def test_extract_tr_equity_reference_falls_back_to_english() -> None:
+    """English-label fall-back when only English labels are present."""
+    md = "Last Price: 45.20\nMarket Cap: 250B\nRevenue: 80B\n"
+    payload = _extract_payload("matriks", md)
+    assert payload.get("latest_price") == "45.20"
+    assert payload.get("market_cap") == "250B"
+    assert payload.get("revenue") == "80B"
+
+
+def test_extract_tr_equity_reference_handles_empty() -> None:
+    assert _extract_payload("finnet", "totally unrelated content") == {}
+    assert _extract_payload("finnet", None) == {}
+
+
 def test_corroborator_result_is_frozen() -> None:
     res = CorroboratorResult(
         source="investing_com",

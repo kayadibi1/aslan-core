@@ -150,8 +150,12 @@ async def test_panel_renders_with_no_cache(
     assert resp.status_code == 200
     body = resp.text
     assert "External corroborator" in body
+    # NG6 Batch-3 — all 5 implemented sources render.
     assert "Corroborator — investing_com" in body
     assert "Corroborator — kap_ir" in body
+    assert "Corroborator — foreks" in body
+    assert "Corroborator — matriks" in body
+    assert "Corroborator — finnet" in body
     # Unimplemented sources still appear with the placeholder.
     assert "Corroborator — tradingview" in body
     assert "not yet implemented" in body

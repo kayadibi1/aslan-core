@@ -45,12 +45,15 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from aslan_core.dq import event as dq_event
 from aslan_core.dq._sql import (
     INSERT_CORROBORATOR_CACHE,
     SELECT_CORROBORATOR_LATEST,
 )
+from aslan_core.dq.types import Severity
 
 _log = structlog.get_logger(__name__)
 
@@ -83,19 +86,52 @@ class CorroboratorResult:
 
 
 def _build_investing_com_url(entity_ticker: str) -> str:
-    """Investing.com Turkey URL pattern.
+    """Investing.com Turkey URL pattern (synchronous fall-back).
 
-    NOTE (NG6 v1): Investing.com's URL slug is *not* a deterministic
-    function of the BIST ticker — the real URL is
-    ``/equities/<company-slug>`` where the slug is editorial (e.g.
-    AKBNK -> ``/equities/akbank``). v1 builds the search-style URL
-    ``/equities/<ticker>-istanbul-stock-exchange`` which Investing's
-    edge redirects to the real entity page when the slug exists.
-    Production hardening (v2) replaces this with a per-ticker slug
-    map maintained alongside ``ref.identifier``.
+    Investing.com's URL slug is *not* a deterministic function of the
+    BIST ticker — the real URL is ``/equities/<company-slug>`` where
+    the slug is editorial (e.g. AKBNK → ``/equities/akbank``).
+
+    Migration 0067 ships ``audit.investing_com_slug`` as the per-ticker
+    slug map; ``_resolve_fetch_url`` consults it before falling back to
+    this builder. The fall-back keeps the legacy
+    ``/equities/<ticker>-istanbul-stock-exchange`` shape (Investing's
+    edge redirects when the slug exists) so a missing-slug-row never
+    crashes the corroborator panel — instead the call site emits a
+    ``corroborator_slug_missing`` audit event so the gap surfaces on
+    /dq/validation.
     """
     slug = entity_ticker.strip().lower()
     return f"https://www.investing.com/equities/{slug}-istanbul-stock-exchange"
+
+
+def _build_foreks_url(entity_ticker: str) -> str:
+    """foreks.com Turkish-equity detail URL.
+
+    Best-effort: ``/borsa/hisse-detay/<TICKER>`` (uppercase ticker).
+    Production must verify each ticker actually resolves; a missing
+    page returns 404 / 500 which the firecrawl boundary records as
+    ``status='error'`` on the cache row.
+    """
+    return f"https://www.foreks.com/borsa/hisse-detay/{entity_ticker.strip().upper()}"
+
+
+def _build_matriks_url(entity_ticker: str) -> str:
+    """matriks.com.tr technical-analysis URL.
+
+    Best-effort: ``/teknik-analiz/<TICKER>`` (uppercase ticker).
+    Production verification candidate.
+    """
+    return f"https://www.matriks.com.tr/teknik-analiz/{entity_ticker.strip().upper()}"
+
+
+def _build_finnet_url(entity_ticker: str) -> str:
+    """finnet.gen.tr equity research URL.
+
+    Best-effort: ``/CompanyResearch/Equity/<TICKER>`` (uppercase ticker).
+    Production verification candidate.
+    """
+    return f"https://www.finnet.gen.tr/CompanyResearch/Equity/{entity_ticker.strip().upper()}"
 
 
 def _build_kap_ir_url(entity_ticker: str) -> str:
@@ -140,6 +176,27 @@ _KAP_IR_PROMPT = (
     "is not surfaced. Do not infer or compute values."
 )
 
+_FOREKS_PROMPT = (
+    "Extract the following fields if present on the page, returning a JSON "
+    "object with keys: latest_price (number), market_cap (string), "
+    "revenue (string). Use null for any field that is not surfaced. "
+    "Do not infer or compute values."
+)
+
+_MATRIKS_PROMPT = (
+    "Extract the following fields if present on the page, returning a JSON "
+    "object with keys: latest_price (number), market_cap (string), "
+    "revenue (string). Use null for any field that is not surfaced. "
+    "Do not infer or compute values."
+)
+
+_FINNET_PROMPT = (
+    "Extract the following fields if present on the page, returning a JSON "
+    "object with keys: latest_price (number), market_cap (string), "
+    "revenue (string). Use null for any field that is not surfaced. "
+    "Do not infer or compute values."
+)
+
 
 _REGISTERED_SOURCES: dict[str, _SourceHandler] = {
     "investing_com": _SourceHandler(
@@ -152,6 +209,29 @@ _REGISTERED_SOURCES: dict[str, _SourceHandler] = {
         name="kap_ir",
         build_url=_build_kap_ir_url,
         extraction_prompt=_KAP_IR_PROMPT,
+        implemented=True,
+    ),
+    # NG6 Batch-3 corroborator wishlist — three TR-equity reference
+    # sites. URL patterns are best-effort (production verification is
+    # a 1-session sidar-authorised Firecrawl-spend task); the firecrawl
+    # boundary records the fetch_status on the cache row so a 404 / 5xx
+    # surfaces on the dashboard rather than crashing the panel.
+    "foreks": _SourceHandler(
+        name="foreks",
+        build_url=_build_foreks_url,
+        extraction_prompt=_FOREKS_PROMPT,
+        implemented=True,
+    ),
+    "matriks": _SourceHandler(
+        name="matriks",
+        build_url=_build_matriks_url,
+        extraction_prompt=_MATRIKS_PROMPT,
+        implemented=True,
+    ),
+    "finnet": _SourceHandler(
+        name="finnet",
+        build_url=_build_finnet_url,
+        extraction_prompt=_FINNET_PROMPT,
         implemented=True,
     ),
     # Registered-but-not-implemented sources. The dashboard surfaces
@@ -345,6 +425,12 @@ def _extract_payload(source: str, markdown: str | None) -> dict[str, Any]:
     Per source:
       * investing_com — looks for "Last Price", "Market Cap", "Revenue".
       * kap_ir       — looks for "Şirket Adı", "Sektör", "BIST Kodu".
+      * foreks / matriks / finnet — TR-equity reference pages; the v1
+        extractors share the same English-label fall-back set
+        ("Son Fiyat" / "Last Price", "Piyasa Değeri" / "Market Cap",
+        "Hasılat" / "Revenue") since the sites carry both labels in
+        practice. Production hardening swaps to source-specific Turkish
+        labels once verified.
     Returns an empty dict if markdown is None or the patterns don't
     match — never raises, the dashboard just renders "—" for empty
     fields.
@@ -355,7 +441,48 @@ def _extract_payload(source: str, markdown: str | None) -> dict[str, Any]:
         return _extract_investing(markdown)
     if source == "kap_ir":
         return _extract_kap_ir(markdown)
+    if source in ("foreks", "matriks", "finnet"):
+        return _extract_tr_equity_reference(markdown)
     return {}
+
+
+def _extract_tr_equity_reference(markdown: str) -> dict[str, Any]:
+    """Shared extractor for the three TR-equity reference sites.
+
+    Looks for the small comparable triple (latest_price, market_cap,
+    revenue) using both Turkish ("Son Fiyat", "Piyasa Değeri",
+    "Hasılat") and English ("Last Price", "Market Cap", "Revenue")
+    labels. The first match per key wins. Conservative — no unit /
+    number normalization; the labeller compares text against the
+    canonical row.
+    """
+    out: dict[str, Any] = {}
+    lower = markdown.lower()
+    label_map: tuple[tuple[str, str], ...] = (
+        # Turkish labels first; English fall-backs second so a TR-only
+        # page extracts cleanly. Each (label, key) pair is appended to
+        # the same `key` so the first match wins via the `key in out`
+        # guard.
+        ("son fiyat", "latest_price"),
+        ("last price", "latest_price"),
+        ("piyasa değeri", "market_cap"),
+        ("piyasa degeri", "market_cap"),
+        ("market cap", "market_cap"),
+        ("hasılat", "revenue"),
+        ("hasilat", "revenue"),
+        ("revenue", "revenue"),
+    )
+    for label, key in label_map:
+        if key in out:
+            continue
+        idx = lower.find(label)
+        if idx == -1:
+            continue
+        tail = markdown[idx + len(label) :].split("\n", 1)[0]
+        token = tail.strip(" :|").split("|", 1)[0].strip()
+        if token:
+            out[key] = token[:128]
+    return out
 
 
 def _extract_investing(markdown: str) -> dict[str, Any]:
@@ -450,6 +577,86 @@ async def _select_latest_row(
             {"source": source, "entity_ticker": entity_ticker},
         )
     ).one_or_none()
+
+
+# ── Slug-map lookup (NG6 Batch 3) ────────────────────────────────
+
+
+_SELECT_INVESTING_SLUG = text(
+    "SELECT full_url FROM audit.investing_com_slug WHERE ticker = :ticker LIMIT 1"
+)
+
+
+async def _table_present(session: AsyncSession, schema: str, table_name: str) -> bool:
+    row = (
+        await session.execute(
+            text(
+                "SELECT EXISTS ("
+                "  SELECT 1 FROM information_schema.tables "
+                "  WHERE table_schema = :schema AND table_name = :table"
+                ") AS present"
+            ),
+            {"schema": schema, "table": table_name},
+        )
+    ).one()
+    return bool(row.present)
+
+
+async def _resolve_investing_slug_url(session: AsyncSession, *, entity_ticker: str) -> str | None:
+    """Look up the canonical Investing.com URL for ``entity_ticker``.
+
+    Returns the ``full_url`` GENERATED column from
+    ``audit.investing_com_slug`` when a row exists, ``None`` otherwise
+    (caller falls back to the legacy URL builder + emits a
+    ``corroborator_slug_missing`` event).
+
+    Returns ``None`` when the slug table is absent (older deployments
+    pre-migration-0067) so the corroborator continues to work
+    end-to-end without the table.
+    """
+    if not await _table_present(session, "audit", "investing_com_slug"):
+        return None
+    row = (
+        await session.execute(_SELECT_INVESTING_SLUG, {"ticker": entity_ticker.strip().upper()})
+    ).one_or_none()
+    if row is None or row.full_url is None:
+        return None
+    return str(row.full_url)
+
+
+async def _resolve_fetch_url(
+    *,
+    session: AsyncSession,
+    source: str,
+    entity_ticker: str,
+    handler: _SourceHandler,
+) -> str:
+    """Build the per-source fetch URL.
+
+    For ``investing_com`` consults the slug map first; on a slug miss
+    emits ``corroborator_slug_missing`` and falls through to the
+    legacy URL builder so the panel still renders. Other sources call
+    ``handler.build_url`` directly.
+    """
+    if source == "investing_com":
+        slug_url = await _resolve_investing_slug_url(session, entity_ticker=entity_ticker)
+        if slug_url is not None:
+            return slug_url
+        # Slug missing — emit an event so the gap surfaces on /dq/validation,
+        # then fall through to the legacy URL builder.
+        await dq_event.emit(
+            session=session,
+            event_type="corroborator_slug_missing",
+            emitter="dq.corroborator._resolve_fetch_url",
+            severity=Severity.INFO,
+            payload={
+                "source": source,
+                "entity_ticker": entity_ticker,
+                "expected_table": "audit.investing_com_slug",
+            },
+        )
+    url = handler.build_url(entity_ticker)
+    return str(url)
 
 
 async def _insert_cache_row(session: AsyncSession, *, result: CorroboratorResult) -> int:
@@ -563,7 +770,12 @@ async def refresh(
             f"see aslan_core.dq.corroborator._REGISTERED_SOURCES"
         )
 
-    fetch_url = handler.build_url(entity_ticker)
+    fetch_url = await _resolve_fetch_url(
+        session=session,
+        source=source,
+        entity_ticker=entity_ticker,
+        handler=handler,
+    )
     started = time.monotonic()
     outcome = _firecrawl_fetch(fetch_url)
     latency_ms = int((time.monotonic() - started) * 1000)
