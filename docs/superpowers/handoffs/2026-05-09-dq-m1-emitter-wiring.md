@@ -44,12 +44,52 @@ specific edge cases) is in the workspace handoff. Summary:
 | aslan-mkk-puller | `src/mkk_puller/cli/pull.py:32` | mkk |
 | aslan-event-extractor | `src/aslan_event_extractor/cli/extract.py` | event-extractor |
 
+## CRITICAL binding constraint — KAP HTTP via rotating proxy pool
+
+Per workspace `CLAUDE.md` and `crawl` commit `eb78619` (2026-05-09),
+**any KAP HTTP traffic from any aslan service MUST honor
+`KAP_PROXY_URL`** (the Webshare rotating proxy pool). Bypassing the
+pool competes with the body-fetcher for KAP's per-IP rate cap (~100
+req per 5 min) and degrades production throughput from 30+/min to
+~6/min.
+
+The Batch-2 batch-2 KAP probe + cross-source `xs_kap_filing_count_recon`
+both go through `aslan_core.dq.probes._http.proxy_aware_client`,
+which reads `KAP_PROXY_URL` at call time and records the resolved
+proxy URL (or the literal `"direct"` if unset) onto
+`probe_detail.proxy` and `validation_failure.detail.proxy`. Operators
+inspecting an unexpectedly-stale recency reading or a recon failure
+should grep those columns for `"proxy": "direct"` — that's the
+canonical debug crumb for "why is KAP rate-limiting us."
+
+The MKK probe uses the same env var (one rotating pool per
+deployment, not per source). Setting `DQ_MKK_API_URL` without
+`KAP_PROXY_URL` is supported but emits the same `"proxy": "direct"`
+trail.
+
 ## Pending follow-ups
 
-* M1.1 — replace placeholder upstream probes in
+* ~~M1.1 — replace placeholder upstream probes in
   `src/aslan_core/dq/probes/{kap,bist,tefas,mkk}.py` with real
   upstream queries (HTTP-poll KAP, ref.calendar_tr for BIST holiday
-  gating, per-fund rolling-90d-median for TEFAS, MKK API).
+  gating, per-fund rolling-90d-median for TEFAS, MKK API).~~
+  **DONE in Batch 2 (Alembic head 0066).**
+  - KAP probe: DB-only mode (default) + opt-in HTTP listing mode
+    (`DQ_KAP_LISTING_URL`) via the new proxy-aware `httpx`
+    helper. The HTTP path honors `KAP_PROXY_URL` per the workspace
+    binding constraint (crawl commit eb78619).
+  - BIST probe: `ref.calendar_tr` integration with Mon-Fri fallback
+    when the calendar table is absent or empty. Migration 0066
+    creates the table (CREATE IF NOT EXISTS) and seeds 27 TR public
+    holidays for 2026 + 2027.
+  - TEFAS probe: per-fund rolling-90-day median update interval,
+    aggregated via `max(median)` across funds (under-alerts vs
+    over-alerts). `db_latest` switched to `MIN(per-fund MAX)` so a
+    single stale fund pulls the metric.
+  - MKK probe: DB-only mode (default) + opt-in HTTP API mode
+    (`DQ_MKK_API_URL` + `DQ_MKK_API_KEY`) with `X-API-Key` auth via
+    the same proxy-aware helper.
+  - Meta-test asserts no `TODO(M1.1)` markers remain in any probe.
 * M2 — **shipped on this branch**. Spot-check labelling workflow
   is live: migration 0058 (`audit.spot_check_sample` +
   `audit.spot_check_result`), `aslan_core.dq.spot_check` module,
@@ -447,16 +487,28 @@ auto-dismissed flags are NOT shown in the open-queue (they leave
   * `tests/integration/dq/test_regression_detect.py`
   * `tests/integration/dashboard/test_dq_validation.py`
 
-### M5.1 follow-ups (deferred, but not blocking M5)
+### M5.1 follow-ups
 
-* **`xs_kap_filing_count_recon`** — wire the upstream KAP listing
+* ~~**`xs_kap_filing_count_recon`** — wire the upstream KAP listing
   HTTP query and replace the trailing-7d-mean self-compare with a
   real upstream-vs-DB diff. The placeholder emits a
-  `kap_api_count_unimplemented` event per run so the gap is visible.
+  `kap_api_count_unimplemented` event per run so the gap is visible.~~
+  **DONE in Batch 2.** When `DQ_KAP_LISTING_URL` is set, the rule
+  fetches the listing endpoint via the proxy-aware httpx helper
+  (KAP_PROXY_URL rotating pool when present), buckets by
+  publishDate.date(), and per-day-compares against the in-DB count.
+  Failures carry `mode=http_recon`, `upstream_count`, `db_count`,
+  `diff`, and the resolved proxy label. When `DQ_KAP_LISTING_URL` is
+  unset the rule keeps the trailing-7d self-compare and the
+  `kap_api_count_unimplemented` marker event still fires so the
+  configuration gap remains visible on `/dq/validation`. HTTP /
+  parse errors emit `kap_listing_recon_error` and gracefully fall
+  back to the self-compare path.
 * **Trading-day calendar for `xs_mkk_kap_capital_action_corr`** —
   v1 uses ±5 calendar days as a Mon-Fri ±3-trading-day approximation.
-  Once `ref.calendar_tr` is populated, swap the SQL window to a real
-  trading-day calculation.
+  Now that migration 0066 ships `ref.calendar_tr`, the SQL window
+  in this rule can be swapped to a real trading-day calculation
+  (Batch 3 candidate).
 * **Curated top-50 entity roster** — DONE in migration 0065
   (`audit.curated_top_50`). BIST-30 + 20 strategic-coverage extras
   seeded with deterministic UUIDv5 entity_id keys. The dispatcher
