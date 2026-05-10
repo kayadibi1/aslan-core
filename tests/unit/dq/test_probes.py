@@ -116,16 +116,59 @@ async def test_kap_db_latest_absent() -> None:
 
 
 @pytest.mark.asyncio
-async def test_kap_upstream_is_placeholder() -> None:
-    session = _fake_session_with_results([])
+async def test_kap_upstream_db_only_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default config (DQ_KAP_LISTING_URL unset) -> DB-only mode."""
+    monkeypatch.delenv("DQ_KAP_LISTING_URL", raising=False)
+    db_ts = datetime(2026, 5, 9, 10, 0, tzinfo=UTC)
+    session = _fake_session_with_results([_row(present=True), _row(db_latest_at=db_ts)])
     probe = KapProbe()
     ts, detail = await probe.upstream_latest(session, "publish_to_db")
-    assert ts is not None
-    assert ts.tzinfo is not None
-    # Placeholder is "now - 30s"; allow a few-second slack.
-    assert abs((datetime.now(UTC) - ts).total_seconds() - 30) < 5
-    assert detail["probe"] == "placeholder"
-    assert "todo" in detail
+    assert ts == db_ts
+    assert detail["probe"] == "db_only"
+    assert detail["mode"] == "db_only_default"
+    assert detail["table_present"] is True
+
+
+@pytest.mark.asyncio
+async def test_kap_upstream_db_only_when_table_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DB-only mode + missing table -> (None, table_present=False)."""
+    monkeypatch.delenv("DQ_KAP_LISTING_URL", raising=False)
+    session = _fake_session_with_results([_row(present=False)])
+    probe = KapProbe()
+    ts, detail = await probe.upstream_latest(session, "publish_to_db")
+    assert ts is None
+    assert detail["table_present"] is False
+
+
+def test_kap_parse_listing_top_level_list() -> None:
+    """Top-level list shape returns max publishDate."""
+    from aslan_core.dq.probes.kap import _parse_kap_listing
+
+    payload = [
+        {"publishDate": "2026-05-09 10:00:00", "title": "x"},
+        {"publishDate": "2026-05-09 11:30:00", "title": "y"},
+        {"publishDate": "2026-05-09 09:15:00", "title": "z"},
+    ]
+    assert _parse_kap_listing(payload) == datetime(2026, 5, 9, 11, 30, tzinfo=UTC)
+
+
+def test_kap_parse_listing_envelope_data() -> None:
+    """Envelope shape ``{"data": [...]}`` also works."""
+    from aslan_core.dq.probes.kap import _parse_kap_listing
+
+    payload = {"data": [{"publishDate": "2026-05-09T08:00:00Z"}]}
+    assert _parse_kap_listing(payload) == datetime(2026, 5, 9, 8, 0, tzinfo=UTC)
+
+
+def test_kap_parse_listing_unknown_shape_returns_none() -> None:
+    """Unrecognised shape -> None so caller can fall back to DB-only."""
+    from aslan_core.dq.probes.kap import _parse_kap_listing
+
+    assert _parse_kap_listing({"unexpected": "shape"}) is None
+    assert _parse_kap_listing("string-payload") is None
+    assert _parse_kap_listing([{"no": "publishDate"}]) is None
 
 
 # ── EVDS probe ─────────────────────────────────────────────────────
