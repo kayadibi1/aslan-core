@@ -346,10 +346,77 @@ async def test_mkk_db_latest_present() -> None:
 
 
 @pytest.mark.asyncio
-async def test_mkk_upstream_one_day_back() -> None:
-    session = _fake_session_with_results([])
+async def test_mkk_upstream_db_only_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default config (DQ_MKK_API_URL unset) -> DB-only mode."""
+    monkeypatch.delenv("DQ_MKK_API_URL", raising=False)
+    monkeypatch.delenv("DQ_MKK_API_KEY", raising=False)
+    db_ts = datetime(2026, 5, 8, 12, 0, tzinfo=UTC)
+    session = _fake_session_with_results([_row(present=True), _row(db_latest_at=db_ts)])
     probe = MkkProbe()
-    ts, _ = await probe.upstream_latest(session, "event_at_to_db")
-    assert ts is not None
-    delta = datetime.now(UTC) - ts
-    assert abs(delta.total_seconds() - timedelta(days=1).total_seconds()) < 5
+    ts, detail = await probe.upstream_latest(session, "event_at_to_db")
+    assert ts == db_ts
+    assert detail["probe"] == "db_only"
+    assert detail["mode"] == "db_only_default"
+
+
+@pytest.mark.asyncio
+async def test_mkk_upstream_db_only_when_url_set_but_key_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """URL set but key missing -> DB-only (both must be set)."""
+    monkeypatch.setenv("DQ_MKK_API_URL", "https://example.invalid/mkk")
+    monkeypatch.delenv("DQ_MKK_API_KEY", raising=False)
+    db_ts = datetime(2026, 5, 8, 12, 0, tzinfo=UTC)
+    session = _fake_session_with_results([_row(present=True), _row(db_latest_at=db_ts)])
+    probe = MkkProbe()
+    ts, detail = await probe.upstream_latest(session, "event_at_to_db")
+    assert ts == db_ts
+    assert detail["probe"] == "db_only"
+
+
+def test_mkk_parse_payload_top_level_list() -> None:
+    from aslan_core.dq.probes.mkk import _parse_mkk_payload
+
+    payload = [
+        {"eventAt": "2026-05-08T08:00:00Z", "id": "1"},
+        {"eventAt": "2026-05-08T12:30:00Z", "id": "2"},
+    ]
+    assert _parse_mkk_payload(payload) == datetime(2026, 5, 8, 12, 30, tzinfo=UTC)
+
+
+def test_mkk_parse_payload_envelope() -> None:
+    from aslan_core.dq.probes.mkk import _parse_mkk_payload
+
+    payload = {"events": [{"eventAt": "2026-05-08 14:00:00"}]}
+    assert _parse_mkk_payload(payload) == datetime(2026, 5, 8, 14, 0, tzinfo=UTC)
+
+
+def test_mkk_parse_payload_unknown_shape() -> None:
+    from aslan_core.dq.probes.mkk import _parse_mkk_payload
+
+    assert _parse_mkk_payload({"unexpected": "shape"}) is None
+    assert _parse_mkk_payload([{"no": "eventAt"}]) is None
+
+
+# ── Meta: no TODO(M1.1) markers remain in any probe module ──────────
+
+
+def test_no_m1_1_todo_markers_in_probes() -> None:
+    """Batch 2 self-review gate: every TODO(M1.1) marker is gone.
+
+    Real upstream probe implementations (this batch) must replace
+    every placeholder. Greps the four probe files (kap, bist, tefas,
+    mkk) — evds was already real in M1 — and asserts no marker text
+    remains. A regression here means a future change re-introduced a
+    placeholder upstream probe; surface that as a test failure.
+    """
+    from pathlib import Path
+
+    from aslan_core.dq import probes as probes_pkg
+
+    probes_dir = Path(probes_pkg.__file__).parent
+    for fname in ("kap.py", "bist.py", "tefas.py", "mkk.py"):
+        text_body = (probes_dir / fname).read_text(encoding="utf-8")
+        assert "TODO(M1.1)" not in text_body, (
+            f"{fname} still carries a TODO(M1.1) marker — probe not real yet"
+        )
