@@ -191,7 +191,7 @@ async def test_kap_filing_count_recon_fires_on_anomaly(
     # At least the 100-filing day should diverge from the mean.
     assert len(results) >= 1
     assert all(r.rule_name == "xs_kap_filing_count_recon" for r in results)
-    # Placeholder marker event was emitted
+    # Self-compare fallback marker event was emitted
     async with session_factory() as s:
         n = (
             await s.execute(
@@ -202,6 +202,132 @@ async def test_kap_filing_count_recon_fires_on_anomaly(
             )
         ).scalar_one()
         assert int(n) >= 1
+
+
+async def test_kap_filing_count_recon_http_mode_compares_with_upstream(
+    _kap_disclosures_seeded: None,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When DQ_KAP_LISTING_URL is set, the rule HTTP-fetches the
+    listing endpoint and per-day-compares against in-DB counts.
+
+    We mock httpx.AsyncClient.get to return a synthetic payload that
+    differs from the seeded DB rows on the 100-filing day so the
+    recon emits a real-upstream-mode diff.
+    """
+    from datetime import timedelta as _td
+    from typing import Any as _Any
+
+    import httpx
+    from pydantic import SecretStr
+
+    from aslan_core.config import Settings
+
+    settings = Settings(
+        ASLAN_PG_DSN=SecretStr("postgresql://x:y@localhost/test"),
+        ASLAN_REDIS_URL="redis://localhost:6379/0",
+        ASLAN_S3_ENDPOINT="http://localhost:9000",
+        ASLAN_S3_REGION="us-east-1",
+        ASLAN_S3_ACCESS_KEY=SecretStr("x"),
+        ASLAN_S3_SECRET_KEY=SecretStr("x"),
+        DQ_KAP_LISTING_URL="https://kap.example.invalid/api/disclosures",
+    )
+
+    base = datetime.now(UTC).replace(hour=12, minute=0, second=0, microsecond=0)
+    # Synthetic upstream payload. For the 100-filing day (d=6) we
+    # report only 50 publishDates; the recon must detect the diff.
+    upstream_rows: list[dict[str, _Any]] = []
+    for d in range(1, 6):
+        for _ in range(10):
+            upstream_rows.append(
+                {"publishDate": (base - _td(days=d)).strftime("%Y-%m-%d %H:%M:%S")}
+            )
+    for _ in range(50):  # disagree with DB's 100
+        upstream_rows.append(
+            {"publishDate": (base - _td(days=6)).strftime("%Y-%m-%d %H:%M:%S")}
+        )
+
+    async def _fake_get(self: _Any, url: str, **kw: _Any) -> _Any:
+        _ = self, kw
+        req = httpx.Request("GET", url)
+        return httpx.Response(200, json=upstream_rows, request=req)
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", _fake_get)
+
+    async with session_factory() as s:
+        results = await cross_source.xs_kap_filing_count_recon(
+            session=s, settings=settings
+        )
+        await s.commit()
+
+    # Only the 100-vs-50 day should fire — the others match exactly.
+    assert len(results) == 1
+    only = results[0]
+    assert only.detail["mode"] == "http_recon"
+    assert only.detail["db_count"] == 100
+    assert only.detail["upstream_count"] == 50
+    assert only.detail["diff"] == -50
+
+    # Cleanup: drop the failure rows the test inserted.
+    async with session_factory() as s:
+        await s.execute(text("DELETE FROM audit.validation_failure"))
+        await s.commit()
+
+
+async def test_kap_filing_count_recon_http_error_falls_back_to_self_compare(
+    _kap_disclosures_seeded: None,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HTTP error -> emit kap_listing_recon_error event, fall back to
+    self-compare so the cron makes progress."""
+    from typing import Any as _Any
+
+    import httpx
+    from pydantic import SecretStr
+
+    from aslan_core.config import Settings
+
+    settings = Settings(
+        ASLAN_PG_DSN=SecretStr("postgresql://x:y@localhost/test"),
+        ASLAN_REDIS_URL="redis://localhost:6379/0",
+        ASLAN_S3_ENDPOINT="http://localhost:9000",
+        ASLAN_S3_REGION="us-east-1",
+        ASLAN_S3_ACCESS_KEY=SecretStr("x"),
+        ASLAN_S3_SECRET_KEY=SecretStr("x"),
+        DQ_KAP_LISTING_URL="https://kap.example.invalid/api/disclosures",
+    )
+
+    async def _fake_get(self: _Any, url: str, **kw: _Any) -> _Any:
+        _ = self, url, kw
+        raise httpx.ConnectError("simulated network failure")
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", _fake_get)
+
+    async with session_factory() as s:
+        results = await cross_source.xs_kap_filing_count_recon(
+            session=s, settings=settings
+        )
+        await s.commit()
+
+    # Self-compare fallback should have fired the 100-day anomaly.
+    assert len(results) >= 1
+    # Recon-error event was emitted.
+    async with session_factory() as s:
+        n = (
+            await s.execute(
+                text(
+                    "SELECT count(*)::int FROM audit.event "
+                    "WHERE event_type = 'kap_listing_recon_error'"
+                )
+            )
+        ).scalar_one()
+        assert int(n) >= 1
+
+    async with session_factory() as s:
+        await s.execute(text("DELETE FROM audit.validation_failure"))
+        await s.commit()
 
 
 # ── Rule 5: EVDS calendar miss fixture ────────────────────────────

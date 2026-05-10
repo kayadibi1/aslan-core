@@ -47,16 +47,19 @@ from __future__ import annotations
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
+import httpx
 import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from aslan_core.config import Settings
 from aslan_core.dq import event as dq_event
 from aslan_core.dq._sql import INSERT_VALIDATION_FAILURE
+from aslan_core.dq.probes._http import proxy_aware_client
 from aslan_core.dq.types import Severity, ValidationFailure
 
 _log = structlog.get_logger(__name__)
@@ -510,13 +513,22 @@ async def xs_evds_observation_calendar(
 _RULE_6 = "xs_kap_filing_count_recon"
 _KAP_RECON_FUDGE_PCT: Decimal = Decimal("0.0")
 
-# v1 placeholder: no HTTP query to the KAP listing API yet (planned
-# for M5.1). v1 self-compares the trailing-7-day per-day count
-# against the 7-day average; days where today's count diverges by
-# more than the fudge factor get flagged. The placeholder lets the
-# wiring + dashboard render correctly today, and a one-line swap to
-# the real upstream count in M5.1 is sufficient to ship the spec
-# rule.
+# Two implementations:
+#
+#   * Real-upstream mode (Settings.dq_kap_listing_url is set): GET
+#     the KAP listing endpoint via the proxy-aware httpx helper
+#     (KAP_PROXY_URL rotating pool when present), bucket by
+#     publishDate.date(), compare each day's upstream count to the
+#     in-DB count from kap.disclosures. Any non-zero diff fires a
+#     failure (severity=info — count drift is typically real, not a
+#     bug, and we want to surface it for human triage rather than
+#     page).
+#
+#   * Self-compare fallback (Settings.dq_kap_listing_url is None):
+#     v1 trailing-7-day mean self-compare. Emits the
+#     ``kap_api_count_unimplemented`` marker event so the dashboard
+#     surfaces the gap; this is the original M5.1 placeholder, kept
+#     working until production wires the listing URL.
 _SQL_KAP_FILING_PER_DAY_TRAILING_7D = text(
     "SELECT date_trunc('day', published_at)::date AS pub_day, "
     "  count(*)::int AS daily_count "
@@ -528,40 +540,59 @@ _SQL_KAP_FILING_PER_DAY_TRAILING_7D = text(
 )
 
 
-async def xs_kap_filing_count_recon(
+def _bucket_kap_listing_by_day(payload: Any) -> dict[date, int]:
+    """Group a KAP listing JSON payload by publishDate.date() -> count.
+
+    Accepts the same shapes as the recency probe parser
+    (``aslan_core.dq.probes.kap._parse_kap_listing``): top-level list
+    or ``{"data": [...]}`` envelope. Rows without a parseable
+    publishDate are silently skipped — a real upstream that returns
+    a row without a date is a structural change worth surfacing in
+    the per-rule failure detail rather than crashing the recon.
+    """
+    from aslan_core.dq.probes.kap import _parse_kap_ts
+
+    rows: Any
+    if isinstance(payload, dict):
+        rows = payload.get("data") if "data" in payload else payload
+    else:
+        rows = payload
+    if not isinstance(rows, list):
+        return {}
+    counts: dict[date, int] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw = row.get("publishDate") or row.get("published_at")
+        if not isinstance(raw, str):
+            continue
+        ts = _parse_kap_ts(raw)
+        if ts is None:
+            continue
+        d = ts.date()
+        counts[d] = counts.get(d, 0) + 1
+    return counts
+
+
+async def _xs_kap_recon_self_compare(
     *,
     session: AsyncSession,
-    fudge_pct: Decimal = _KAP_RECON_FUDGE_PCT,
-    max_failures: int = 500,
+    fudge_pct: Decimal,
+    max_failures: int,
+    detected_at: datetime,
 ) -> list[ValidationFailure]:
-    """KAP per-day count vs upstream KAP API per-day count.
+    """Trailing-7d-mean self-compare fallback (when no listing URL set).
 
-    v1 placeholder — the upstream HTTP query lands in M5.1; v1
-    compares each day's count to the trailing-7-day mean and flags
-    days that diverge by more than ``fudge_pct``. The default
-    ``fudge_pct=0`` means "any divergence from the mean fires";
-    callers can widen for production. Emits an
-    ``kap_api_count_unimplemented`` event so the dashboard surfaces
-    the v1 placeholder gap.
+    Emits the ``kap_api_count_unimplemented`` marker event so the
+    dashboard surfaces the gap to operators.
     """
-    ok, missing = await _all_tables_present(session, (("kap", "disclosures"),))
-    if not ok:
-        await _emit_skip(
-            session=session,
-            rule_name=_RULE_6,
-            reason="required tables not present",
-            missing=missing,
-        )
-        return []
-    # Emit the placeholder marker once per run regardless of
-    # firing-count so the gap is auditable.
     await dq_event.emit(
         session=session,
         event_type="kap_api_count_unimplemented",
         emitter=f"dq.cross_source.{_RULE_6}",
         severity=Severity.INFO,
         payload={
-            "reason": "v1 self-compare; HTTP upstream count is M5.1",
+            "reason": "no DQ_KAP_LISTING_URL configured; self-compare fallback",
             "fudge_pct": str(fudge_pct),
         },
     )
@@ -570,7 +601,6 @@ async def xs_kap_filing_count_recon(
         return []
     counts = [int(r.daily_count) for r in rows]
     mean = Decimal(sum(counts)) / Decimal(len(counts))
-    detected_at = datetime.now(UTC)
     out: list[ValidationFailure] = []
     for r in rows:
         if mean == 0:
@@ -582,14 +612,15 @@ async def xs_kap_filing_count_recon(
             break
         pk: dict[str, Any] = {"pub_day": r.pub_day.isoformat()}
         detail: dict[str, Any] = {
+            "mode": "self_compare",
             "daily_count": int(r.daily_count),
             "trailing_7d_mean": str(mean),
             "diff_pct": str(diff_pct),
             "fudge_pct": str(fudge_pct),
             "reason": (
                 "kap.disclosures daily count diverges from trailing-7d "
-                "mean (v1 placeholder; replace with real KAP API count "
-                "in M5.1)"
+                "mean (self-compare fallback; set DQ_KAP_LISTING_URL "
+                "for upstream recon)"
             ),
         }
         out.append(
@@ -605,6 +636,131 @@ async def xs_kap_filing_count_recon(
             )
         )
     return out
+
+
+async def _xs_kap_recon_http(
+    *,
+    session: AsyncSession,
+    listing_url: str,
+    max_failures: int,
+    detected_at: datetime,
+) -> list[ValidationFailure]:
+    """Real-upstream mode: GET listing URL, compare per-day to DB.
+
+    On HTTP / parse error: emit ``kap_listing_recon_error`` event and
+    fall back to self-compare so the cron makes progress.
+    """
+    try:
+        async with proxy_aware_client() as (client, proxy_label):
+            resp = await client.get(listing_url)
+            resp.raise_for_status()
+            payload = resp.json()
+    except (httpx.HTTPError, json.JSONDecodeError, ValueError) as exc:
+        await dq_event.emit(
+            session=session,
+            event_type="kap_listing_recon_error",
+            emitter=f"dq.cross_source.{_RULE_6}",
+            severity=Severity.WARN,
+            payload={
+                "listing_url": listing_url,
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+                "fallback": "self_compare",
+            },
+        )
+        return await _xs_kap_recon_self_compare(
+            session=session,
+            fudge_pct=_KAP_RECON_FUDGE_PCT,
+            max_failures=max_failures,
+            detected_at=detected_at,
+        )
+
+    upstream_by_day = _bucket_kap_listing_by_day(payload)
+    db_rows = (await session.execute(_SQL_KAP_FILING_PER_DAY_TRAILING_7D)).all()
+    db_by_day: dict[date, int] = {r.pub_day: int(r.daily_count) for r in db_rows}
+
+    out: list[ValidationFailure] = []
+    # Union of days seen on either side. A day present upstream but
+    # not in DB is the "we missed a filing" case; a day in DB but not
+    # upstream is "upstream pruned but we still have it" (also worth
+    # surfacing).
+    all_days = sorted(set(upstream_by_day.keys()) | set(db_by_day.keys()))
+    for d in all_days:
+        upstream_n = upstream_by_day.get(d, 0)
+        db_n = db_by_day.get(d, 0)
+        if upstream_n == db_n:
+            continue
+        if len(out) >= max_failures:
+            break
+        pk: dict[str, Any] = {"pub_day": d.isoformat()}
+        detail: dict[str, Any] = {
+            "mode": "http_recon",
+            "listing_url": listing_url,
+            "proxy": proxy_label,
+            "upstream_count": upstream_n,
+            "db_count": db_n,
+            "diff": upstream_n - db_n,
+            "reason": (
+                "kap.disclosures daily count differs from KAP listing "
+                f"endpoint (upstream={upstream_n}, db={db_n})"
+            ),
+        }
+        out.append(
+            await _persist_failure(
+                session=session,
+                source="kap",
+                rule_name=_RULE_6,
+                severity=Severity.INFO,
+                record_table="kap.disclosures",
+                record_pk=pk,
+                detail=detail,
+                detected_at=detected_at,
+            )
+        )
+    return out
+
+
+async def xs_kap_filing_count_recon(
+    *,
+    session: AsyncSession,
+    fudge_pct: Decimal = _KAP_RECON_FUDGE_PCT,
+    max_failures: int = 500,
+    settings: Settings | None = None,
+) -> list[ValidationFailure]:
+    """KAP per-day count vs upstream KAP API per-day count.
+
+    Real-upstream mode (``Settings.dq_kap_listing_url`` set): HTTP
+    GET via proxy-aware httpx, compare per-day counts. Any non-zero
+    diff fires a row.
+
+    Self-compare fallback (``Settings.dq_kap_listing_url`` unset):
+    trailing-7-day mean self-compare; emits
+    ``kap_api_count_unimplemented`` marker so operators see the gap.
+    """
+    ok, missing = await _all_tables_present(session, (("kap", "disclosures"),))
+    if not ok:
+        await _emit_skip(
+            session=session,
+            rule_name=_RULE_6,
+            reason="required tables not present",
+            missing=missing,
+        )
+        return []
+    s = settings if settings is not None else Settings()
+    detected_at = datetime.now(UTC)
+    if s.dq_kap_listing_url is None:
+        return await _xs_kap_recon_self_compare(
+            session=session,
+            fudge_pct=fudge_pct,
+            max_failures=max_failures,
+            detected_at=detected_at,
+        )
+    return await _xs_kap_recon_http(
+        session=session,
+        listing_url=s.dq_kap_listing_url,
+        max_failures=max_failures,
+        detected_at=detected_at,
+    )
 
 
 # ── All-rules driver ─────────────────────────────────────────────
