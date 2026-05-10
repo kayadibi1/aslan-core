@@ -240,13 +240,21 @@ class _AslanSample:
     """Result of one Aslan-side field sampler.
 
     ``value`` is the textual representation persisted to the cell
-    (TEXT-typed column). ``placeholder`` indicates the sampler is a
-    v1 stub that has not yet been wired to a real source — the caller
-    emits a ``bloomberg_sampler_placeholder`` audit event in this case.
+    (TEXT-typed column). ``placeholder`` indicates the sampler could
+    not produce a real value (the upstream extractor table is missing
+    on this branch / environment) — the caller emits a
+    ``bloomberg_sampler_placeholder`` audit event in this case. The
+    optional ``reason`` / ``expected_table`` / ``expected_cols`` carry
+    structured detail onto that event so the dashboard surfaces
+    "Aslan sampler waiting on extractor M3" rather than just
+    "placeholder."
     """
 
     value: str | None
     placeholder: bool = False
+    reason: str | None = None
+    expected_table: str | None = None
+    expected_cols: tuple[str, ...] | None = None
 
 
 def _try_decimal(value: str | None) -> Decimal | None:
@@ -314,6 +322,30 @@ async def _table_present(session: AsyncSession, schema: str, table_name: str) ->
         )
     ).one()
     return bool(row.present)
+
+
+async def _columns_present(
+    session: AsyncSession, schema: str, table_name: str, columns: tuple[str, ...]
+) -> bool:
+    """Return True iff every column in ``columns`` exists on ``schema.table_name``.
+
+    Used by the M4.1 graceful-degradation samplers to verify the
+    upstream event-extractor table has the expected payload columns
+    before we attempt a real query against it.
+    """
+    if not columns:
+        return True
+    rows = (
+        await session.execute(
+            text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = :schema AND table_name = :table"
+            ),
+            {"schema": schema, "table": table_name},
+        )
+    ).all()
+    present = {str(r.column_name) for r in rows}
+    return all(c in present for c in columns)
 
 
 _SELECT_ENTITY_BY_BIST_TICKER = text(
@@ -393,41 +425,171 @@ async def _sample_filing_lag_p95_30d(*, session: AsyncSession) -> _AslanSample:
     return _AslanSample(value=f"{float(row.p95):.2f}")
 
 
+# M4.1 graceful-degradation samplers — query the expected upstream
+# extractor table when present (event-extractor M3 output); fall back
+# to a rich placeholder _AslanSample when absent so the dashboard
+# event payload tells the operator which extractor is missing.
+
+
+_MATERIAL_EVENT_EXPECTED_TABLE = ("agg", "filing_event")
+_MATERIAL_EVENT_EXPECTED_COLS: tuple[str, ...] = ("event_type", "payload", "emitted_at")
+
+_SELECT_MATERIAL_EVENT_AVG_FIELDS = text(
+    "SELECT AVG(jsonb_array_length(payload->'fields'))::float AS avg_fields "
+    "FROM agg.filing_event "
+    "WHERE event_type = 'material_event' "
+    "  AND emitted_at >= now() - INTERVAL '90 days'"
+)
+
+
 async def _sample_material_event_field_count(*, session: AsyncSession) -> _AslanSample:
     """Aslan-only signal — average structured-field count per material_event
-    filing. v1 placeholder: returns None until the event-extractor's M3
-    structured-payload writer is wired."""
-    if not await _table_present(session, "kap", "disclosures"):
-        return _AslanSample(value=None, placeholder=True)
-    # TODO(M4.1): real Aslan sampler. Real version queries
-    # `agg.filing_event` joined to kap.disclosures and computes
-    # avg(jsonb_object_keys_count(structured_payload)) for the
-    # material_event slice. For v1 we emit a placeholder event since
-    # the structured-payload writer isn't on this branch.
-    return _AslanSample(value=None, placeholder=True)
+    filing over the trailing 90 days.
+
+    Real wiring: ``agg.filing_event`` (event-extractor M3 output)
+    carries one row per emitted event with a ``payload jsonb`` column;
+    the ``fields`` array on the payload is the structured-extraction
+    output. The metric is the mean array length over the 90-day window
+    so a transient extractor regression does not collapse the value.
+
+    NOTE: graceful skip when upstream table absent — see information_schema
+    check above. When the table is missing or the expected columns are
+    not present the sampler returns a rich placeholder _AslanSample
+    carrying ``reason`` + ``expected_table`` + ``expected_cols`` so the
+    dashboard event surfaces the precise gap.
+    """
+    schema, table_name = _MATERIAL_EVENT_EXPECTED_TABLE
+    if not await _table_present(session, schema, table_name):
+        return _AslanSample(
+            value=None,
+            placeholder=True,
+            reason="upstream_table_missing",
+            expected_table=f"{schema}.{table_name}",
+            expected_cols=_MATERIAL_EVENT_EXPECTED_COLS,
+        )
+    if not await _columns_present(session, schema, table_name, _MATERIAL_EVENT_EXPECTED_COLS):
+        return _AslanSample(
+            value=None,
+            placeholder=True,
+            reason="upstream_columns_missing",
+            expected_table=f"{schema}.{table_name}",
+            expected_cols=_MATERIAL_EVENT_EXPECTED_COLS,
+        )
+    row = (await session.execute(_SELECT_MATERIAL_EVENT_AVG_FIELDS)).one_or_none()
+    if row is None or row.avg_fields is None:
+        return _AslanSample(value=None)
+    return _AslanSample(value=f"{float(row.avg_fields):.2f}")
+
+
+_DIVIDEND_EXPECTED_TABLE = ("agg", "dividend_event")
+_DIVIDEND_EXPECTED_COLS: tuple[str, ...] = ("entity_id", "amount_per_share", "ex_date")
+
+_SELECT_LATEST_DIVIDEND = text(
+    "SELECT amount_per_share FROM agg.dividend_event "
+    "WHERE entity_id = :entity_id "
+    "ORDER BY ex_date DESC LIMIT 1"
+)
 
 
 async def _sample_latest_dividend_amount(*, ticker: str, session: AsyncSession) -> _AslanSample:
-    """Latest dividend amount for ``ticker``. v1 placeholder; real wiring
-    requires the dividend extraction in aslan-event-extractor M3."""
-    _ = ticker
-    _ = session
-    # TODO(M4.1): real Aslan sampler. Real version joins kap.disclosures
-    # to agg.filing_event(event_type='dividend') for the resolved
-    # entity_id and returns the latest dividend's amount field.
-    return _AslanSample(value=None, placeholder=True)
+    """Latest dividend amount per share for ``ticker`` from the
+    dividend projector.
+
+    Real wiring: ``agg.dividend_event`` (dividend-projector output)
+    carries one row per entity-ex-date with the per-share amount; the
+    metric is the most-recent ``amount_per_share`` for the entity
+    resolved from ``ticker``.
+
+    NOTE: graceful skip when upstream table absent — see information_schema
+    check above. When the entity cannot be resolved we still return a
+    real (non-placeholder) _AslanSample with value=None so the
+    bloomberg-cell renders as "no dividend on file" rather than
+    "extractor missing".
+    """
+    schema, table_name = _DIVIDEND_EXPECTED_TABLE
+    if not await _table_present(session, schema, table_name):
+        return _AslanSample(
+            value=None,
+            placeholder=True,
+            reason="upstream_table_missing",
+            expected_table=f"{schema}.{table_name}",
+            expected_cols=_DIVIDEND_EXPECTED_COLS,
+        )
+    if not await _columns_present(session, schema, table_name, _DIVIDEND_EXPECTED_COLS):
+        return _AslanSample(
+            value=None,
+            placeholder=True,
+            reason="upstream_columns_missing",
+            expected_table=f"{schema}.{table_name}",
+            expected_cols=_DIVIDEND_EXPECTED_COLS,
+        )
+    entity_id = await _resolve_entity_id(session, ticker)
+    if entity_id is None:
+        # Entity not in ref.identifier — no dividend lookup possible.
+        # Not a placeholder (extractor IS wired); the cell legitimately
+        # has no value for the resolved-but-unknown ticker.
+        return _AslanSample(value=None)
+    row = (await session.execute(_SELECT_LATEST_DIVIDEND, {"entity_id": entity_id})).one_or_none()
+    if row is None or row.amount_per_share is None:
+        return _AslanSample(value=None)
+    return _AslanSample(value=str(row.amount_per_share))
+
+
+_CAPITAL_ACTION_EXPECTED_TABLE = ("agg", "capital_action_event")
+_CAPITAL_ACTION_EXPECTED_COLS: tuple[str, ...] = (
+    "entity_id",
+    "action_type",
+    "ratio",
+    "effective_date",
+)
+
+_SELECT_LATEST_CAPITAL_ACTION = text(
+    "SELECT action_type, ratio FROM agg.capital_action_event "
+    "WHERE entity_id = :entity_id "
+    "ORDER BY effective_date DESC LIMIT 1"
+)
 
 
 async def _sample_latest_capital_action(*, ticker: str, session: AsyncSession) -> _AslanSample:
-    """Latest capital action for ``ticker``. v1 placeholder; real wiring
-    requires the capital-action extraction in aslan-event-extractor M3."""
-    _ = ticker
-    _ = session
-    # TODO(M4.1): real Aslan sampler. Real version joins kap.disclosures
-    # to agg.filing_event(event_type='capital_action') for the resolved
-    # entity_id and returns the latest capital action's classification +
-    # date. Output format: "<action_type>@<date>".
-    return _AslanSample(value=None, placeholder=True)
+    """Latest capital-action descriptor for ``ticker`` from the
+    capital-action projector.
+
+    Real wiring: ``agg.capital_action_event`` (capital-action-projector
+    output) carries one row per entity-effective-date with
+    ``action_type`` (e.g. ``bedelsiz``, ``bedelli``, ``split``) +
+    ``ratio`` (e.g. ``"0.10"``). The metric is rendered as
+    ``"<action_type> <ratio>"``.
+
+    NOTE: graceful skip when upstream table absent — see information_schema
+    check above.
+    """
+    schema, table_name = _CAPITAL_ACTION_EXPECTED_TABLE
+    if not await _table_present(session, schema, table_name):
+        return _AslanSample(
+            value=None,
+            placeholder=True,
+            reason="upstream_table_missing",
+            expected_table=f"{schema}.{table_name}",
+            expected_cols=_CAPITAL_ACTION_EXPECTED_COLS,
+        )
+    if not await _columns_present(session, schema, table_name, _CAPITAL_ACTION_EXPECTED_COLS):
+        return _AslanSample(
+            value=None,
+            placeholder=True,
+            reason="upstream_columns_missing",
+            expected_table=f"{schema}.{table_name}",
+            expected_cols=_CAPITAL_ACTION_EXPECTED_COLS,
+        )
+    entity_id = await _resolve_entity_id(session, ticker)
+    if entity_id is None:
+        return _AslanSample(value=None)
+    row = (
+        await session.execute(_SELECT_LATEST_CAPITAL_ACTION, {"entity_id": entity_id})
+    ).one_or_none()
+    if row is None or row.action_type is None:
+        return _AslanSample(value=None)
+    ratio_part = "" if row.ratio is None else f" {row.ratio}"
+    return _AslanSample(value=f"{row.action_type}{ratio_part}".strip())
 
 
 async def _dispatch_sampler(*, session: AsyncSession, ticker: str, field: str) -> _AslanSample:
@@ -472,17 +634,27 @@ async def record_aslan_value(*, session: AsyncSession, cell_id: UUID) -> None:
 
     sample = await _dispatch_sampler(session=session, ticker=cell.entity_ticker, field=cell.field)
     if sample.placeholder:
+        # M4.1: when the upstream extractor table is absent the
+        # sampler returns a rich placeholder carrying the precise
+        # reason / expected table / expected columns. The legacy
+        # "v1 sampler placeholder" reason is preserved as the default
+        # so dashboards keyed on the historical string keep working.
+        payload: dict[str, object] = {
+            "cell_id": str(cell_id),
+            "entity_ticker": cell.entity_ticker,
+            "field": cell.field,
+            "reason": sample.reason or "v1 sampler placeholder; real wiring deferred to M4.1",
+        }
+        if sample.expected_table is not None:
+            payload["expected_table"] = sample.expected_table
+        if sample.expected_cols is not None:
+            payload["expected_cols"] = list(sample.expected_cols)
         await dq_event.emit(
             session=session,
             event_type="bloomberg_sampler_placeholder",
             emitter="dq.bloomberg.record_aslan_value",
             severity=Severity.INFO,
-            payload={
-                "cell_id": str(cell_id),
-                "entity_ticker": cell.entity_ticker,
-                "field": cell.field,
-                "reason": "v1 sampler placeholder; real wiring deferred to M4.1",
-            },
+            payload=payload,
         )
 
     variance_pct, advantage = _compute_advantage(cell.bloomberg_value, sample.value)
