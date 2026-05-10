@@ -2,6 +2,8 @@ FROM python:3.12-slim AS base
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libpq5 curl \
+        libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz-subset0 \
+        libcairo2 libgdk-pixbuf-2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
