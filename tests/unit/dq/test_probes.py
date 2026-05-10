@@ -224,18 +224,47 @@ async def test_bist_db_latest_absent_returns_none() -> None:
 
 
 @pytest.mark.asyncio
-async def test_bist_upstream_returns_recent_weekday_close() -> None:
-    session = _fake_session_with_results([])
+async def test_bist_upstream_calendar_mode_with_holiday() -> None:
+    """Calendar mode returns the calendar's latest trading day."""
+    from datetime import date
+
+    holiday_eve = date(2026, 4, 22)  # Day before 2026-04-23 holiday
+    session = _fake_session_with_results(
+        [_row(present=True), _row(trade_date=holiday_eve)]
+    )
+    probe = BistProbe()
+    ts, detail = await probe.upstream_latest(session, "trade_close_to_ohlcv")
+    assert ts is not None
+    assert ts.date() == holiday_eve
+    assert ts.hour == 15
+    assert detail["probe"] == "calendar"
+    assert detail["calendar_table"] == "ref.calendar_tr"
+
+
+@pytest.mark.asyncio
+async def test_bist_upstream_fallback_when_calendar_absent() -> None:
+    """Calendar table absent -> Mon-Fri fallback."""
+    session = _fake_session_with_results([_row(present=False)])
     probe = BistProbe()
     ts, detail = await probe.upstream_latest(session, "trade_close_to_ohlcv")
     assert ts is not None
     assert ts.weekday() < 5
-    # 15:00 UTC close
     assert ts.hour == 15
-    assert ts.minute == 0
-    # Within last week
-    assert (datetime.now(UTC) - ts) <= timedelta(days=7)
-    assert detail["probe"] == "placeholder"
+    assert detail["probe"] == "fallback_mon_fri"
+    assert detail["calendar_table_present"] is False
+
+
+@pytest.mark.asyncio
+async def test_bist_upstream_fallback_when_calendar_empty() -> None:
+    """Calendar table present but empty -> Mon-Fri fallback."""
+    session = _fake_session_with_results(
+        [_row(present=True), _row(trade_date=None)]
+    )
+    probe = BistProbe()
+    ts, detail = await probe.upstream_latest(session, "trade_close_to_ohlcv")
+    assert ts is not None
+    assert detail["probe"] == "fallback_mon_fri"
+    assert detail["calendar_empty"] is True
 
 
 # ── TEFAS probe ────────────────────────────────────────────────────
