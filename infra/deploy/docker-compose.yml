@@ -89,6 +89,8 @@ services:
       KAP_S3_RAW_BUCKET: aslan-filings
       KAP_INSTANCE_ID: hetzner-prod-1
       KAP_PROXY_URL: "${KAP_PROXY_URL:-}"
+      KAP_MIN_INTERVAL_S: "${KAP_MIN_INTERVAL_S:-1.0}"
+      KAP_JITTER_S: "${KAP_JITTER_S:-0.2}"
       ASLAN_PG_DSN: "postgresql+asyncpg://aslan:aslan@postgres:5432/aslan"
       ASLAN_REDIS_URL: "redis://redis:6379/0"
       ASLAN_S3_ENDPOINT: "http://minio:9000"
@@ -121,6 +123,8 @@ services:
       KAP_S3_RAW_BUCKET: aslan-filings
       KAP_INSTANCE_ID: hetzner-tail-1
       KAP_PROXY_URL: "${KAP_PROXY_URL:-}"
+      KAP_MIN_INTERVAL_S: "${KAP_MIN_INTERVAL_S:-1.0}"
+      KAP_JITTER_S: "${KAP_JITTER_S:-0.2}"
       ASLAN_PG_DSN: "postgresql+asyncpg://aslan:aslan@postgres:5432/aslan"
       ASLAN_REDIS_URL: "redis://redis:6379/0"
       ASLAN_S3_ENDPOINT: "http://minio:9000"
@@ -152,6 +156,8 @@ services:
       KAP_S3_RAW_BUCKET: aslan-filings
       KAP_INSTANCE_ID: hetzner-fetcher-1
       KAP_PROXY_URL: "${KAP_PROXY_URL:-}"
+      KAP_MIN_INTERVAL_S: "${KAP_MIN_INTERVAL_S:-1.0}"
+      KAP_JITTER_S: "${KAP_JITTER_S:-0.2}"
       ASLAN_PG_DSN: "postgresql+asyncpg://aslan:aslan@postgres:5432/aslan"
       ASLAN_REDIS_URL: "redis://redis:6379/0"
       ASLAN_S3_ENDPOINT: "http://minio:9000"
