@@ -273,20 +273,64 @@ async def test_bist_upstream_fallback_when_calendar_empty() -> None:
 @pytest.mark.asyncio
 async def test_tefas_db_latest_present() -> None:
     db_ts = datetime(2026, 5, 7, 0, 0, tzinfo=UTC)
-    session = _fake_session_with_results([_row(present=True), _row(db_latest_at=db_ts)])
+    session = _fake_session_with_results(
+        [_row(present=True), _row(db_latest_at=db_ts, fund_count=42)]
+    )
     probe = TefasProbe()
-    ts, _ = await probe.db_latest(session, "per_fund_cadence")
+    ts, detail = await probe.db_latest(session, "per_fund_cadence")
     assert ts == db_ts
+    assert detail["fund_count"] == 42
+    assert detail["aggregate"] == "min(per-fund max(snapshot_date))"
 
 
 @pytest.mark.asyncio
-async def test_tefas_upstream_two_days_back() -> None:
-    session = _fake_session_with_results([])
+async def test_tefas_upstream_rolling_90d_median() -> None:
+    """Median-based mode returns now() - max(median_interval)."""
+    expected_ts = datetime(2026, 5, 7, 0, 0, tzinfo=UTC)
+    session = _fake_session_with_results(
+        [
+            _row(present=True),
+            _row(
+                upstream_latest_at=expected_ts,
+                fund_count=10,
+                slowest_median_interval=timedelta(days=3),
+            ),
+        ]
+    )
     probe = TefasProbe()
-    ts, _ = await probe.upstream_latest(session, "per_fund_cadence")
-    assert ts is not None
-    delta = datetime.now(UTC) - ts
-    assert abs(delta.total_seconds() - timedelta(days=2).total_seconds()) < 5
+    ts, detail = await probe.upstream_latest(session, "per_fund_cadence")
+    assert ts == expected_ts
+    assert detail["probe"] == "rolling_90d_median"
+    assert detail["fund_count"] == 10
+
+
+@pytest.mark.asyncio
+async def test_tefas_upstream_empty_window() -> None:
+    """No rows in trailing-90d window -> None upstream."""
+    session = _fake_session_with_results(
+        [
+            _row(present=True),
+            _row(
+                upstream_latest_at=None,
+                fund_count=0,
+                slowest_median_interval=None,
+            ),
+        ]
+    )
+    probe = TefasProbe()
+    ts, detail = await probe.upstream_latest(session, "per_fund_cadence")
+    assert ts is None
+    assert detail["fund_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_tefas_upstream_table_absent() -> None:
+    """Missing table -> graceful skip."""
+    session = _fake_session_with_results([_row(present=False)])
+    probe = TefasProbe()
+    ts, detail = await probe.upstream_latest(session, "per_fund_cadence")
+    assert ts is None
+    assert detail["table_present"] is False
 
 
 # ── MKK probe ──────────────────────────────────────────────────────
