@@ -61,7 +61,7 @@ api = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
     "python-jose[cryptography]>=3.3",
-    "passlib[bcrypt]>=1.7",
+    "passlib[bcrypt]>=1.7.4",
 ]
 
 [dependency-groups]
