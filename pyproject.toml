@@ -71,7 +71,7 @@ dev = [
     "testcontainers[minio,postgres,redis]>=4.7",
     "hypothesis>=6.152.4",
     "ruff>=0.7",
-    "mypy>=1.20",
+    "mypy>=2.1.0",
     "pre-commit>=3.8",
     "types-PyYAML>=6.0",
     # v0.6.0 dashboard lint dep (codex F-3): the static-SQL scanner
