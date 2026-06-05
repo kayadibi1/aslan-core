@@ -33,7 +33,7 @@ dependencies = [
 # argument; ``setup_*(None)`` is always a no-op and never imports
 # the SDK.
 obs = [
-    "sentry-sdk>=2.18",
+    "sentry-sdk>=2.61.1",
     "opentelemetry-api>=1.27",
     "opentelemetry-sdk>=1.27",
     "opentelemetry-exporter-otlp-proto-grpc>=1.27",
