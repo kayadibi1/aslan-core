@@ -2,6 +2,8 @@
 
 The data-plane core of **Aslan Terminal**, a bitemporal financial-data platform for the Turkish market (BIST equities and KAP disclosures). This package owns the schemas, the database engine, the ingestion plumbing, entity resolution, the LLM-extraction provenance layer, the audit subsystem, and the read-only operator dashboard that the ingestion services build on.
 
+![Architecture overview](docs/img/architecture.png)
+
 ## What is interesting here
 
 The hard correctness properties are enforced in code and in the database, not by convention.
