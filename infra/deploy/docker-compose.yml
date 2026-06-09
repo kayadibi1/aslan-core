@@ -76,7 +76,7 @@ services:
 
   scraper:
     build:
-      context: /home/emersus
+      context: /opt/aslan
       dockerfile: aslan-core/infra/deploy/Dockerfile.scraper
     environment:
       KAP_ENV: prod
@@ -112,7 +112,7 @@ services:
 
   tail:
     build:
-      context: /home/emersus
+      context: /opt/aslan
       dockerfile: aslan-core/infra/deploy/Dockerfile.scraper
     environment:
       KAP_ENV: prod
@@ -147,7 +147,7 @@ services:
 
   body-fetcher:
     build:
-      context: /home/emersus
+      context: /opt/aslan
       dockerfile: aslan-core/infra/deploy/Dockerfile.scraper
     environment:
       KAP_ENV: prod
@@ -199,7 +199,7 @@ services:
 
   tefas-puller:
     build:
-      context: /home/emersus
+      context: /opt/aslan
       dockerfile: aslan-tefas-puller/Dockerfile
     environment:
       TEFAS_POSTGRES_DSN: "postgresql+asyncpg://aslan:aslan@postgres:5432/aslan"
@@ -217,7 +217,7 @@ services:
 
   bist-puller:
     build:
-      context: /home/emersus
+      context: /opt/aslan
       dockerfile: aslan-bist-puller/Dockerfile
     environment:
       BIST_POSTGRES_DSN: "postgresql+asyncpg://aslan:aslan@postgres:5432/aslan"
@@ -236,7 +236,7 @@ services:
 
   evds-puller:
     build:
-      context: /home/emersus
+      context: /opt/aslan
       dockerfile: aslan-evds-puller/Dockerfile
     environment:
       EVDS_POSTGRES_DSN: "postgresql+asyncpg://aslan:aslan@postgres:5432/aslan"
@@ -256,7 +256,7 @@ services:
 
   mkk-puller:
     build:
-      context: /home/emersus
+      context: /opt/aslan
       dockerfile: aslan-mkk-puller/Dockerfile
     environment:
       MKK_POSTGRES_DSN: "postgresql+asyncpg://aslan:aslan@postgres:5432/aslan"
@@ -272,9 +272,39 @@ services:
     profiles:
       - mkk
 
+  kap-puller:
+    build:
+      context: /opt/aslan
+      dockerfile: aslan-kap-puller/Dockerfile
+    env_file:
+      - .env
+    environment:
+      KAP_POSTGRES_DSN: "postgresql+asyncpg://aslan:aslan@postgres:5432/aslan"
+      KAP_API_KEY: "${KAP_API_KEY}"
+      KAP_API_SECRET: "${KAP_API_SECRET:-}"
+      KAP_ACCESS_TOKEN: "${KAP_ACCESS_TOKEN:-}"
+      KAP_API_BASE_URL: "${KAP_API_BASE_URL:-https://apigwdev.mkk.com.tr/api/vyk}"
+      KAP_AUTH_BASE_URL: "${KAP_AUTH_BASE_URL:-https://apigwdev.mkk.com.tr}"
+      KAP_AUTH_MODE: "${KAP_AUTH_MODE:-auto}"
+      KAP_RAW_DIR: "/data/kap-vyk-raw"
+      ASLAN_PG_DSN: "postgresql+asyncpg://aslan:aslan@postgres:5432/aslan"
+      ASLAN_REDIS_URL: "redis://redis:6379/0"
+      ASLAN_S3_ENDPOINT: "http://minio:9000"
+      ASLAN_S3_REGION: us-east-1
+      ASLAN_S3_ACCESS_KEY: minioadmin
+      ASLAN_S3_SECRET_KEY: minioadmin
+    volumes:
+      - kap_vyk_raw:/data/kap-vyk-raw
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - kap
+    entrypoint: ["kap-pull"]
+
   event-extractor:
     build:
-      context: /home/emersus
+      context: /opt/aslan
       dockerfile: aslan-core/infra/deploy/Dockerfile.event-extractor
     env_file:
       - .env
@@ -292,6 +322,59 @@ services:
     profiles:
       - event-extractor
 
+  # Moat 2 bitemporal canary. Re-runs ≥10 hand-curated KAP-amendment
+  # cases every 5 minutes; writes status into
+  # aslan_core.feature_flags.MOAT_2_CANARY_STATUS, increments the
+  # moat_2_canary_failures_total Prometheus counter on red, and emits
+  # the JSON failing-cases blob into the flag's `notes` column for
+  # RUNBOOK §5a triage.
+  #
+  # Profile-gated: only starts under `docker compose --profile
+  # bitemporal-canary up bitemporal-canary`. Mirrors the workspace
+  # convention of long-running services using
+  # `restart: unless-stopped`; the host crontab is reserved for
+  # heavyweight pullers, and a 5-minute internal Python loop is
+  # cheaper than a per-tick container spawn.
+  #
+  # TODO: when the workspace adopts a uniform cron container pattern,
+  # migrate this to that pattern instead of the in-process
+  # `while true; sleep 300` loop. Until then this is the simplest
+  # thing that mirrors the existing tail/body-fetcher long-running
+  # service shape.
+  bitemporal-canary:
+    build:
+      context: ../..
+      dockerfile: infra/deploy/Dockerfile
+    env_file:
+      - .env
+    environment:
+      ASLAN_PG_DSN: "postgresql+asyncpg://aslan:aslan@postgres:5432/aslan"
+      ASLAN_REDIS_URL: "redis://redis:6379/0"
+      BITEMPORAL_CANARY_INTERVAL_SECONDS: "300"
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+        # The double-dollar prevents Compose's parse-time variable
+        # expansion; the SHELL inside the container reads
+        # ${BITEMPORAL_CANARY_INTERVAL_SECONDS} from the service's
+        # `environment:` block above. Otherwise Compose interpolates
+        # the host-side env at parse time (often empty), and `sleep ""`
+        # under set -e exits the loop after one iteration.
+        echo "bitemporal-canary: starting; interval=$${BITEMPORAL_CANARY_INTERVAL_SECONDS:-300}s"
+        while true; do
+          /app/.venv/bin/python scripts/canary_moat_2.py || true
+          sleep "$${BITEMPORAL_CANARY_INTERVAL_SECONDS:-300}"
+        done
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - bitemporal-canary
+    restart: unless-stopped
+
 volumes:
   pg_data:
   minio_data:
+  kap_vyk_raw:

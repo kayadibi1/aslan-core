@@ -18,6 +18,8 @@ dependencies = [
     "structlog>=24.4",
     "aioboto3>=13.0",
     "redis>=5.0",
+    "argon2-cffi>=25.1.0",
+    "psycopg[binary]>=3.3.4",
 ]
 
 [project.optional-dependencies]

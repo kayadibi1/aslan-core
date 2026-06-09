@@ -1,0 +1,103 @@
+# .github/workflows/bitemporal-api-ci.yml
+#
+# CI for the Bitemporal Research API spec + implementation.
+# Mirrors the conventions in ci.yml: actions/checkout@v6,
+# astral-sh/setup-uv@v7, `uv sync` then `uv run <tool>`.
+#
+# Note: full DB-backed tests (testcontainers Postgres + 7M-row
+# fixtures used by tests under tests/integration/research/) are
+# intentionally NOT run here — they require a representative
+# bitemporal dataset and run against the staging DSN on Hetzner.
+# CI here covers spec validation + static analysis on the new files;
+# the Phase 4 load + Moat 2 regression suite runs out-of-band on
+# staging per RUNBOOK §1.
+name: bitemporal-api-ci
+
+on:
+  push:
+    branches:
+      - "feature/bitemporal-**"
+  pull_request:
+    paths:
+      - "docs/specs/bitemporal-research-api/**"
+      - "src/aslan_core/api/research_envelope.py"
+      - "src/aslan_core/api/research_auth.py"
+      - "src/aslan_core/api/research_observability.py"
+      - "src/aslan_core/api/research_logging.py"
+      - "src/aslan_core/api/routes/research.py"
+      - "src/aslan_core/api/__init__.py"
+      - "src/aslan_core/db/migrations/versions/20260509_*_004*.py"
+      - "src/aslan_core/db/migrations/versions/20260509_*_005*.py"
+      - "tests/research/**"
+      - "scripts/check_bitemporal_invariants.py"
+      - "scripts/check_bitemporal_invariants.sql"
+      - "scripts/canary_moat_2.py"
+      - ".github/workflows/bitemporal-api-ci.yml"
+
+jobs:
+  validate-openapi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-groups
+      - name: Validate OpenAPI 3.1 contract
+        run: |
+          uv run --with openapi-spec-validator \
+            openapi-spec-validator docs/specs/bitemporal-research-api/OPENAPI.yaml
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-groups
+      - name: Ruff (new files only)
+        run: |
+          uv run ruff check \
+            src/aslan_core/api/routes/research.py \
+            src/aslan_core/api/research_envelope.py \
+            src/aslan_core/api/research_auth.py \
+            src/aslan_core/api/research_observability.py \
+            src/aslan_core/api/research_logging.py \
+            scripts/check_bitemporal_invariants.py \
+            scripts/canary_moat_2.py
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-groups
+      - name: mypy --strict (new files only)
+        # The full repo mypy lives in ci.yml::lint. This job adds the
+        # --strict bar specifically on the bitemporal API surface,
+        # per workspace CLAUDE.md "Every public class / function has
+        # type hints. mypy --strict passes."
+        run: |
+          uv run mypy --strict \
+            src/aslan_core/api/research_envelope.py \
+            src/aslan_core/api/research_auth.py \
+            src/aslan_core/api/research_observability.py \
+            src/aslan_core/api/research_logging.py \
+            src/aslan_core/api/routes/research.py
+
+  collect-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-groups --all-extras
+      - name: Pytest collect (research tests, integration marker)
+        # We can't run integration tests in CI (no Postgres), but we
+        # collect them so import-level breakage on test files is caught.
+        run: |
+          uv run pytest tests/research/ --collect-only -m integration -q
