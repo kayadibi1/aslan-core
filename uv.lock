@@ -291,7 +291,7 @@ requires-dist = [
     { name = "opentelemetry-instrumentation-asyncpg", marker = "extra == 'obs'", specifier = ">=0.48b0" },
     { name = "opentelemetry-instrumentation-sqlalchemy", marker = "extra == 'obs'", specifier = ">=0.48b0" },
     { name = "opentelemetry-sdk", marker = "extra == 'obs'", specifier = ">=1.27" },
-    { name = "passlib", extras = ["bcrypt"], marker = "extra == 'api'", specifier = ">=1.7" },
+    { name = "passlib", extras = ["bcrypt"], marker = "extra == 'api'", specifier = ">=1.7.4" },
     { name = "prometheus-client", marker = "extra == 'dashboard'", specifier = ">=0.21" },
     { name = "prometheus-client", marker = "extra == 'obs'", specifier = ">=0.21" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3.4" },
