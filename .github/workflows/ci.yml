@@ -18,6 +18,7 @@ jobs:
       - run: uv run mypy src tests
 
   test:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -54,6 +55,7 @@ jobs:
   # on ANY vulnerability; see the pip-audit.json artifact for details.
   # Dependabot opens a remediation PR within 24h of any new CVE.
   audit:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

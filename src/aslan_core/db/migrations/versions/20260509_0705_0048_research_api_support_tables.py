@@ -53,8 +53,7 @@ def upgrade() -> None:
         )
     """)
     op.execute(
-        "CREATE INDEX api_key_active_filter_idx "
-        "ON aslan_core.api_key (revoked_at, expires_at)"
+        "CREATE INDEX api_key_active_filter_idx ON aslan_core.api_key (revoked_at, expires_at)"
     )
 
     # 2. api_query_audit — per-request audit log per D18
@@ -77,9 +76,15 @@ def upgrade() -> None:
             feature_flags_active  TEXT[] NOT NULL DEFAULT ARRAY[]::text[]
         )
     """)
-    op.execute("CREATE INDEX aqa_requested_at_idx ON aslan_core.api_query_audit (requested_at DESC)")
-    op.execute("CREATE INDEX aqa_api_key_idx ON aslan_core.api_query_audit (api_key_id, requested_at DESC)")
-    op.execute("CREATE INDEX aqa_status_idx ON aslan_core.api_query_audit (status_code) WHERE status_code >= 400")
+    op.execute(
+        "CREATE INDEX aqa_requested_at_idx ON aslan_core.api_query_audit (requested_at DESC)"
+    )
+    op.execute(
+        "CREATE INDEX aqa_api_key_idx ON aslan_core.api_query_audit (api_key_id, requested_at DESC)"
+    )
+    op.execute(
+        "CREATE INDEX aqa_status_idx ON aslan_core.api_query_audit (status_code) WHERE status_code >= 400"
+    )
 
     # 3. api_rate_limit_state — token-bucket state per D6
     op.execute("""
@@ -92,7 +97,9 @@ def upgrade() -> None:
             PRIMARY KEY (api_key_id, window_kind, window_start)
         )
     """)
-    op.execute("CREATE INDEX rls_window_idx ON aslan_core.api_rate_limit_state (window_kind, window_start)")
+    op.execute(
+        "CREATE INDEX rls_window_idx ON aslan_core.api_rate_limit_state (window_kind, window_start)"
+    )
 
     # 4. feature_flags — per H3, H7
     op.execute("""

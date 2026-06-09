@@ -310,18 +310,14 @@ def evaluate(conn: psycopg.Connection) -> dict[str, Any]:
             before = fetch_canonical_value(conn, case, as_of=case.as_of_before)
             after = fetch_canonical_value(conn, case, as_of=case.as_of_after)
         except Exception as e:
-            failing_cases.append(
-                {"case_id": case.case_id, "kind": "exception", "error": repr(e)}
-            )
+            failing_cases.append({"case_id": case.case_id, "kind": "exception", "error": repr(e)})
             continue
 
-        before_match = (
-            before == case.expected_before
-            or (before is None and case.expected_before is None)
+        before_match = before == case.expected_before or (
+            before is None and case.expected_before is None
         )
-        after_match = (
-            after == case.expected_after
-            or (after is None and case.expected_after is None)
+        after_match = after == case.expected_after or (
+            after is None and case.expected_after is None
         )
         if not (before_match and after_match):
             failing_cases.append(

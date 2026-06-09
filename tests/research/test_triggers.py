@@ -63,9 +63,7 @@ def _is_feature_not_supported(exc: BaseException) -> bool:
     """Return True if the exception chain reports SQLSTATE 0A000."""
     cur: BaseException | None = exc
     while cur is not None:
-        sqlstate = getattr(cur, "sqlstate", None) or getattr(
-            cur, "pgcode", None
-        )
+        sqlstate = getattr(cur, "sqlstate", None) or getattr(cur, "pgcode", None)
         if sqlstate == "0A000":
             return True
         cur = cur.__cause__ or cur.__context__
@@ -91,9 +89,7 @@ async def test_update_on_ts_observation_rejected(
         )
     )
     sid = await session.scalar(
-        text(
-            "SELECT series_id FROM ts.series_catalog WHERE series_code='trig_obs'"
-        )
+        text("SELECT series_id FROM ts.series_catalog WHERE series_code='trig_obs'")
     )
     await session.execute(
         text(
@@ -122,9 +118,7 @@ async def test_update_on_ts_observation_rejected(
         text("DELETE FROM ts.observation WHERE series_id = :sid"),
         {"sid": sid},
     )
-    await session.execute(
-        text("DELETE FROM ts.series_catalog WHERE series_code='trig_obs'")
-    )
+    await session.execute(text("DELETE FROM ts.series_catalog WHERE series_code='trig_obs'"))
     await session.commit()
 
 
@@ -163,17 +157,12 @@ async def test_update_on_ts_canonical_financial_rejected(
 
     with pytest.raises(DBAPIError) as ei:
         await session.execute(
-            text(
-                "UPDATE ts.canonical_financial SET value = 99.0 "
-                "WHERE entity_id = :eid"
-            ),
+            text("UPDATE ts.canonical_financial SET value = 99.0 WHERE entity_id = :eid"),
             {"eid": eid},
         )
         await session.commit()
     await session.rollback()
-    assert _is_feature_not_supported(ei.value), (
-        f"expected SQLSTATE 0A000, got {ei.value!r}"
-    )
+    assert _is_feature_not_supported(ei.value), f"expected SQLSTATE 0A000, got {ei.value!r}"
 
     # Cleanup
     await session.execute(
@@ -229,9 +218,7 @@ async def test_update_on_ref_identifier_rejected(
         )
         await session.commit()
     await session.rollback()
-    assert _is_feature_not_supported(ei.value), (
-        f"expected SQLSTATE 0A000, got {ei.value!r}"
-    )
+    assert _is_feature_not_supported(ei.value), f"expected SQLSTATE 0A000, got {ei.value!r}"
 
     await session.execute(
         text("DELETE FROM ref.identifier WHERE entity_id = :eid"),
@@ -280,8 +267,7 @@ async def test_every_class_a_table_has_no_update_trigger(
             },
         )
         assert int(present or 0) >= 1, (
-            f"missing trigger {r.table_name}_no_update on "
-            f"{r.schema_name}.{r.table_name}"
+            f"missing trigger {r.table_name}_no_update on {r.schema_name}.{r.table_name}"
         )
 
 
@@ -308,9 +294,7 @@ async def test_duplicate_observation_pk_blocked(
         )
     )
     sid = await session.scalar(
-        text(
-            "SELECT series_id FROM ts.series_catalog WHERE series_code='trig_dup'"
-        )
+        text("SELECT series_id FROM ts.series_catalog WHERE series_code='trig_dup'")
     )
     await session.execute(
         text(
@@ -341,7 +325,5 @@ async def test_duplicate_observation_pk_blocked(
         text("DELETE FROM ts.observation WHERE series_id = :sid"),
         {"sid": sid},
     )
-    await session.execute(
-        text("DELETE FROM ts.series_catalog WHERE series_code='trig_dup'")
-    )
+    await session.execute(text("DELETE FROM ts.series_catalog WHERE series_code='trig_dup'"))
     await session.commit()

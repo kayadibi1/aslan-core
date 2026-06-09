@@ -72,7 +72,7 @@ def upgrade() -> None:
              true,
              'Discovered Phase 2g; same shape as ts.canonical_financial.')
         ON CONFLICT (schema_name, table_name) DO NOTHING
-        """
+        """  # noqa: S608
     )
 
     op.execute("""

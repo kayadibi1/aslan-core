@@ -78,9 +78,7 @@ def app(pg_dsn: str) -> Iterator[FastAPI]:
         finally:
             await a.state.engine.dispose()
 
-    a = FastAPI(
-        title="Aslan Research API (test-extended)", version="test", lifespan=_lifespan
-    )
+    a = FastAPI(title="Aslan Research API (test-extended)", version="test", lifespan=_lifespan)
     a.include_router(research_router)
     yield a
 
@@ -167,9 +165,7 @@ def test_naive_as_of_rejected_for_events() -> None:
 # ---------------------------------------------------------------------
 
 
-def test_master_flag_off_returns_503_on_entities(
-    client: TestClient, db_dsn: str
-) -> None:
+def test_master_flag_off_returns_503_on_entities(client: TestClient, db_dsn: str) -> None:
     """TC-033 / TC-073 — master flag off → 503 on /entities."""
     _set_master_flag(db_dsn, value=False)
 
@@ -180,9 +176,7 @@ def test_master_flag_off_returns_503_on_entities(
     assert detail.get("code") == "FEATURE_DISABLED"
 
 
-def test_master_flag_off_returns_503_on_quality_scores(
-    client: TestClient, db_dsn: str
-) -> None:
+def test_master_flag_off_returns_503_on_quality_scores(client: TestClient, db_dsn: str) -> None:
     """TC-033 / TC-073 — master flag off → 503 on /quality-scores."""
     _set_master_flag(db_dsn, value=False)
 
@@ -198,9 +192,7 @@ def test_master_flag_off_returns_503_on_quality_scores(
 # ---------------------------------------------------------------------
 
 
-def test_missing_api_key_returns_401_on_filings(
-    client: TestClient, db_dsn: str
-) -> None:
+def test_missing_api_key_returns_401_on_filings(client: TestClient, db_dsn: str) -> None:
     """TC-027 / TC-031 — master on, no API key → 401 on /filings."""
     _set_master_flag(db_dsn, value=True)
     try:
@@ -254,9 +246,7 @@ def _seed_api_key(dsn: str, *, pii_unredacted: bool = False) -> tuple[str, str]:
     return key_id, secret
 
 
-def test_get_entity_nonexistent_returns_404(
-    client: TestClient, db_dsn: str
-) -> None:
+def test_get_entity_nonexistent_returns_404(client: TestClient, db_dsn: str) -> None:
     """TC-003 — /entities/{nonexistent_uuid} → 404."""
     _set_master_flag(db_dsn, value=True)
     try:
@@ -272,9 +262,7 @@ def test_get_entity_nonexistent_returns_404(
         _set_master_flag(db_dsn, value=False)
 
 
-def test_get_disclosure_nonexistent_returns_404(
-    client: TestClient, db_dsn: str
-) -> None:
+def test_get_disclosure_nonexistent_returns_404(client: TestClient, db_dsn: str) -> None:
     """TC-003 — /disclosures/{nonexistent_id} → 404."""
     _set_master_flag(db_dsn, value=True)
     try:
@@ -356,9 +344,7 @@ def test_redact_event_payload_unredacted_for_pii_unredacted_principal() -> None:
 # ---------------------------------------------------------------------
 
 
-def test_disclosures_rows_carry_as_of_provenance(
-    client: TestClient, db_dsn: str
-) -> None:
+def test_disclosures_rows_carry_as_of_provenance(client: TestClient, db_dsn: str) -> None:
     """TC-008 (round-6 revision) — after migration 0051's SCD-4
     upgrade, ``/v1/research/disclosures`` no longer attaches a
     ``PRE_BITEMPORAL_TABLE`` envelope warning (the table IS bitemporal).
@@ -409,9 +395,7 @@ def test_disclosures_rows_carry_as_of_provenance(
         _set_master_flag(db_dsn, value=False)
 
 
-def test_filings_envelope_carries_pre_bitemporal_warning(
-    client: TestClient, db_dsn: str
-) -> None:
+def test_filings_envelope_carries_pre_bitemporal_warning(client: TestClient, db_dsn: str) -> None:
     """TC-008b — the PRE_BITEMPORAL_TABLE warning moved from
     /disclosures (now bitemporal via 0051) to /filings (Class F;
     no ``doc.filing_at`` PIT function in v1; v1.0.0-beta follow-up).
@@ -443,9 +427,7 @@ def test_filings_envelope_carries_pre_bitemporal_warning(
 # ---------------------------------------------------------------------
 
 
-def test_quality_scores_envelope_shape_empty_result(
-    client: TestClient, db_dsn: str
-) -> None:
+def test_quality_scores_envelope_shape_empty_result(client: TestClient, db_dsn: str) -> None:
     """TC-001 / TC-073 — /quality-scores envelope has ``data`` list +
     ``metadata.as_of_resolved`` even when the result set is empty.
     """

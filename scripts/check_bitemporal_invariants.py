@@ -187,9 +187,7 @@ INVARIANTS: tuple[Invariant, ...] = (
     ),
     Invariant(
         name="bitemporal_table_registry_present",
-        description=(
-            "After Phase 2, aslan_core.bitemporal_table_registry must exist."
-        ),
+        description=("After Phase 2, aslan_core.bitemporal_table_registry must exist."),
         sql="""
             SELECT
                 CASE WHEN EXISTS (
@@ -282,9 +280,7 @@ def run_one(conn: psycopg.Connection, inv: Invariant) -> tuple[bool, int, str]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Bitemporal invariants checker (H2)."
-    )
+    parser = argparse.ArgumentParser(description="Bitemporal invariants checker (H2).")
     parser.add_argument(
         "--db",
         default=None,
@@ -366,11 +362,7 @@ def main() -> int:
         return 0
     except psycopg.OperationalError as e:
         log.exception("invariants_check_connect_failed", dsn_redacted=_redact_dsn(dsn))
-        print(
-            json.dumps(
-                {"status": "error", "reason": f"connect-failed: {e!r}"}
-            )
-        )
+        print(json.dumps({"status": "error", "reason": f"connect-failed: {e!r}"}))
         return 2
 
 

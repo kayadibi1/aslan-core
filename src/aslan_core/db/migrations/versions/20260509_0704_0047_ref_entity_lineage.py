@@ -54,9 +54,7 @@ def upgrade() -> None:
     op.execute(
         "CREATE INDEX entity_lineage_into_idx ON ref.entity_lineage (into_entity_id, event_at)"
     )
-    op.execute(
-        "CREATE INDEX entity_lineage_as_of_idx ON ref.entity_lineage (as_of)"
-    )
+    op.execute("CREATE INDEX entity_lineage_as_of_idx ON ref.entity_lineage (as_of)")
 
     op.execute("""
         DROP TRIGGER IF EXISTS entity_lineage_no_update ON ref.entity_lineage

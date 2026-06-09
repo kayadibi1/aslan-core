@@ -1,5 +1,7 @@
 # aslan-core
 
+[![ci](https://github.com/kayadibi1/aslan-core/actions/workflows/bitemporal-api-ci.yml/badge.svg)](https://github.com/kayadibi1/aslan-core/actions/workflows/bitemporal-api-ci.yml)
+
 The data-plane core of **Aslan Terminal**, a bitemporal financial-data platform for the Turkish market (BIST equities and KAP disclosures). This package owns the schemas, the database engine, the ingestion plumbing, entity resolution, the LLM-extraction provenance layer, the audit subsystem, and the read-only operator dashboard that the ingestion services build on.
 
 ![Architecture overview](docs/img/architecture.png)

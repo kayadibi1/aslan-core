@@ -125,10 +125,7 @@ def _parse_as_of_range(raw: str | None) -> tuple[datetime, datetime] | None:
         raise HTTPException(
             status_code=400,
             detail={
-                "type": (
-                    "https://docs.aslanterminal.com/errors/"
-                    "BITEMPORAL_INTERVAL_INVALID"
-                ),
+                "type": ("https://docs.aslanterminal.com/errors/BITEMPORAL_INTERVAL_INVALID"),
                 "title": "as_of_range must be the canonical half-open form [T1,T2)",
                 "code": "BITEMPORAL_INTERVAL_INVALID",
                 "extensions": {"received_value": raw},
@@ -141,10 +138,7 @@ def _parse_as_of_range(raw: str | None) -> tuple[datetime, datetime] | None:
         raise HTTPException(
             status_code=400,
             detail={
-                "type": (
-                    "https://docs.aslanterminal.com/errors/"
-                    "BITEMPORAL_INTERVAL_INVALID"
-                ),
+                "type": ("https://docs.aslanterminal.com/errors/BITEMPORAL_INTERVAL_INVALID"),
                 "title": "as_of_range missing comma separator",
                 "code": "BITEMPORAL_INTERVAL_INVALID",
                 "extensions": {"received_value": raw},
@@ -158,10 +152,7 @@ def _parse_as_of_range(raw: str | None) -> tuple[datetime, datetime] | None:
         raise HTTPException(
             status_code=400,
             detail={
-                "type": (
-                    "https://docs.aslanterminal.com/errors/"
-                    "BITEMPORAL_INTERVAL_INVALID"
-                ),
+                "type": ("https://docs.aslanterminal.com/errors/BITEMPORAL_INTERVAL_INVALID"),
                 "title": "as_of_range endpoints not ISO-8601",
                 "code": "BITEMPORAL_INTERVAL_INVALID",
                 "extensions": {"received_value": raw},
@@ -171,10 +162,7 @@ def _parse_as_of_range(raw: str | None) -> tuple[datetime, datetime] | None:
         raise HTTPException(
             status_code=400,
             detail={
-                "type": (
-                    "https://docs.aslanterminal.com/errors/"
-                    "BITEMPORAL_INTERVAL_INVALID"
-                ),
+                "type": ("https://docs.aslanterminal.com/errors/BITEMPORAL_INTERVAL_INVALID"),
                 "title": "as_of_range endpoints must carry an explicit timezone",
                 "code": "BITEMPORAL_INTERVAL_INVALID",
                 "extensions": {"received_value": raw},
@@ -186,10 +174,7 @@ def _parse_as_of_range(raw: str | None) -> tuple[datetime, datetime] | None:
         raise HTTPException(
             status_code=400,
             detail={
-                "type": (
-                    "https://docs.aslanterminal.com/errors/"
-                    "BITEMPORAL_INTERVAL_INVALID"
-                ),
+                "type": ("https://docs.aslanterminal.com/errors/BITEMPORAL_INTERVAL_INVALID"),
                 "title": "as_of_range has T1 >= T2",
                 "code": "BITEMPORAL_INTERVAL_INVALID",
                 "extensions": {"received_value": raw},
@@ -221,16 +206,12 @@ def _enforce_query_cost(
             raise HTTPException(
                 status_code=413,
                 detail={
-                    "type": (
-                        "https://docs.aslanterminal.com/errors/QUERY_TOO_LARGE"
-                    ),
+                    "type": ("https://docs.aslanterminal.com/errors/QUERY_TOO_LARGE"),
                     "title": "as_of_range exceeds 5-year cap",
                     "code": "QUERY_TOO_LARGE",
                     "extensions": {
                         "width_seconds": int(width.total_seconds()),
-                        "max_width_seconds": int(
-                            _AS_OF_RANGE_MAX_WIDTH.total_seconds()
-                        ),
+                        "max_width_seconds": int(_AS_OF_RANGE_MAX_WIDTH.total_seconds()),
                     },
                 },
             )
@@ -238,9 +219,7 @@ def _enforce_query_cost(
         raise HTTPException(
             status_code=413,
             detail={
-                "type": (
-                    "https://docs.aslanterminal.com/errors/QUERY_TOO_LARGE"
-                ),
+                "type": ("https://docs.aslanterminal.com/errors/QUERY_TOO_LARGE"),
                 "title": f"limit exceeds hard cap of {_LIMIT_HARD_CAP}",
                 "code": "QUERY_TOO_LARGE",
                 "extensions": {"limit": limit, "max_limit": _LIMIT_HARD_CAP},
@@ -248,18 +227,13 @@ def _enforce_query_cost(
         )
 
 
-def _reject_pit_with_interval(
-    *, as_of: str | None, as_of_range: str | None
-) -> None:
+def _reject_pit_with_interval(*, as_of: str | None, as_of_range: str | None) -> None:
     """Per SCOPE.md D2: ``as_of`` and ``as_of_range`` are mutually exclusive."""
     if as_of is not None and as_of_range is not None:
         raise HTTPException(
             status_code=400,
             detail={
-                "type": (
-                    "https://docs.aslanterminal.com/errors/"
-                    "BITEMPORAL_INTERVAL_INVALID"
-                ),
+                "type": ("https://docs.aslanterminal.com/errors/BITEMPORAL_INTERVAL_INVALID"),
                 "title": "as_of and as_of_range are mutually exclusive",
                 "code": "BITEMPORAL_INTERVAL_INVALID",
             },
@@ -289,9 +263,7 @@ def _gate_interval_flag(
         raise HTTPException(
             status_code=503,
             detail={
-                "type": (
-                    "https://docs.aslanterminal.com/errors/FEATURE_DISABLED"
-                ),
+                "type": ("https://docs.aslanterminal.com/errors/FEATURE_DISABLED"),
                 "title": "Interval queries are disabled",
                 "code": "FEATURE_DISABLED",
                 "extensions": {"flag": "BITEMPORAL_API_INTERVAL_QUERIES"},
@@ -370,9 +342,7 @@ def _build_filtered_sql(
     else:
         source = pit_call if pit_call is not None else from_clause
     where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
-    return (
-        f"{select_clause} FROM {source} {where_clause} {order_by} LIMIT {limit_param}"
-    )
+    return f"{select_clause} FROM {source} {where_clause} {order_by} LIMIT {limit_param}"
 
 
 # ---------------------------------------------------------------------
@@ -479,9 +449,7 @@ async def verify_moat_2(
 # ---------------------------------------------------------------------
 
 
-async def _resolve_series_code(
-    session: AsyncSession, code: str
-) -> int | None:
+async def _resolve_series_code(session: AsyncSession, code: str) -> int | None:
     """Resolve a documented string ``series_code`` to its numeric ``series_id``.
 
     Per OPENAPI.yaml ``Observation.series_id`` ('BIST.GARAN.close') and
@@ -490,10 +458,7 @@ async def _resolve_series_code(
     """
     row = (
         await session.execute(
-            text(
-                "SELECT series_id FROM ts.series_catalog "
-                "WHERE series_code = :code"
-            ),
+            text("SELECT series_id FROM ts.series_catalog WHERE series_code = :code"),
             {"code": code},
         )
     ).first()
@@ -549,10 +514,7 @@ async def observations(
             raise HTTPException(
                 status_code=400,
                 detail={
-                    "type": (
-                        "https://docs.aslanterminal.com/errors/"
-                        "BITEMPORAL_INTERVAL_INVALID"
-                    ),
+                    "type": ("https://docs.aslanterminal.com/errors/BITEMPORAL_INTERVAL_INVALID"),
                     "title": "unknown series code",
                     "code": "BITEMPORAL_INTERVAL_INVALID",
                     "extensions": {"series_code": series_code},
@@ -579,11 +541,7 @@ async def observations(
 
     filters_for_cursor: dict[str, Any] = {
         "as_of": resolved.isoformat() if interval is None else None,
-        "as_of_range": (
-            [interval[0].isoformat(), interval[1].isoformat()]
-            if interval
-            else None
-        ),
+        "as_of_range": ([interval[0].isoformat(), interval[1].isoformat()] if interval else None),
         "series_id": series_id,
         "ts_from": ts_from.isoformat() if ts_from else None,
         "ts_to": ts_to.isoformat() if ts_to else None,
@@ -622,12 +580,8 @@ async def observations(
     if len(data) == limit and data:
         last = data[-1]
         anchor = {"series_id": last["series_id"], "ts": last["ts"]}
-        next_cursor = encode_cursor(
-            as_of=resolved, anchor=anchor, filters=filters_for_cursor
-        )
-    pagination = Pagination(
-        next_cursor=next_cursor, has_more=(next_cursor is not None)
-    )
+        next_cursor = encode_cursor(as_of=resolved, anchor=anchor, filters=filters_for_cursor)
+    pagination = Pagination(next_cursor=next_cursor, has_more=(next_cursor is not None))
 
     env = build_envelope(
         data=data,
@@ -779,11 +733,7 @@ async def financials_canonical(
 
     filters_for_cursor: dict[str, Any] = {
         "as_of": resolved.isoformat() if interval is None else None,
-        "as_of_range": (
-            [interval[0].isoformat(), interval[1].isoformat()]
-            if interval
-            else None
-        ),
+        "as_of_range": ([interval[0].isoformat(), interval[1].isoformat()] if interval else None),
         "entity_id": str(entity_id),
         "restatement_basis": restatement_basis,
     }
@@ -846,9 +796,7 @@ async def financials_canonical(
                     "Both as_reported and cpi_normalized bases are returned by "
                     "default; pass restatement_basis to filter."
                 ),
-                rows_affected=sum(
-                    1 for d in data if d["restatement_basis"] == "cpi_normalized"
-                ),
+                rows_affected=sum(1 for d in data if d["restatement_basis"] == "cpi_normalized"),
             )
         )
 
@@ -860,12 +808,8 @@ async def financials_canonical(
             "canonical_code": last["canonical_code"],
             "restatement_basis": last["restatement_basis"],
         }
-        next_cursor = encode_cursor(
-            as_of=resolved, anchor=anchor, filters=filters_for_cursor
-        )
-    pagination = Pagination(
-        next_cursor=next_cursor, has_more=(next_cursor is not None)
-    )
+        next_cursor = encode_cursor(as_of=resolved, anchor=anchor, filters=filters_for_cursor)
+    pagination = Pagination(next_cursor=next_cursor, has_more=(next_cursor is not None))
 
     env = build_envelope(
         data=data,
@@ -889,14 +833,10 @@ async def financials_canonical(
 # ---------------------------------------------------------------------
 
 
-_PII_KEYS = frozenset(
-    {"counterparty_name", "counterparty_address", "signatory_name"}
-)
+_PII_KEYS = frozenset({"counterparty_name", "counterparty_address", "signatory_name"})
 
 
-def _redact_event_payload(
-    payload: Any, principal: ApiKeyPrincipal | None
-) -> Any:
+def _redact_event_payload(payload: Any, principal: ApiKeyPrincipal | None) -> Any:
     """Redact PII keys in an ``agg.filing_event.payload`` JSONB blob.
 
     Per SCOPE.md D30: counterparty / signatory fields are redacted with
@@ -1011,23 +951,15 @@ async def financials_line_items(
 
     filters_for_cursor: dict[str, Any] = {
         "as_of": resolved.isoformat() if interval is None else None,
-        "as_of_range": (
-            [interval[0].isoformat(), interval[1].isoformat()]
-            if interval
-            else None
-        ),
+        "as_of_range": ([interval[0].isoformat(), interval[1].isoformat()] if interval else None),
         "entity_id": str(entity_id) if entity_id else None,
         "filing_id": str(filing_id) if filing_id else None,
         "statement_type": statement_type,
         "line_code": line_code,
         "consolidation": consolidation,
         "period_end": period_end.isoformat() if period_end else None,
-        "period_end_from": (
-            period_end_from.isoformat() if period_end_from else None
-        ),
-        "period_end_to": (
-            period_end_to.isoformat() if period_end_to else None
-        ),
+        "period_end_from": (period_end_from.isoformat() if period_end_from else None),
+        "period_end_to": (period_end_to.isoformat() if period_end_to else None),
         "restatement_basis": restatement_basis,
     }
     if cursor is not None:
@@ -1073,9 +1005,7 @@ async def financials_line_items(
             "accounting_standard": r.accounting_standard,
             "restatement_basis": r.restatement_basis,
             "as_of": r.as_of.isoformat() if r.as_of else None,
-            "ingestion_run_id": (
-                str(r.ingestion_run_id) if r.ingestion_run_id else None
-            ),
+            "ingestion_run_id": (str(r.ingestion_run_id) if r.ingestion_run_id else None),
             "measuring_unit_date": (
                 r.measuring_unit_date.isoformat() if r.measuring_unit_date else None
             ),
@@ -1093,12 +1023,8 @@ async def financials_line_items(
             "line_code": last["line_code"],
             "restatement_basis": last["restatement_basis"],
         }
-        next_cursor = encode_cursor(
-            as_of=resolved, anchor=anchor, filters=filters_for_cursor
-        )
-    pagination = Pagination(
-        next_cursor=next_cursor, has_more=(next_cursor is not None)
-    )
+        next_cursor = encode_cursor(as_of=resolved, anchor=anchor, filters=filters_for_cursor)
+    pagination = Pagination(next_cursor=next_cursor, has_more=(next_cursor is not None))
 
     env = build_envelope(
         data=data,
@@ -1163,11 +1089,7 @@ async def entities(
 
     filters_for_cursor: dict[str, Any] = {
         "as_of": resolved.isoformat() if interval is None else None,
-        "as_of_range": (
-            [interval[0].isoformat(), interval[1].isoformat()]
-            if interval
-            else None
-        ),
+        "as_of_range": ([interval[0].isoformat(), interval[1].isoformat()] if interval else None),
         "kind": kind,
     }
     if cursor is not None:
@@ -1226,9 +1148,7 @@ async def entities(
         split_from: str | None = None
         for le in lineage_rows:
             if le.event_kind == "split" and le.into_entity_id == r.entity_id:
-                split_from = (
-                    str(le.from_entity_id) if le.from_entity_id else None
-                )
+                split_from = str(le.from_entity_id) if le.from_entity_id else None
                 break
         data.append(
             {
@@ -1242,15 +1162,9 @@ async def entities(
                 "lineage_events": [
                     {
                         "event_kind": le.event_kind,
-                        "from": (
-                            str(le.from_entity_id) if le.from_entity_id else None
-                        ),
-                        "into": (
-                            str(le.into_entity_id) if le.into_entity_id else None
-                        ),
-                        "event_at": (
-                            le.event_at.isoformat() if le.event_at else None
-                        ),
+                        "from": (str(le.from_entity_id) if le.from_entity_id else None),
+                        "into": (str(le.into_entity_id) if le.into_entity_id else None),
+                        "event_at": (le.event_at.isoformat() if le.event_at else None),
                         "reason": le.reason,
                     }
                     for le in lineage_rows
@@ -1263,12 +1177,8 @@ async def entities(
     if len(data) == limit and data:
         last = data[-1]
         anchor = {"entity_id": last["entity_id"]}
-        next_cursor = encode_cursor(
-            as_of=resolved, anchor=anchor, filters=filters_for_cursor
-        )
-    pagination = Pagination(
-        next_cursor=next_cursor, has_more=(next_cursor is not None)
-    )
+        next_cursor = encode_cursor(as_of=resolved, anchor=anchor, filters=filters_for_cursor)
+    pagination = Pagination(next_cursor=next_cursor, has_more=(next_cursor is not None))
 
     env = build_envelope(
         data=data,
@@ -1323,10 +1233,7 @@ async def get_entity(
         raise HTTPException(
             status_code=404,
             detail={
-                "type": (
-                    "https://docs.aslanterminal.com/errors/"
-                    "BITEMPORAL_PRE_BITEMPORAL_REGION"
-                ),
+                "type": ("https://docs.aslanterminal.com/errors/BITEMPORAL_PRE_BITEMPORAL_REGION"),
                 "title": "Entity not found at this as_of",
                 "code": "BITEMPORAL_PRE_BITEMPORAL_REGION",
             },
@@ -1471,14 +1378,8 @@ async def disclosures(
         raise HTTPException(
             status_code=400,
             detail={
-                "type": (
-                    "https://docs.aslanterminal.com/errors/"
-                    "BITEMPORAL_INTERVAL_INVALID"
-                ),
-                "title": (
-                    "include_pre_bitemporal=true requires PIT mode "
-                    "(no as_of_range)"
-                ),
+                "type": ("https://docs.aslanterminal.com/errors/BITEMPORAL_INTERVAL_INVALID"),
+                "title": ("include_pre_bitemporal=true requires PIT mode (no as_of_range)"),
                 "code": "BITEMPORAL_INTERVAL_INVALID",
             },
         )
@@ -1495,12 +1396,8 @@ async def disclosures(
     # name takes precedence when both old (deprecated) and new aliases
     # are passed. Old aliases stay accepted to avoid breaking existing
     # clients; D24 deprecation header is a v1.0.0-beta follow-up.
-    effective_published_from = (
-        published_from if published_from is not None else published_after
-    )
-    effective_published_to = (
-        published_to if published_to is not None else published_before
-    )
+    effective_published_from = published_from if published_from is not None else published_after
+    effective_published_to = published_to if published_to is not None else published_before
 
     where_parts: list[str] = []
     params: dict[str, Any] = {"limit": limit}
@@ -1527,24 +1424,14 @@ async def disclosures(
 
     filters_for_cursor: dict[str, Any] = {
         "as_of": resolved.isoformat() if interval is None else None,
-        "as_of_range": (
-            [interval[0].isoformat(), interval[1].isoformat()]
-            if interval
-            else None
-        ),
+        "as_of_range": ([interval[0].isoformat(), interval[1].isoformat()] if interval else None),
         "entity_id": str(entity_id) if entity_id else None,
         "kap_company_id": kap_company_id,
         "form_type": form_type,
         "published_from": (
-            effective_published_from.isoformat()
-            if effective_published_from
-            else None
+            effective_published_from.isoformat() if effective_published_from else None
         ),
-        "published_to": (
-            effective_published_to.isoformat()
-            if effective_published_to
-            else None
-        ),
+        "published_to": (effective_published_to.isoformat() if effective_published_to else None),
         "include_pre_bitemporal": include_pre_bitemporal,
     }
     if cursor is not None:
@@ -1608,35 +1495,21 @@ async def disclosures(
     rows = await session.execute(text(sql), params)
     data = [
         {
-            "disclosure_id": (
-                str(r.disclosure_id) if r.disclosure_id else None
-            ),
+            "disclosure_id": (str(r.disclosure_id) if r.disclosure_id else None),
             "kap_company_id": r.kap_id,
             "entity_id": str(r.entity_id) if r.entity_id else None,
             "form_type": r.category_code,
             "title": r.title,
             "category_code": r.category_code,
             "subcategory_code": r.subcategory_code,
-            "published_at": (
-                r.published_at.isoformat() if r.published_at else None
-            ),
-            "is_amendment": (
-                bool(r.is_amendment) if r.is_amendment is not None else None
-            ),
-            "body_fetched": (
-                bool(r.body_fetched) if r.body_fetched is not None else None
-            ),
-            "body_fetched_at": (
-                r.body_fetched_at.isoformat() if r.body_fetched_at else None
-            ),
-            "republished_as": (
-                str(r.parent_disclosure_id) if r.parent_disclosure_id else None
-            ),
+            "published_at": (r.published_at.isoformat() if r.published_at else None),
+            "is_amendment": (bool(r.is_amendment) if r.is_amendment is not None else None),
+            "body_fetched": (bool(r.body_fetched) if r.body_fetched is not None else None),
+            "body_fetched_at": (r.body_fetched_at.isoformat() if r.body_fetched_at else None),
+            "republished_as": (str(r.parent_disclosure_id) if r.parent_disclosure_id else None),
             "as_of": r.as_of.isoformat() if r.as_of else None,
             "as_of_provenance": r.as_of_provenance,
-            "pre_bitemporal": (
-                r.as_of_provenance == "pre_bitemporal_unknown"
-            ),
+            "pre_bitemporal": (r.as_of_provenance == "pre_bitemporal_unknown"),
             "event_kind": r.event_kind,
         }
         for r in rows
@@ -1650,12 +1523,8 @@ async def disclosures(
             "published_at": last["published_at"],
             "disclosure_id": last["disclosure_id"],
         }
-        next_cursor = encode_cursor(
-            as_of=resolved, anchor=anchor, filters=filters_for_cursor
-        )
-    pagination = Pagination(
-        next_cursor=next_cursor, has_more=(next_cursor is not None)
-    )
+        next_cursor = encode_cursor(as_of=resolved, anchor=anchor, filters=filters_for_cursor)
+    pagination = Pagination(next_cursor=next_cursor, has_more=(next_cursor is not None))
 
     env = build_envelope(
         data=data,
@@ -1748,10 +1617,7 @@ async def get_disclosure(
         raise HTTPException(
             status_code=404,
             detail={
-                "type": (
-                    "https://docs.aslanterminal.com/errors/"
-                    "BITEMPORAL_PRE_BITEMPORAL_REGION"
-                ),
+                "type": ("https://docs.aslanterminal.com/errors/BITEMPORAL_PRE_BITEMPORAL_REGION"),
                 "title": "Disclosure not found",
                 "code": "BITEMPORAL_PRE_BITEMPORAL_REGION",
             },
@@ -1765,21 +1631,11 @@ async def get_disclosure(
         "title": row.title,
         "category_code": row.category_code,
         "subcategory_code": row.subcategory_code,
-        "published_at": (
-            row.published_at.isoformat() if row.published_at else None
-        ),
-        "is_amendment": (
-            bool(row.is_amendment) if row.is_amendment is not None else None
-        ),
-        "body_fetched": (
-            bool(row.body_fetched) if row.body_fetched is not None else None
-        ),
-        "body_fetched_at": (
-            row.body_fetched_at.isoformat() if row.body_fetched_at else None
-        ),
-        "republished_as": (
-            str(row.parent_disclosure_id) if row.parent_disclosure_id else None
-        ),
+        "published_at": (row.published_at.isoformat() if row.published_at else None),
+        "is_amendment": (bool(row.is_amendment) if row.is_amendment is not None else None),
+        "body_fetched": (bool(row.body_fetched) if row.body_fetched is not None else None),
+        "body_fetched_at": (row.body_fetched_at.isoformat() if row.body_fetched_at else None),
+        "republished_as": (str(row.parent_disclosure_id) if row.parent_disclosure_id else None),
         "as_of": row.as_of.isoformat() if row.as_of else None,
         "as_of_provenance": row.as_of_provenance,
         "pre_bitemporal": row.as_of_provenance == "pre_bitemporal_unknown",
@@ -1863,9 +1719,7 @@ async def filings(
     # parameter names; the legacy ``received_*`` names stay as aliases.
     # ``doc.filing`` does not store a "received_at" column — the closest
     # documented timestamp is ``published_at``, so both names map to it.
-    effective_filed_from = (
-        filed_from if filed_from is not None else received_after
-    )
+    effective_filed_from = filed_from if filed_from is not None else received_after
     effective_filed_to = filed_to if filed_to is not None else received_before
 
     where_parts: list[str] = []
@@ -1887,19 +1741,11 @@ async def filings(
 
     filters_for_cursor: dict[str, Any] = {
         "as_of": resolved.isoformat() if interval is None else None,
-        "as_of_range": (
-            [interval[0].isoformat(), interval[1].isoformat()]
-            if interval
-            else None
-        ),
+        "as_of_range": ([interval[0].isoformat(), interval[1].isoformat()] if interval else None),
         "entity_id": str(entity_id) if entity_id else None,
         "source_kind": source_kind,
-        "filed_from": (
-            effective_filed_from.isoformat() if effective_filed_from else None
-        ),
-        "filed_to": (
-            effective_filed_to.isoformat() if effective_filed_to else None
-        ),
+        "filed_from": (effective_filed_from.isoformat() if effective_filed_from else None),
+        "filed_to": (effective_filed_to.isoformat() if effective_filed_to else None),
     }
     if cursor is not None:
         decode_cursor(cursor, filters_for_cursor)
@@ -1939,12 +1785,8 @@ async def filings(
             "published_at": last.get("published_at"),
             "filing_id": last.get("filing_id"),
         }
-        next_cursor = encode_cursor(
-            as_of=resolved, anchor=anchor, filters=filters_for_cursor
-        )
-    pagination = Pagination(
-        next_cursor=next_cursor, has_more=(next_cursor is not None)
-    )
+        next_cursor = encode_cursor(as_of=resolved, anchor=anchor, filters=filters_for_cursor)
+    pagination = Pagination(next_cursor=next_cursor, has_more=(next_cursor is not None))
 
     env = build_envelope(
         data=data,
@@ -2028,12 +1870,8 @@ async def events(
 
     # Per pass-2 finding 6 / OpenAPI: prefer the documented OpenAPI
     # parameter names; legacy ``event_*`` aliases keep working.
-    effective_occurred_from = (
-        occurred_from if occurred_from is not None else event_after
-    )
-    effective_occurred_to = (
-        occurred_to if occurred_to is not None else event_before
-    )
+    effective_occurred_from = occurred_from if occurred_from is not None else event_after
+    effective_occurred_to = occurred_to if occurred_to is not None else event_before
 
     where_parts: list[str] = []
     params: dict[str, Any] = {"limit": limit}
@@ -2060,24 +1898,12 @@ async def events(
 
     filters_for_cursor: dict[str, Any] = {
         "as_of": resolved.isoformat() if interval is None else None,
-        "as_of_range": (
-            [interval[0].isoformat(), interval[1].isoformat()]
-            if interval
-            else None
-        ),
+        "as_of_range": ([interval[0].isoformat(), interval[1].isoformat()] if interval else None),
         "entity_id": str(entity_id) if entity_id else None,
         "filing_id": str(filing_id) if filing_id else None,
         "event_type": event_type,
-        "occurred_from": (
-            effective_occurred_from.isoformat()
-            if effective_occurred_from
-            else None
-        ),
-        "occurred_to": (
-            effective_occurred_to.isoformat()
-            if effective_occurred_to
-            else None
-        ),
+        "occurred_from": (effective_occurred_from.isoformat() if effective_occurred_from else None),
+        "occurred_to": (effective_occurred_to.isoformat() if effective_occurred_to else None),
     }
     if cursor is not None:
         decode_cursor(cursor, filters_for_cursor)
@@ -2107,9 +1933,7 @@ async def events(
     data = [
         {
             # OpenAPI surface name -> physical column.
-            "event_id": (
-                str(r.filing_event_id) if r.filing_event_id else None
-            ),
+            "event_id": (str(r.filing_event_id) if r.filing_event_id else None),
             "filing_id": str(r.filing_id) if r.filing_id else None,
             "source_id": r.source_id,
             "source_filing_ref": r.source_filing_ref,
@@ -2120,20 +1944,14 @@ async def events(
                 str(r.counterparty_entity_id) if r.counterparty_entity_id else None
             ),
             "occurred_at": r.event_ts.isoformat() if r.event_ts else None,
-            "effective_dt": (
-                r.effective_dt.isoformat() if r.effective_dt else None
-            ),
+            "effective_dt": (r.effective_dt.isoformat() if r.effective_dt else None),
             "as_of": r.as_of.isoformat() if r.as_of else None,
             "attributes": _redact_event_payload(r.payload, principal),
             "primary_confidence": (
-                float(r.primary_confidence)
-                if r.primary_confidence is not None
-                else None
+                float(r.primary_confidence) if r.primary_confidence is not None else None
             ),
             "final_confidence": (
-                float(r.final_confidence)
-                if r.final_confidence is not None
-                else None
+                float(r.final_confidence) if r.final_confidence is not None else None
             ),
             "primary_model_version": r.primary_model_version,
             "primary_prompt_version": r.primary_prompt_version,
@@ -2163,12 +1981,8 @@ async def events(
             "filing_id": last["filing_id"],
             "event_seq": last["event_seq"],
         }
-        next_cursor = encode_cursor(
-            as_of=resolved, anchor=anchor, filters=filters_for_cursor
-        )
-    pagination = Pagination(
-        next_cursor=next_cursor, has_more=(next_cursor is not None)
-    )
+        next_cursor = encode_cursor(as_of=resolved, anchor=anchor, filters=filters_for_cursor)
+    pagination = Pagination(next_cursor=next_cursor, has_more=(next_cursor is not None))
 
     env = build_envelope(
         data=data,
@@ -2245,18 +2059,10 @@ async def quality_scores(
 
     filters_for_cursor: dict[str, Any] = {
         "as_of": resolved.isoformat() if interval is None else None,
-        "as_of_range": (
-            [interval[0].isoformat(), interval[1].isoformat()]
-            if interval
-            else None
-        ),
+        "as_of_range": ([interval[0].isoformat(), interval[1].isoformat()] if interval else None),
         "entity_id": str(entity_id) if entity_id else None,
-        "period_end_from": (
-            period_end_from.isoformat() if period_end_from else None
-        ),
-        "period_end_to": (
-            period_end_to.isoformat() if period_end_to else None
-        ),
+        "period_end_from": (period_end_from.isoformat() if period_end_from else None),
+        "period_end_to": (period_end_to.isoformat() if period_end_to else None),
         "restatement_basis": restatement_basis,
     }
     if cursor is not None:
@@ -2292,9 +2098,7 @@ async def quality_scores(
                 record[col] = str(val)
             else:
                 record[col] = (
-                    float(val)
-                    if hasattr(val, "is_finite") and not isinstance(val, bool)
-                    else val
+                    float(val) if hasattr(val, "is_finite") and not isinstance(val, bool) else val
                 )
         data.append(record)
     ctx.rows_returned = len(data)
@@ -2306,12 +2110,8 @@ async def quality_scores(
             "period_end": last.get("period_end"),
             "entity_id": last.get("entity_id"),
         }
-        next_cursor = encode_cursor(
-            as_of=resolved, anchor=anchor, filters=filters_for_cursor
-        )
-    pagination = Pagination(
-        next_cursor=next_cursor, has_more=(next_cursor is not None)
-    )
+        next_cursor = encode_cursor(as_of=resolved, anchor=anchor, filters=filters_for_cursor)
+    pagination = Pagination(next_cursor=next_cursor, has_more=(next_cursor is not None))
 
     env = build_envelope(
         data=data,

@@ -147,7 +147,7 @@ def upgrade() -> None:
                     $sql$;
                 END IF;
             END $$;
-            """
+            """  # noqa: S608
         )
 
         entity_array = "ARRAY[" + ", ".join(f"'{c}'" for c in entity_cols) + "]::text[]"
@@ -162,7 +162,7 @@ def upgrade() -> None:
                  'Phase 2 enrolment; PIT function lands in 0049; ' ||
                  'exposed_in_api flips on Phase 3 deploy.')
             ON CONFLICT (schema_name, table_name) DO NOTHING
-            """
+            """  # noqa: S608
         )
 
 
@@ -184,11 +184,11 @@ def downgrade() -> None:
                     EXECUTE 'DROP TRIGGER {table}_no_update ON {schema}.{table}';
                 END IF;
             END $$;
-            """
+            """  # noqa: S608
         )
         op.execute(
             f"""
             DELETE FROM aslan_core.bitemporal_table_registry
             WHERE schema_name = '{schema}' AND table_name = '{table}'
-            """
+            """  # noqa: S608
         )

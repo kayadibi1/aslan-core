@@ -95,7 +95,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
-      - run: uv sync --all-groups
+      - run: uv sync --all-groups --all-extras
       - name: Pytest collect (research tests, integration marker)
         # We can't run integration tests in CI (no Postgres), but we
         # collect them so import-level breakage on test files is caught.

@@ -25,6 +25,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 from sqlalchemy import text
@@ -44,14 +45,12 @@ def _psycopg_dsn(asyncpg_dsn: str) -> str:
     return asyncpg_dsn
 
 
-def _run_invariants(dsn: str) -> tuple[int, dict]:
+def _run_invariants(dsn: str) -> tuple[int, dict[str, Any]]:
     """Invoke the invariants script as a subprocess; parse JSON report."""
     src_path = str(REPO_ROOT / "src")
     env = os.environ.copy()
     existing_pp = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = (
-        f"{src_path}{os.pathsep}{existing_pp}" if existing_pp else src_path
-    )
+    env["PYTHONPATH"] = f"{src_path}{os.pathsep}{existing_pp}" if existing_pp else src_path
     proc = subprocess.run(  # noqa: S603 — fixed argv from this test module
         [sys.executable, str(INVARIANTS_SCRIPT), "--dsn", dsn, "--json"],
         capture_output=True,
@@ -67,9 +66,7 @@ def _run_invariants(dsn: str) -> tuple[int, dict]:
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_invariants_script_clean_after_migrations(
-    session: AsyncSession, pg_dsn: str
-) -> None:
+async def test_invariants_script_clean_after_migrations(session: AsyncSession, pg_dsn: str) -> None:
     """TC-061..065 — script returns exit 0 on a freshly migrated DB.
 
     Empty Class A tables trivially satisfy every count-based invariant
@@ -77,9 +74,7 @@ async def test_invariants_script_clean_after_migrations(
     trigger-presence invariants are satisfied by migrations 0043/0044.
     """
     # Sanity-check the registry has Class A rows seeded by migration 0044.
-    n = await session.scalar(
-        text("SELECT COUNT(*) FROM aslan_core.bitemporal_table_registry")
-    )
+    n = await session.scalar(text("SELECT COUNT(*) FROM aslan_core.bitemporal_table_registry"))
     assert n is not None and int(n) >= 5, (
         f"registry should have ≥5 Class A rows from migration 0044, got {n}"
     )
@@ -125,10 +120,7 @@ async def test_invariants_script_passes_with_seeded_observation(
         )
     )
     series_id = await session.scalar(
-        text(
-            "SELECT series_id FROM ts.series_catalog "
-            "WHERE series_code='inv_test_series'"
-        )
+        text("SELECT series_id FROM ts.series_catalog WHERE series_code='inv_test_series'")
     )
     await session.execute(
         text(
@@ -166,8 +158,6 @@ async def test_invariants_script_passes_with_seeded_observation(
             {"sid": series_id},
         )
         await session.execute(
-            text(
-                "DELETE FROM ts.series_catalog WHERE series_code='inv_test_series'"
-            )
+            text("DELETE FROM ts.series_catalog WHERE series_code='inv_test_series'")
         )
         await session.commit()

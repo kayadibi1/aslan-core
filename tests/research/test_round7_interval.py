@@ -79,9 +79,7 @@ def app(pg_dsn: str) -> Iterator[FastAPI]:
         finally:
             await a.state.engine.dispose()
 
-    a = FastAPI(
-        title="Aslan Research API (test-round7)", version="test", lifespan=_lifespan
-    )
+    a = FastAPI(title="Aslan Research API (test-round7)", version="test", lifespan=_lifespan)
     a.include_router(research_router)
     yield a
 
@@ -232,8 +230,7 @@ def _wipe_canonical_financial_seed(
 ) -> None:
     with psycopg.connect(dsn) as conn, conn.cursor() as cur:
         cur.execute(
-            "DELETE FROM ts.canonical_financial "
-            "WHERE entity_id = %s AND canonical_code = %s",
+            "DELETE FROM ts.canonical_financial WHERE entity_id = %s AND canonical_code = %s",
             (entity_id, canonical_code),
         )
         # Migration 0046 installs an AFTER DELETE trigger on ref.entity
@@ -260,9 +257,7 @@ def _wipe_canonical_financial_seed(
         conn.commit()
 
 
-def _seed_entity_versions(
-    dsn: str, *, entity_id: str, versions: list[tuple[str, str]]
-) -> int:
+def _seed_entity_versions(dsn: str, *, entity_id: str, versions: list[tuple[str, str]]) -> int:
     """Seed rows directly in ``ref.entity_version``.
 
     Per the round-7 brief, we INSERT directly into ``ref.entity_version``
@@ -414,9 +409,7 @@ def _seed_disclosure_versions(
     return run_id
 
 
-def _wipe_disclosure_seed(
-    dsn: str, *, disclosure_id: str, entity_id: str, run_id: int
-) -> None:
+def _wipe_disclosure_seed(dsn: str, *, disclosure_id: str, entity_id: str, run_id: int) -> None:
     with psycopg.connect(dsn) as conn, conn.cursor() as cur:
         cur.execute(
             "DELETE FROM kap.disclosures_version WHERE disclosure_id = %s",
@@ -491,9 +484,7 @@ def test_canonical_financial_interval_returns_version_chain_ascending(
         body = resp.json()
         # Filter to rows for our test canonical_code so we don't trip
         # on shared-DB pollution from other tests.
-        rows = [
-            r for r in body["data"] if r.get("canonical_code") == _TEST_CANONICAL_CODE
-        ]
+        rows = [r for r in body["data"] if r.get("canonical_code") == _TEST_CANONICAL_CODE]
         assert len(rows) == 3, f"expected 3 versions, got {len(rows)}: {rows}"
         # Ascending as_of (TC-014 core invariant).
         assert rows[0]["as_of"] < rows[1]["as_of"] < rows[2]["as_of"]
@@ -525,9 +516,7 @@ def test_canonical_financial_interval_returns_version_chain_ascending(
 # ---------------------------------------------------------------------
 
 
-def test_canonical_financial_interval_half_open_semantics(
-    client: TestClient, db_dsn: str
-) -> None:
+def test_canonical_financial_interval_half_open_semantics(client: TestClient, db_dsn: str) -> None:
     """TC-015 — ``[T1,T2)`` includes T1 and excludes T2.
 
     Two rows seeded at exact endpoints (``T1 = 2024-05-01T00:00:00Z``
@@ -559,9 +548,7 @@ def test_canonical_financial_interval_half_open_semantics(
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
-        rows = [
-            r for r in body["data"] if r.get("canonical_code") == _TEST_CANONICAL_CODE
-        ]
+        rows = [r for r in body["data"] if r.get("canonical_code") == _TEST_CANONICAL_CODE]
         assert len(rows) == 1, (
             f"expected exactly 1 row in [T1,T2) (T1 inclusive, T2 exclusive); "
             f"got {len(rows)}: {rows}"
@@ -638,9 +625,7 @@ def test_entities_interval_returns_version_chain_with_lineage(
     ]
     run_id: int | None = None
     try:
-        run_id = _seed_entity_versions(
-            db_dsn, entity_id=entity_id, versions=versions
-        )
+        run_id = _seed_entity_versions(db_dsn, entity_id=entity_id, versions=versions)
         key_id, secret = _seed_api_key(db_dsn)
         resp = client.get(
             "/v1/research/entities",
@@ -653,9 +638,7 @@ def test_entities_interval_returns_version_chain_with_lineage(
         assert resp.status_code == 200, resp.text
         body = resp.json()
         rows = [r for r in body["data"] if r.get("entity_id") == entity_id]
-        assert len(rows) == 2, (
-            f"expected 2 versions for our entity; got {len(rows)}: {rows}"
-        )
+        assert len(rows) == 2, f"expected 2 versions for our entity; got {len(rows)}: {rows}"
         # Ascending as_of (TC-014/TC-017 core invariant).
         assert rows[0]["as_of"] < rows[1]["as_of"]
         # Each row carries lineage_events (may be empty).
@@ -676,9 +659,7 @@ def test_entities_interval_returns_version_chain_with_lineage(
 # ---------------------------------------------------------------------
 
 
-def test_disclosures_interval_returns_version_chain(
-    client: TestClient, db_dsn: str
-) -> None:
+def test_disclosures_interval_returns_version_chain(client: TestClient, db_dsn: str) -> None:
     """TC-018 — ``/disclosures?as_of_range=...`` returns the version
     chain from ``kap.disclosures_version`` ordered by ``as_of`` ASC,
     with ``as_of_provenance`` populated on every row.
@@ -710,12 +691,9 @@ def test_disclosures_interval_returns_version_chain(
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
-        rows = [
-            r for r in body["data"] if r.get("disclosure_id") == disclosure_id
-        ]
+        rows = [r for r in body["data"] if r.get("disclosure_id") == disclosure_id]
         assert len(rows) == 2, (
-            f"expected 2 versions for disclosure_id={disclosure_id}; "
-            f"got {len(rows)}: {rows}"
+            f"expected 2 versions for disclosure_id={disclosure_id}; got {len(rows)}: {rows}"
         )
         # Ascending as_of.
         assert rows[0]["as_of"] < rows[1]["as_of"]
@@ -746,9 +724,7 @@ def test_disclosures_interval_returns_version_chain(
 # ---------------------------------------------------------------------
 
 
-def test_observations_interval_16y_returns_query_too_large(
-    client: TestClient, db_dsn: str
-) -> None:
+def test_observations_interval_16y_returns_query_too_large(client: TestClient, db_dsn: str) -> None:
     """TC-019 — interval width > 5 years on ``/observations`` returns
     ``413 QUERY_TOO_LARGE`` through the HTTP route (round-6 covered the
     parser-level test; this is the HTTP-path complement).
@@ -767,9 +743,7 @@ def test_observations_interval_16y_returns_query_too_large(
         body = resp.json()
         # RFC 7807 envelope per the research handler — code at top level.
         detail = body.get("detail", body)
-        code = body.get("code") or (
-            detail.get("code") if isinstance(detail, dict) else None
-        )
+        code = body.get("code") or (detail.get("code") if isinstance(detail, dict) else None)
         assert code == "QUERY_TOO_LARGE"
     finally:
         _set_master_flag(db_dsn, value=False)
@@ -804,9 +778,7 @@ def test_interval_flag_off_returns_503_on_interval_but_200_on_pit(
         assert resp_interval.status_code == 503, resp_interval.text
         body = resp_interval.json()
         detail = body.get("detail", body)
-        code = body.get("code") or (
-            detail.get("code") if isinstance(detail, dict) else None
-        )
+        code = body.get("code") or (detail.get("code") if isinstance(detail, dict) else None)
         assert code == "FEATURE_DISABLED"
         # The exact flag name must surface in extensions per round-7
         # gating. The envelope shape varies — check both top-level and
@@ -870,9 +842,7 @@ def test_interval_cache_basis_uses_upper_bound_for_cache_control(
         # Present-day interval: T2 = now()+1y, which is after the
         # 5-minute immutable threshold, so the cache header must be
         # the "no-cache, must-revalidate" shape.
-        future_t2 = (datetime.now(tz=UTC) + timedelta(days=365)).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
+        future_t2 = (datetime.now(tz=UTC) + timedelta(days=365)).strftime("%Y-%m-%dT%H:%M:%SZ")
         resp_now = client.get(
             "/v1/research/observations",
             params={
@@ -890,12 +860,8 @@ def test_interval_cache_basis_uses_upper_bound_for_cache_control(
 
         # Re-issue with a width <= 5y so cost gate doesn't fire.
         # Pick T1 = (now - 1 day), T2 = (now + 30 days). Width ~= 31d.
-        present_t1 = (datetime.now(tz=UTC) - timedelta(days=1)).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
-        present_t2 = (datetime.now(tz=UTC) + timedelta(days=30)).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
+        present_t1 = (datetime.now(tz=UTC) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        present_t2 = (datetime.now(tz=UTC) + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
         resp_present = client.get(
             "/v1/research/observations",
             params={

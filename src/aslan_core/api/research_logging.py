@@ -83,9 +83,7 @@ def configure_research_logging(*, json_output: bool | None = None) -> None:
     ]
 
     if json_output:
-        renderer: structlog.types.Processor = structlog.processors.JSONRenderer(
-            sort_keys=True
-        )
+        renderer: structlog.types.Processor = structlog.processors.JSONRenderer(sort_keys=True)
     else:
         renderer = structlog.dev.ConsoleRenderer(colors=False)
 
@@ -110,9 +108,7 @@ def get_research_logger(name: str | None = None) -> structlog.stdlib.BoundLogger
     """Return a structlog BoundLogger pre-bound for the research API."""
     if not _CONFIGURED:
         configure_research_logging()
-    base: structlog.stdlib.BoundLogger = structlog.get_logger(
-        name or "aslan_core.api.research"
-    )
+    base: structlog.stdlib.BoundLogger = structlog.get_logger(name or "aslan_core.api.research")
     return base.bind(component="bitemporal-research-api")
 
 
@@ -181,7 +177,7 @@ def _is_research_path(request: Request) -> bool:
     Mirror the audit-middleware boundary: exact ``/v1/research`` (no
     children) or any path under ``/v1/research/``.
     """
-    path = request.url.path
+    path: str = request.url.path
     return path == _RESEARCH_PREFIX or path.startswith(_RESEARCH_PREFIX + "/")
 
 
@@ -222,7 +218,7 @@ def register_research_exception_handlers(app: FastAPI) -> None:
     """
     log = get_research_logger("aslan_core.api.research.errors")
 
-    @app.exception_handler(StarletteHTTPException)
+    @app.exception_handler(StarletteHTTPException)  # type: ignore[untyped-decorator]
     async def _research_http_exc_handler(
         request: Request, exc: StarletteHTTPException
     ) -> JSONResponse:
@@ -237,9 +233,7 @@ def register_research_exception_handlers(app: FastAPI) -> None:
             # handler closure directly because it's bound to a different
             # FastAPI instance; instead replicate its body.
             del _re  # only imported for documentation purposes
-            detail: Any = (
-                exc.detail if isinstance(exc.detail, str) else str(exc.detail)
-            )
+            detail: Any = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
             return JSONResponse(
                 status_code=exc.status_code,
                 content={"detail": detail, "status_code": exc.status_code},
@@ -294,10 +288,8 @@ def register_research_exception_handlers(app: FastAPI) -> None:
         )
         return JSONResponse(status_code=exc.status_code, content=body)
 
-    @app.exception_handler(Exception)
-    async def _research_unhandled_exc_handler(
-        request: Request, exc: Exception
-    ) -> JSONResponse:
+    @app.exception_handler(Exception)  # type: ignore[untyped-decorator]
+    async def _research_unhandled_exc_handler(request: Request, exc: Exception) -> JSONResponse:
         if not _is_research_path(request):
             # Existing app-wide handler will catch it. Re-raise so
             # FastAPI's exception-handler chain delegates upward.

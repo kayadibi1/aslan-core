@@ -79,7 +79,17 @@ try:  # pragma: no cover - optional dep
         "Bitemporal-research-API request latency.",
         ["endpoint"],
         buckets=(
-            0.005, 0.010, 0.025, 0.050, 0.100, 0.200, 0.500, 1.0, 2.5, 5.0, 10.0,
+            0.005,
+            0.010,
+            0.025,
+            0.050,
+            0.100,
+            0.200,
+            0.500,
+            1.0,
+            2.5,
+            5.0,
+            10.0,
         ),
     )
     _AUDIT_TOTAL = Counter(
@@ -248,9 +258,7 @@ def set_cache_headers(response: Response, *, as_of_resolved: datetime, body_byte
     etag = '"' + hashlib.sha256(body_bytes).hexdigest()[:32] + '"'
     response.headers["ETag"] = etag
     if age >= _IMMUTABLE_THRESHOLD_SECONDS:
-        response.headers["Cache-Control"] = (
-            f"public, max-age={_IMMUTABLE_MAX_AGE}, immutable"
-        )
+        response.headers["Cache-Control"] = f"public, max-age={_IMMUTABLE_MAX_AGE}, immutable"
     else:
         response.headers["Cache-Control"] = "no-cache, must-revalidate"
 
@@ -263,8 +271,8 @@ def set_cache_headers(response: Response, *, as_of_resolved: datetime, body_byte
 _TIER_LIMITS = {
     # tier_name: {window_kind: limit}
     "internal": {"minute": 10_000, "hour": 100_000, "day": 0},  # 0 = unlimited
-    "partner":  {"minute": 600,    "hour": 5_000,   "day": 30_000},
-    "public":   {"minute": 60,     "hour": 500,    "day": 2_000},
+    "partner": {"minute": 600, "hour": 5_000, "day": 30_000},
+    "public": {"minute": 60, "hour": 500, "day": 2_000},
 }
 
 
@@ -328,9 +336,7 @@ async def enforce_rate_limit(
         ).first()
         if bucket and bucket.tokens_used > cap:
             await session.commit()
-            _RATE_THROTTLES.labels(
-                api_key_id=str(principal.key_id), window_kind=window_kind
-            ).inc()
+            _RATE_THROTTLES.labels(api_key_id=str(principal.key_id), window_kind=window_kind).inc()
             retry_after = _retry_after_seconds(window_kind, now)
             logger.warning(
                 "research_rate_limit_throttle",
@@ -346,8 +352,7 @@ async def enforce_rate_limit(
                 detail={
                     "code": "RATE_LIMITED",
                     "title": (
-                        f"Rate limit exceeded for tier {principal.rate_tier} "
-                        f"(window={window_kind})"
+                        f"Rate limit exceeded for tier {principal.rate_tier} (window={window_kind})"
                     ),
                     "retry_after_seconds": retry_after,
                 },
@@ -393,10 +398,7 @@ async def research_audit_middleware(
     # an explicit trailing slash so unrelated future paths that happen to
     # contain "/v1/research" as a substring (e.g. /internal/proxy/v1/research-status)
     # don't get audited / forced through this branch.
-    if not (
-        request.url.path == "/v1/research"
-        or request.url.path.startswith("/v1/research/")
-    ):
+    if not (request.url.path == "/v1/research" or request.url.path.startswith("/v1/research/")):
         return await call_next(request)
 
     ctx = RequestContext(endpoint=f"{request.method} {request.url.path}")
@@ -499,9 +501,7 @@ async def research_audit_middleware(
 
 def _query_params_sha256(request: Request) -> bytes:
     """Per D18: hash of canonical params; raw params are PII-risky."""
-    canonical = json.dumps(
-        sorted(request.query_params.multi_items()), default=str
-    ).encode("utf-8")
+    canonical = json.dumps(sorted(request.query_params.multi_items()), default=str).encode("utf-8")
     return hashlib.sha256(canonical).digest()
 
 

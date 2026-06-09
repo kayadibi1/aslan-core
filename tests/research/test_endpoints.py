@@ -110,10 +110,7 @@ def _set_canary_status(dsn: str, *, green: bool) -> None:
 
 def _clear_canary_status(dsn: str) -> None:
     with psycopg.connect(dsn) as conn, conn.cursor() as cur:
-        cur.execute(
-            "DELETE FROM aslan_core.feature_flags "
-            "WHERE flag_name = 'MOAT_2_CANARY_STATUS'"
-        )
+        cur.execute("DELETE FROM aslan_core.feature_flags WHERE flag_name = 'MOAT_2_CANARY_STATUS'")
         conn.commit()
 
 
@@ -134,9 +131,7 @@ def test_healthz_always_returns_200(client: TestClient) -> None:
 # ---------------------------------------------------------------------
 
 
-def test_master_flag_off_returns_503_on_observations(
-    client: TestClient, db_dsn: str
-) -> None:
+def test_master_flag_off_returns_503_on_observations(client: TestClient, db_dsn: str) -> None:
     """TC-033 / TC-073 — master flag off → 503 FEATURE_DISABLED.
 
     Default seeded value of BITEMPORAL_API_ENABLED is ``false`` per
@@ -151,9 +146,7 @@ def test_master_flag_off_returns_503_on_observations(
     assert detail.get("code") == "FEATURE_DISABLED"
 
 
-def test_master_flag_on_then_missing_api_key_returns_401(
-    client: TestClient, db_dsn: str
-) -> None:
+def test_master_flag_on_then_missing_api_key_returns_401(client: TestClient, db_dsn: str) -> None:
     """TC-031 / TC-027 — master on, no API key → 401 AUTH_INVALID."""
     _set_master_flag(db_dsn, value=True)
     try:
@@ -165,9 +158,7 @@ def test_master_flag_on_then_missing_api_key_returns_401(
         _set_master_flag(db_dsn, value=False)
 
 
-def test_master_flag_on_with_invalid_api_key_returns_401(
-    client: TestClient, db_dsn: str
-) -> None:
+def test_master_flag_on_with_invalid_api_key_returns_401(client: TestClient, db_dsn: str) -> None:
     """TC-032 / TC-028 — invalid API key → 401 AUTH_INVALID.
 
     The header expects ``key_id:secret``; freeform garbage fails parsing
@@ -236,9 +227,7 @@ def test_utc_z_suffix_accepted() -> None:
 # ---------------------------------------------------------------------
 
 
-def test_verify_moat_2_green_when_canary_true(
-    client: TestClient, db_dsn: str
-) -> None:
+def test_verify_moat_2_green_when_canary_true(client: TestClient, db_dsn: str) -> None:
     """TC-056 — canary green → /verify/moat-2 returns 200 with green shape."""
     _set_canary_status(db_dsn, green=True)
     try:
@@ -251,9 +240,7 @@ def test_verify_moat_2_green_when_canary_true(
         _clear_canary_status(db_dsn)
 
 
-def test_verify_moat_2_red_when_canary_false(
-    client: TestClient, db_dsn: str
-) -> None:
+def test_verify_moat_2_red_when_canary_false(client: TestClient, db_dsn: str) -> None:
     """TC-057 — canary red → /verify/moat-2 returns 503 with red shape."""
     _set_canary_status(db_dsn, green=False)
     try:

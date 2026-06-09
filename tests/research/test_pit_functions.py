@@ -120,10 +120,7 @@ async def test_observation_at_single_row_exact_as_of(
 
     rows = (
         await session.execute(
-            text(
-                "SELECT value FROM ts.observation_at(:asof) "
-                "WHERE series_id = :sid"
-            ),
+            text("SELECT value FROM ts.observation_at(:asof) WHERE series_id = :sid"),
             {"asof": as_of_v, "sid": sid},
         )
     ).all()
@@ -134,9 +131,7 @@ async def test_observation_at_single_row_exact_as_of(
         text("DELETE FROM ts.observation WHERE series_id = :sid"),
         {"sid": sid},
     )
-    await session.execute(
-        text("DELETE FROM ts.series_catalog WHERE series_code = 'pit_tc001'")
-    )
+    await session.execute(text("DELETE FROM ts.series_catalog WHERE series_code = 'pit_tc001'"))
     await session.commit()
 
 
@@ -170,10 +165,7 @@ async def test_observation_at_multi_version_picks_latest_le_as_of(
     # Pick a request as_of between v2 and v3.
     rows = (
         await session.execute(
-            text(
-                "SELECT value, as_of FROM ts.observation_at(:asof) "
-                "WHERE series_id = :sid"
-            ),
+            text("SELECT value, as_of FROM ts.observation_at(:asof) WHERE series_id = :sid"),
             {"asof": "2024-08-03T00:00:00Z", "sid": sid},
         )
     ).all()
@@ -188,9 +180,7 @@ async def test_observation_at_multi_version_picks_latest_le_as_of(
         text("DELETE FROM ts.observation WHERE series_id = :sid"),
         {"sid": sid},
     )
-    await session.execute(
-        text("DELETE FROM ts.series_catalog WHERE series_code = 'pit_tc002'")
-    )
+    await session.execute(text("DELETE FROM ts.series_catalog WHERE series_code = 'pit_tc002'"))
     await session.commit()
 
 
@@ -213,10 +203,7 @@ async def test_observation_at_before_first_version_returns_empty(
 
     rows = (
         await session.execute(
-            text(
-                "SELECT value FROM ts.observation_at(:asof) "
-                "WHERE series_id = :sid"
-            ),
+            text("SELECT value FROM ts.observation_at(:asof) WHERE series_id = :sid"),
             {"asof": "2023-03-01T00:00:00Z", "sid": sid},
         )
     ).all()
@@ -226,9 +213,7 @@ async def test_observation_at_before_first_version_returns_empty(
         text("DELETE FROM ts.observation WHERE series_id = :sid"),
         {"sid": sid},
     )
-    await session.execute(
-        text("DELETE FROM ts.series_catalog WHERE series_code = 'pit_tc003'")
-    )
+    await session.execute(text("DELETE FROM ts.series_catalog WHERE series_code = 'pit_tc003'"))
     await session.commit()
 
 
@@ -260,10 +245,7 @@ async def test_observation_at_microsecond_boundary(
     # Query at exact newer microsecond.
     rows = (
         await session.execute(
-            text(
-                "SELECT value FROM ts.observation_at(:asof) "
-                "WHERE series_id = :sid"
-            ),
+            text("SELECT value FROM ts.observation_at(:asof) WHERE series_id = :sid"),
             {"asof": newer, "sid": sid},
         )
     ).all()
@@ -273,10 +255,7 @@ async def test_observation_at_microsecond_boundary(
     # Query at older microsecond → must see only the older row.
     rows = (
         await session.execute(
-            text(
-                "SELECT value FROM ts.observation_at(:asof) "
-                "WHERE series_id = :sid"
-            ),
+            text("SELECT value FROM ts.observation_at(:asof) WHERE series_id = :sid"),
             {"asof": older, "sid": sid},
         )
     ).all()
@@ -287,9 +266,7 @@ async def test_observation_at_microsecond_boundary(
         text("DELETE FROM ts.observation WHERE series_id = :sid"),
         {"sid": sid},
     )
-    await session.execute(
-        text("DELETE FROM ts.series_catalog WHERE series_code = 'pit_tc005'")
-    )
+    await session.execute(text("DELETE FROM ts.series_catalog WHERE series_code = 'pit_tc005'"))
     await session.commit()
 
 
@@ -424,10 +401,7 @@ async def test_observation_at_amendment_chain_returns_latest_value(
     # Between v1 and v2 → v1 visible.
     rows = (
         await session.execute(
-            text(
-                "SELECT value FROM ts.observation_at(:asof) "
-                "WHERE series_id = :sid"
-            ),
+            text("SELECT value FROM ts.observation_at(:asof) WHERE series_id = :sid"),
             {"asof": "2024-08-01T20:00:00Z", "sid": sid},
         )
     ).all()
@@ -437,10 +411,7 @@ async def test_observation_at_amendment_chain_returns_latest_value(
     # After v2 → v2 visible.
     rows = (
         await session.execute(
-            text(
-                "SELECT value FROM ts.observation_at(:asof) "
-                "WHERE series_id = :sid"
-            ),
+            text("SELECT value FROM ts.observation_at(:asof) WHERE series_id = :sid"),
             {"asof": "2024-08-03T00:00:00Z", "sid": sid},
         )
     ).all()
@@ -451,7 +422,5 @@ async def test_observation_at_amendment_chain_returns_latest_value(
         text("DELETE FROM ts.observation WHERE series_id = :sid"),
         {"sid": sid},
     )
-    await session.execute(
-        text("DELETE FROM ts.series_catalog WHERE series_code = 'pit_amend'")
-    )
+    await session.execute(text("DELETE FROM ts.series_catalog WHERE series_code = 'pit_amend'"))
     await session.commit()

@@ -63,9 +63,7 @@ def app(pg_dsn: str) -> Iterator[FastAPI]:
         finally:
             await a.state.engine.dispose()
 
-    a = FastAPI(
-        title="Aslan Research API (test-round6)", version="test", lifespan=_lifespan
-    )
+    a = FastAPI(title="Aslan Research API (test-round6)", version="test", lifespan=_lifespan)
     a.include_router(research_router)
     yield a
 
@@ -136,8 +134,10 @@ def test_as_of_range_parser_half_open() -> None:
     out = _parse_as_of_range("[2024-01-01T00:00:00Z,2025-01-01T00:00:00Z)")
     assert out is not None
     t1, t2 = out
-    assert t1.tzinfo is UTC or t1.utcoffset().total_seconds() == 0
-    assert t2.tzinfo is UTC or t2.utcoffset().total_seconds() == 0
+    t1_off = t1.utcoffset()
+    t2_off = t2.utcoffset()
+    assert t1.tzinfo is UTC or (t1_off is not None and t1_off.total_seconds() == 0)
+    assert t2.tzinfo is UTC or (t2_off is not None and t2_off.total_seconds() == 0)
     assert t1 < t2
     assert t1.year == 2024 and t1.month == 1 and t1.day == 1
     assert t2.year == 2025 and t2.month == 1 and t2.day == 1
@@ -263,9 +263,7 @@ def test_as_of_and_as_of_range_mutually_exclusive_on_observations(
         body = resp.json()
         # RFC 7807 envelope from research_logging — ``code`` is at the top level.
         detail = body.get("detail", body)
-        code = body.get("code") or (
-            detail.get("code") if isinstance(detail, dict) else None
-        )
+        code = body.get("code") or (detail.get("code") if isinstance(detail, dict) else None)
         assert code == "BITEMPORAL_INTERVAL_INVALID"
     finally:
         _set_master_flag(db_dsn, value=False)
@@ -298,9 +296,7 @@ def test_query_too_large_when_as_of_range_width_exceeds_5_years(
         assert resp.status_code == 413
         body = resp.json()
         detail = body.get("detail", body)
-        code = body.get("code") or (
-            detail.get("code") if isinstance(detail, dict) else None
-        )
+        code = body.get("code") or (detail.get("code") if isinstance(detail, dict) else None)
         assert code == "QUERY_TOO_LARGE"
     finally:
         _set_master_flag(db_dsn, value=False)
@@ -311,9 +307,7 @@ def test_query_too_large_when_as_of_range_width_exceeds_5_years(
 # ---------------------------------------------------------------------
 
 
-def test_limit_above_500_returns_query_too_large(
-    client: TestClient, db_dsn: str
-) -> None:
+def test_limit_above_500_returns_query_too_large(client: TestClient, db_dsn: str) -> None:
     """Round-7 (closes pass-2 finding §4/X2 — limit hard cap).
 
     The earlier ``Query(le=500)`` constraint was removed so the cap
@@ -345,9 +339,7 @@ def test_limit_above_500_returns_query_too_large(
 # ---------------------------------------------------------------------
 
 
-def test_disclosure_id_accepts_kap_shaped_string(
-    client: TestClient, db_dsn: str
-) -> None:
+def test_disclosure_id_accepts_kap_shaped_string(client: TestClient, db_dsn: str) -> None:
     """Round-6 §4/X4 — closes BUG_REVIEW_FINDINGS HIGH §4/X4 disclosure_id: str.
 
     KAP IDs (e.g. ``KAP-2024-1234567``) are TEXT in the crawl schema
@@ -362,15 +354,11 @@ def test_disclosure_id_accepts_kap_shaped_string(
     try:
         # Without an API key: 401 AUTH_INVALID. With master flag off:
         # 503 FEATURE_DISABLED. Either way, NOT 422.
-        resp_master_on = client.get(
-            "/v1/research/disclosures/KAP-2024-1234567"
-        )
+        resp_master_on = client.get("/v1/research/disclosures/KAP-2024-1234567")
         assert resp_master_on.status_code != 422
 
         _set_master_flag(db_dsn, value=False)
-        resp_master_off = client.get(
-            "/v1/research/disclosures/KAP-2024-1234567"
-        )
+        resp_master_off = client.get("/v1/research/disclosures/KAP-2024-1234567")
         assert resp_master_off.status_code != 422
     finally:
         _set_master_flag(db_dsn, value=False)
